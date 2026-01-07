@@ -1060,20 +1060,37 @@ impl<'src> Parser<'src> {
             });
         }
 
-        // Array literal
+        // Array literal or array repeat: [1, 2, 3] or [0; 100]
         if self.match_token(&TokenKind::LBracket) {
             let mut elements = Vec::new();
 
             if !self.check(&TokenKind::RBracket) {
-                loop {
-                    elements.push(self.parse_expr()?);
-                    if !self.match_token(&TokenKind::Comma) {
-                        break;
-                    }
+                // Parse first element
+                let first = self.parse_expr()?;
+
+                // Check for repeat syntax: [value; count]
+                if self.match_token(&TokenKind::Semicolon) {
+                    let count = self.parse_integer_literal()?;
+                    self.expect(&TokenKind::RBracket, "expected ']' after repeat count")?;
+                    let span = start.merge(self.previous().span);
+                    return Ok(Expr {
+                        kind: ExprKind::ArrayRepeat {
+                            value: Box::new(first),
+                            count,
+                        },
+                        span,
+                    });
+                }
+
+                elements.push(first);
+
+                // Parse remaining elements
+                while self.match_token(&TokenKind::Comma) {
                     // Allow trailing comma
                     if self.check(&TokenKind::RBracket) {
                         break;
                     }
+                    elements.push(self.parse_expr()?);
                 }
             }
 

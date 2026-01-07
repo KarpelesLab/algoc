@@ -64,7 +64,7 @@ impl PythonGenerator {
     fn is_array_like_expr(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
-            ExprKind::Array(_) => true,
+            ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
             ExprKind::Slice { .. } => true,
             ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
                 self.is_array_like_expr(inner)
@@ -291,13 +291,27 @@ impl PythonGenerator {
                 self.write_indent();
                 self.write(&format!("{} = ", name.name));
                 if let Some(init) = init {
-                    self.generate_expr(init);
+                    // Check if init is a struct literal - need special handling
+                    if let ExprKind::StructLit { name: struct_name, fields } = &init.kind {
+                        // Create the struct
+                        self.write(&format!("{}()\n", struct_name.name));
+                        // Assign each field
+                        for (field_name, field_value) in fields {
+                            self.write_indent();
+                            self.write(&format!("{}.{} = ", name.name, field_name.name));
+                            self.generate_expr(field_value);
+                            self.write("\n");
+                        }
+                    } else {
+                        self.generate_expr(init);
+                        self.write("\n");
+                    }
                 } else if let Some(ty) = ty {
                     self.write(&self.default_value_for_type(ty));
+                    self.write("\n");
                 } else {
-                    self.write("None");
+                    self.write("None\n");
                 }
-                self.write("\n");
             }
             StmtKind::Expr(expr) => {
                 self.write_indent();
@@ -577,6 +591,13 @@ impl PythonGenerator {
                     }
                     self.write("]");
                 }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                // Generate [value] * count
+                self.write("[");
+                self.generate_expr(value);
+                self.write("] * ");
+                self.write(&count.to_string());
             }
             ExprKind::Cast { expr, ty } => {
                 // In Python, we need to mask for integer type casts

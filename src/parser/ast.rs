@@ -339,6 +339,11 @@ pub enum ExprKind {
     },
     /// Array literal: `[1, 2, 3]`
     Array(Vec<Expr>),
+    /// Array repeat: `[value; count]`
+    ArrayRepeat {
+        value: Box<Expr>,
+        count: u64,
+    },
     /// Cast: `expr as Type`
     Cast {
         expr: Box<Expr>,

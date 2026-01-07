@@ -83,3 +83,171 @@ fn secure_zero(buf: &mut [u8]) {
         buf[i] = 0;
     }
 }
+
+// ============================================================================
+// Bit-level I/O for DEFLATE
+// ============================================================================
+// DEFLATE uses LSB-first bit ordering within each byte.
+// Bits are read/written starting from bit 0 (LSB) of each byte.
+
+// BitReader state - for reading bits from a byte buffer
+struct BitReader {
+    data: &[u8],        // Source buffer (reference to external data)
+    byte_pos: u64,      // Current byte position in data
+    bit_pos: u8,        // Bit position within current byte (0-7, 0=LSB)
+    bit_buf: u32,       // Bit buffer (accumulated bits)
+    buf_avail: u8       // Number of bits available in buffer
+}
+
+// Initialize a bit reader
+fn bitreader_init(reader: &mut BitReader, data: &[u8]) {
+    reader.data = data;
+    reader.byte_pos = 0;
+    reader.bit_pos = 0;
+    reader.bit_buf = 0;
+    reader.buf_avail = 0;
+}
+
+// Ensure we have at least n bits in the buffer
+fn bitreader_fill(reader: &mut BitReader, n: u8) {
+    while reader.buf_avail < n && reader.byte_pos < reader.data.len() {
+        reader.bit_buf = reader.bit_buf | ((reader.data[reader.byte_pos] as u32) << reader.buf_avail);
+        reader.byte_pos = reader.byte_pos + 1;
+        reader.buf_avail = reader.buf_avail + 8;
+    }
+}
+
+// Read n bits (up to 16) from the stream, LSB first
+fn bitreader_read(reader: &mut BitReader, n: u8) -> u32 {
+    bitreader_fill(reader, n);
+    let mask: u32 = (1 << n) - 1;
+    let result: u32 = reader.bit_buf & mask;
+    reader.bit_buf = reader.bit_buf >> n;
+    reader.buf_avail = reader.buf_avail - n;
+    return result;
+}
+
+// Peek at n bits without consuming them
+fn bitreader_peek(reader: &mut BitReader, n: u8) -> u32 {
+    bitreader_fill(reader, n);
+    let mask: u32 = (1 << n) - 1;
+    return reader.bit_buf & mask;
+}
+
+// Skip n bits
+fn bitreader_skip(reader: &mut BitReader, n: u8) {
+    bitreader_fill(reader, n);
+    reader.bit_buf = reader.bit_buf >> n;
+    reader.buf_avail = reader.buf_avail - n;
+}
+
+// Read a single bit
+fn bitreader_read_bit(reader: &mut BitReader) -> u32 {
+    return bitreader_read(reader, 1);
+}
+
+// Align to byte boundary (skip remaining bits in current byte)
+fn bitreader_align(reader: &mut BitReader) {
+    let skip: u8 = reader.buf_avail % 8;
+    if skip > 0 {
+        reader.bit_buf = reader.bit_buf >> skip;
+        reader.buf_avail = reader.buf_avail - skip;
+    }
+}
+
+// Get remaining byte count (after alignment)
+fn bitreader_bytes_remaining(reader: &mut BitReader) -> u64 {
+    return reader.data.len() - reader.byte_pos + (reader.buf_avail / 8) as u64;
+}
+
+// Read bytes directly (after aligning)
+fn bitreader_read_bytes(reader: &mut BitReader, dest: &mut [u8], count: u64) {
+    bitreader_align(reader);
+    // First consume any buffered complete bytes
+    let mut i: u64 = 0;
+    while i < count && reader.buf_avail >= 8 {
+        dest[i] = (reader.bit_buf & 0xFF) as u8;
+        reader.bit_buf = reader.bit_buf >> 8;
+        reader.buf_avail = reader.buf_avail - 8;
+        i = i + 1;
+    }
+    // Then read remaining bytes directly from source
+    while i < count && reader.byte_pos < reader.data.len() {
+        dest[i] = reader.data[reader.byte_pos];
+        reader.byte_pos = reader.byte_pos + 1;
+        i = i + 1;
+    }
+}
+
+// BitWriter state - for writing bits to a byte buffer
+struct BitWriter {
+    data: &mut [u8],    // Destination buffer
+    byte_pos: u64,      // Current byte position
+    bit_buf: u32,       // Bit buffer (accumulated bits)
+    buf_used: u8        // Number of bits used in buffer (0-32)
+}
+
+// Initialize a bit writer
+fn bitwriter_init(writer: &mut BitWriter, data: &mut [u8]) {
+    writer.data = data;
+    writer.byte_pos = 0;
+    writer.bit_buf = 0;
+    writer.buf_used = 0;
+}
+
+// Flush complete bytes from the bit buffer
+fn bitwriter_flush_bytes(writer: &mut BitWriter) {
+    while writer.buf_used >= 8 {
+        writer.data[writer.byte_pos] = (writer.bit_buf & 0xFF) as u8;
+        writer.byte_pos = writer.byte_pos + 1;
+        writer.bit_buf = writer.bit_buf >> 8;
+        writer.buf_used = writer.buf_used - 8;
+    }
+}
+
+// Write n bits (up to 16) to the stream, LSB first
+fn bitwriter_write(writer: &mut BitWriter, value: u32, n: u8) {
+    let mask: u32 = (1 << n) - 1;
+    writer.bit_buf = writer.bit_buf | ((value & mask) << writer.buf_used);
+    writer.buf_used = writer.buf_used + n;
+    bitwriter_flush_bytes(writer);
+}
+
+// Write a single bit
+fn bitwriter_write_bit(writer: &mut BitWriter, bit: u32) {
+    bitwriter_write(writer, bit, 1);
+}
+
+// Align to byte boundary (pad with zero bits)
+fn bitwriter_align(writer: &mut BitWriter) {
+    if writer.buf_used > 0 {
+        // Pad remaining bits with zeros and write final byte
+        writer.data[writer.byte_pos] = (writer.bit_buf & 0xFF) as u8;
+        writer.byte_pos = writer.byte_pos + 1;
+        writer.bit_buf = 0;
+        writer.buf_used = 0;
+    }
+}
+
+// Write bytes directly (after aligning)
+fn bitwriter_write_bytes(writer: &mut BitWriter, src: &[u8], count: u64) {
+    bitwriter_align(writer);
+    for i in 0..count {
+        writer.data[writer.byte_pos] = src[i];
+        writer.byte_pos = writer.byte_pos + 1;
+    }
+}
+
+// Get number of bytes written
+fn bitwriter_bytes_written(writer: &mut BitWriter) -> u64 {
+    if writer.buf_used > 0 {
+        return writer.byte_pos + 1;
+    }
+    return writer.byte_pos;
+}
+
+// Finalize and return total bytes written
+fn bitwriter_finish(writer: &mut BitWriter) -> u64 {
+    bitwriter_align(writer);
+    return writer.byte_pos;
+}

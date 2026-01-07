@@ -159,7 +159,8 @@ impl<'a> TypeChecker<'a> {
                 let declared_ty = ty.as_ref().map(|t| self.ast_to_type(t));
 
                 if let Some(init) = init {
-                    let init_ty = self.infer_expr(init);
+                    // Use declared type as hint for type inference
+                    let init_ty = self.infer_expr_with_hint(init, declared_ty.as_ref());
                     if let Some(ref declared) = declared_ty {
                         if !init_ty.is_compatible_with(declared) {
                             self.error(
@@ -354,6 +355,28 @@ impl<'a> TypeChecker<'a> {
                     if elements.len() as u64 != *size {
                         self.error(
                             format!("array length mismatch: expected {}, got {}", size, elements.len()),
+                            expr.span,
+                        );
+                    }
+                    return expected.clone();
+                }
+            }
+        }
+
+        // Handle array repeat syntax with type hint
+        if let parser::ExprKind::ArrayRepeat { value, count } = &expr.kind {
+            if let Some(expected) = hint {
+                if let TypeKind::Array { element: expected_elem, size } = &expected.kind {
+                    let elem_ty = self.infer_expr_with_hint(value, Some(expected_elem));
+                    if !elem_ty.is_compatible_with(expected_elem) {
+                        self.error(
+                            format!("array element type mismatch: expected {}, got {}", expected_elem, elem_ty),
+                            value.span,
+                        );
+                    }
+                    if *count != *size {
+                        self.error(
+                            format!("array length mismatch: expected {}, got {}", size, count),
                             expr.span,
                         );
                     }
@@ -568,6 +591,10 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 Type::array(elem_ty, elements.len() as u64)
+            }
+            parser::ExprKind::ArrayRepeat { value, count } => {
+                let elem_ty = self.infer_expr(value);
+                Type::array(elem_ty, *count)
             }
             parser::ExprKind::Cast { expr: inner, ty } => {
                 let _ = self.infer_expr(inner);

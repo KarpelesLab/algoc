@@ -1,0 +1,774 @@
+// DEFLATE compression/decompression implementation
+// Based on RFC 1951 - DEFLATE Compressed Data Format Specification
+//
+// This implementation supports:
+// - Decompression of all DEFLATE block types (stored, fixed, dynamic)
+// - Compression using fixed Huffman codes (to start)
+
+use "../runtime.algoc";
+
+// ============================================================================
+// DEFLATE Constants
+// ============================================================================
+
+// Maximum code lengths
+const MAX_BITS: u32 = 15;
+const MAX_LIT_CODES: u32 = 286;   // 256 literals + end-of-block + 29 length codes
+const MAX_DIST_CODES: u32 = 30;
+const MAX_CL_CODES: u32 = 19;     // Code length codes
+
+// Length code base values (codes 257-285)
+// Code 257 = length 3, 258 = length 4, ..., 285 = length 258
+const LENGTH_BASE: u32[29] = [
+    3, 4, 5, 6, 7, 8, 9, 10,      // 257-264
+    11, 13, 15, 17,               // 265-268
+    19, 23, 27, 31,               // 269-272
+    35, 43, 51, 59,               // 273-276
+    67, 83, 99, 115,              // 277-280
+    131, 163, 195, 227, 258       // 281-285
+];
+
+// Extra bits for length codes
+const LENGTH_EXTRA: u8[29] = [
+    0, 0, 0, 0, 0, 0, 0, 0,       // 257-264: no extra bits
+    1, 1, 1, 1,                   // 265-268: 1 extra bit
+    2, 2, 2, 2,                   // 269-272: 2 extra bits
+    3, 3, 3, 3,                   // 273-276: 3 extra bits
+    4, 4, 4, 4,                   // 277-280: 4 extra bits
+    5, 5, 5, 5, 0                 // 281-285: 5 extra bits (285 = 0)
+];
+
+// Distance code base values (codes 0-29)
+const DIST_BASE: u32[30] = [
+    1, 2, 3, 4, 5, 7, 9, 13,          // 0-7
+    17, 25, 33, 49, 65, 97, 129, 193, // 8-15
+    257, 385, 513, 769,               // 16-19
+    1025, 1537, 2049, 3073,           // 20-23
+    4097, 6145, 8193, 12289,          // 24-27
+    16385, 24577                      // 28-29
+];
+
+// Extra bits for distance codes
+const DIST_EXTRA: u8[30] = [
+    0, 0, 0, 0, 1, 1, 2, 2,   // 0-7
+    3, 3, 4, 4, 5, 5, 6, 6,   // 8-15
+    7, 7, 8, 8, 9, 9, 10, 10, // 16-23
+    11, 11, 12, 12, 13, 13    // 24-29
+];
+
+// Order of code length codes for dynamic Huffman
+const CL_ORDER: u8[19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+];
+
+// ============================================================================
+// Huffman Decoding Tables
+// ============================================================================
+
+// Huffman table for decoding
+// We use a simple array-based approach: for each code length, store symbols
+struct HuffmanTable {
+    // For fast lookup: counts[i] = number of codes with length i
+    counts: u32[16],
+    // Symbols in canonical order
+    symbols: u32[320]
+}
+
+// Build a Huffman table from code lengths
+fn huffman_build(table: &mut HuffmanTable, lengths: &[u8], num_codes: u32) {
+    // Count code lengths
+    for i in 0..16 {
+        table.counts[i] = 0;
+    }
+    for i in 0..num_codes {
+        let len: u32 = lengths[i] as u32;
+        if len > 0 && len < 16 {
+            table.counts[len] = table.counts[len] + 1;
+        }
+    }
+
+    // Compute first code for each length (not needed for decoding, but useful)
+    let mut next_code: u32[16] = [0 as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut code: u32 = 0;
+    for nbits in 1..16 {
+        code = (code + table.counts[nbits - 1]) << 1;
+        next_code[nbits] = code;
+    }
+
+    // Assign symbols sorted by (length, symbol) - canonical order
+    // This is what canonical Huffman requires for correct decoding
+    let mut sym_idx: u32 = 0;
+    for len in 1..16 {
+        for i in 0..num_codes {
+            if (lengths[i] as u32) == len {
+                table.symbols[sym_idx] = i;
+                sym_idx = sym_idx + 1;
+            }
+        }
+    }
+}
+
+// Decode a symbol using the Huffman table
+fn huffman_decode(table: &HuffmanTable, reader: &mut BitReader) -> u32 {
+    let mut code: u32 = 0;
+    let mut first: u32 = 0;
+    let mut index: u32 = 0;
+
+    for len in 1..16 {
+        code = code | bitreader_read(reader, 1);
+        let count: u32 = table.counts[len];
+        if code < first + count {
+            return table.symbols[index + code - first];
+        }
+        index = index + count;
+        first = (first + count) << 1;
+        code = code << 1;
+    }
+
+    // Invalid code - return 0 (error case)
+    return 0;
+}
+
+// ============================================================================
+// Fixed Huffman Tables (predefined by RFC 1951)
+// ============================================================================
+
+// Build fixed literal/length Huffman table
+fn build_fixed_lit_table(table: &mut HuffmanTable) {
+    let mut lengths: u8[288] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    // 0-143: 8 bits
+    for i in 0..144 {
+        lengths[i] = 8;
+    }
+    // 144-255: 9 bits
+    for i in 144..256 {
+        lengths[i] = 9;
+    }
+    // 256-279: 7 bits
+    for i in 256..280 {
+        lengths[i] = 7;
+    }
+    // 280-287: 8 bits
+    for i in 280..288 {
+        lengths[i] = 8;
+    }
+
+    huffman_build(table, &lengths, 288);
+}
+
+// Build fixed distance Huffman table (all 5-bit codes)
+fn build_fixed_dist_table(table: &mut HuffmanTable) {
+    let mut lengths: u8[32] = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0];
+    huffman_build(table, &lengths, 32);
+}
+
+// ============================================================================
+// DEFLATE Decompression State
+// ============================================================================
+
+struct DeflateState {
+    output: &mut [u8],       // Output buffer
+    out_pos: u64,            // Current output position
+    out_size: u64,           // Total output buffer size
+    lit_table: HuffmanTable, // Literal/length Huffman table
+    dist_table: HuffmanTable // Distance Huffman table
+}
+
+// Decode a length value from a code (257-285)
+fn decode_length(reader: &mut BitReader, code: u32) -> u32 {
+    let idx: u32 = code - 257;
+    let base: u32 = LENGTH_BASE[idx];
+    let extra: u8 = LENGTH_EXTRA[idx];
+    if extra > 0 {
+        return base + bitreader_read(reader, extra);
+    }
+    return base;
+}
+
+// Decode a distance value
+fn decode_distance(reader: &mut BitReader, code: u32) -> u32 {
+    let base: u32 = DIST_BASE[code];
+    let extra: u8 = DIST_EXTRA[code];
+    if extra > 0 {
+        return base + bitreader_read(reader, extra);
+    }
+    return base;
+}
+
+// Copy bytes from earlier in output (LZ77 back-reference)
+fn copy_match(state: &mut DeflateState, length: u32, distance: u32) {
+    let src_pos: u64 = state.out_pos - distance as u64;
+    for i in 0..length {
+        if state.out_pos < state.out_size {
+            state.output[state.out_pos] = state.output[src_pos + i as u64];
+            state.out_pos = state.out_pos + 1;
+        }
+    }
+}
+
+// Decode a compressed block (fixed or dynamic Huffman)
+fn decode_huffman_block(state: &mut DeflateState, reader: &mut BitReader) {
+    loop {
+        let sym: u32 = huffman_decode(&state.lit_table, reader);
+
+        if sym < 256 {
+            // Literal byte
+            if state.out_pos < state.out_size {
+                state.output[state.out_pos] = sym as u8;
+                state.out_pos = state.out_pos + 1;
+            }
+        } else if sym == 256 {
+            // End of block
+            return;
+        } else {
+            // Length/distance pair
+            let length: u32 = decode_length(reader, sym);
+            let dist_code: u32 = huffman_decode(&state.dist_table, reader);
+            let distance: u32 = decode_distance(reader, dist_code);
+            copy_match(state, length, distance);
+        }
+    }
+}
+
+// Read dynamic Huffman code lengths
+fn read_dynamic_tables(state: &mut DeflateState, reader: &mut BitReader) {
+    // Read header
+    let hlit: u32 = bitreader_read(reader, 5) + 257;  // Literal codes (257-286)
+    let hdist: u32 = bitreader_read(reader, 5) + 1;   // Distance codes (1-32)
+    let hclen: u32 = bitreader_read(reader, 4) + 4;   // Code length codes (4-19)
+
+    // Read code length code lengths
+    let mut cl_lengths: u8[19] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for i in 0..hclen {
+        let idx: u32 = CL_ORDER[i] as u32;
+        cl_lengths[idx] = bitreader_read(reader, 3) as u8;
+    }
+
+    // Build code length Huffman table
+    let mut cl_table: HuffmanTable = HuffmanTable {
+        counts: [0 as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        symbols: [0 as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    };
+    huffman_build(&mut cl_table, &cl_lengths, 19);
+
+    // Read literal/length and distance code lengths
+    let mut all_lengths: u8[320] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let total: u32 = hlit + hdist;
+    let mut i: u32 = 0;
+
+    while i < total {
+        let sym: u32 = huffman_decode(&cl_table, reader);
+
+        if sym < 16 {
+            // Literal length value
+            all_lengths[i] = sym as u8;
+            i = i + 1;
+        } else if sym == 16 {
+            // Copy previous length 3-6 times
+            let repeat: u32 = 3 + bitreader_read(reader, 2);
+            let prev: u8 = all_lengths[i - 1];
+            for j in 0..repeat {
+                all_lengths[i] = prev;
+                i = i + 1;
+            }
+        } else if sym == 17 {
+            // Repeat zero 3-10 times
+            let repeat: u32 = 3 + bitreader_read(reader, 3);
+            for j in 0..repeat {
+                all_lengths[i] = 0;
+                i = i + 1;
+            }
+        } else {
+            // sym == 18: Repeat zero 11-138 times
+            let repeat: u32 = 11 + bitreader_read(reader, 7);
+            for j in 0..repeat {
+                all_lengths[i] = 0;
+                i = i + 1;
+            }
+        }
+    }
+
+    // Build literal/length table
+    huffman_build(&mut state.lit_table, &all_lengths, hlit);
+
+    // Build distance table (offset by hlit in all_lengths)
+    let mut dist_lengths: u8[32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for i in 0..hdist {
+        dist_lengths[i] = all_lengths[hlit + i];
+    }
+    huffman_build(&mut state.dist_table, &dist_lengths, hdist);
+}
+
+// Decode a stored (uncompressed) block
+fn decode_stored_block(state: &mut DeflateState, reader: &mut BitReader) {
+    // Align to byte boundary
+    bitreader_align(reader);
+
+    // Read length and complement
+    let len: u32 = bitreader_read(reader, 8) | (bitreader_read(reader, 8) << 8);
+    let nlen: u32 = bitreader_read(reader, 8) | (bitreader_read(reader, 8) << 8);
+
+    // Copy literal bytes
+    for i in 0..len {
+        if state.out_pos < state.out_size {
+            state.output[state.out_pos] = bitreader_read(reader, 8) as u8;
+            state.out_pos = state.out_pos + 1;
+        }
+    }
+}
+
+// ============================================================================
+// Main DEFLATE Functions
+// ============================================================================
+
+// Decompress DEFLATE data starting at given offset
+// Returns: number of bytes written to output
+fn deflate_decompress_at(input: &[u8], in_offset: u64, in_len: u64, output: &mut [u8]) -> u64 {
+    let mut reader: BitReader = BitReader {
+        data: input,
+        byte_pos: in_offset,
+        bit_pos: 0,
+        bit_buf: 0,
+        buf_avail: 0
+    };
+
+    let mut state: DeflateState = DeflateState {
+        output: output,
+        out_pos: 0,
+        out_size: output.len(),
+        lit_table: HuffmanTable {
+            counts: [0 as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            symbols: [0 as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        },
+        dist_table: HuffmanTable {
+            counts: [0 as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            symbols: [0 as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        }
+    };
+
+    let mut bfinal: u32 = 0;
+
+    while bfinal == 0 {
+        bfinal = bitreader_read(&mut reader, 1);
+        let btype: u32 = bitreader_read(&mut reader, 2);
+
+        if btype == 0 {
+            // Stored block
+            decode_stored_block(&mut state, &mut reader);
+        } else if btype == 1 {
+            // Fixed Huffman
+            build_fixed_lit_table(&mut state.lit_table);
+            build_fixed_dist_table(&mut state.dist_table);
+            decode_huffman_block(&mut state, &mut reader);
+        } else if btype == 2 {
+            // Dynamic Huffman
+            read_dynamic_tables(&mut state, &mut reader);
+            decode_huffman_block(&mut state, &mut reader);
+        }
+        // btype == 3 is reserved/error
+    }
+
+    return state.out_pos;
+}
+
+// Convenience wrapper that decompresses from the start
+fn deflate_decompress(input: &[u8], output: &mut [u8]) -> u64 {
+    return deflate_decompress_at(input, 0, input.len(), output);
+}
+
+// ============================================================================
+// DEFLATE Compression
+// ============================================================================
+
+// Reverse bits for Huffman codes (DEFLATE uses reversed bit order)
+fn reverse_bits(value: u32, nbits: u32) -> u32 {
+    let mut result: u32 = 0;
+    let mut v: u32 = value;
+    for i in 0..nbits {
+        result = (result << 1) | (v & 1);
+        v = v >> 1;
+    }
+    return result;
+}
+
+// Get length code for a given match length (3-258)
+// Returns (code, extra_bits_value, extra_bits_count)
+fn encode_length(length: u32) -> u32 {
+    // Find the appropriate length code
+    if length <= 10 {
+        return 257 + length - 3;  // 257-264: lengths 3-10
+    } else if length <= 18 {
+        return 265 + (length - 11) / 2;  // 265-268
+    } else if length <= 34 {
+        return 269 + (length - 19) / 4;  // 269-272
+    } else if length <= 66 {
+        return 273 + (length - 35) / 8;  // 273-276
+    } else if length <= 130 {
+        return 277 + (length - 67) / 16; // 277-280
+    } else if length <= 257 {
+        return 281 + (length - 131) / 32; // 281-284
+    } else {
+        return 285;  // length 258
+    }
+}
+
+// Get extra bits for length code
+fn get_length_extra_bits(length: u32, code: u32) -> u32 {
+    if code < 265 {
+        return 0;
+    }
+    let base: u32 = LENGTH_BASE[code - 257];
+    return length - base;
+}
+
+// Get distance code for a given distance (1-32768)
+fn encode_distance(dist: u32) -> u32 {
+    if dist <= 4 {
+        return dist - 1;  // 0-3: distances 1-4
+    } else if dist <= 8 {
+        return 4 + (dist - 5) / 2;   // 4-5
+    } else if dist <= 16 {
+        return 6 + (dist - 9) / 4;   // 6-7
+    } else if dist <= 32 {
+        return 8 + (dist - 17) / 8;  // 8-9
+    } else if dist <= 64 {
+        return 10 + (dist - 33) / 16;  // 10-11
+    } else if dist <= 128 {
+        return 12 + (dist - 65) / 32;  // 12-13
+    } else if dist <= 256 {
+        return 14 + (dist - 129) / 64; // 14-15
+    } else if dist <= 512 {
+        return 16 + (dist - 257) / 128; // 16-17
+    } else if dist <= 1024 {
+        return 18 + (dist - 513) / 256; // 18-19
+    } else if dist <= 2048 {
+        return 20 + (dist - 1025) / 512; // 20-21
+    } else if dist <= 4096 {
+        return 22 + (dist - 2049) / 1024; // 22-23
+    } else if dist <= 8192 {
+        return 24 + (dist - 4097) / 2048; // 24-25
+    } else if dist <= 16384 {
+        return 26 + (dist - 8193) / 4096; // 26-27
+    } else {
+        return 28 + (dist - 16385) / 8192; // 28-29
+    }
+}
+
+// Get extra bits for distance code
+fn get_distance_extra_bits(dist: u32, code: u32) -> u32 {
+    let base: u32 = DIST_BASE[code];
+    return dist - base;
+}
+
+// Write a fixed Huffman literal code (0-255) or end-of-block (256)
+fn write_fixed_lit(writer: &mut BitWriter, sym: u32) {
+    if sym <= 143 {
+        // 0-143: 8-bit codes 0b00110000 to 0b10111111 (48-191 reversed)
+        let code: u32 = 48 + sym;
+        bitwriter_write(writer, reverse_bits(code, 8), 8);
+    } else if sym <= 255 {
+        // 144-255: 9-bit codes 0b110010000 to 0b111111111 (400-511 reversed)
+        let code: u32 = 400 + (sym - 144);
+        bitwriter_write(writer, reverse_bits(code, 9), 9);
+    } else if sym == 256 {
+        // End of block: 7-bit code 0b0000000 (0 reversed)
+        bitwriter_write(writer, 0, 7);
+    } else if sym <= 279 {
+        // 257-279: 7-bit codes 0b0000001 to 0b0010111 (1-23 reversed)
+        let code: u32 = 1 + (sym - 257);
+        bitwriter_write(writer, reverse_bits(code, 7), 7);
+    } else {
+        // 280-287: 8-bit codes 0b11000000 to 0b11000111 (192-199 reversed)
+        let code: u32 = 192 + (sym - 280);
+        bitwriter_write(writer, reverse_bits(code, 8), 8);
+    }
+}
+
+// Write a fixed Huffman distance code (all 5 bits)
+fn write_fixed_dist(writer: &mut BitWriter, code: u32) {
+    bitwriter_write(writer, reverse_bits(code, 5), 5);
+}
+
+// ============================================================================
+// LZ77 Match Finding
+// ============================================================================
+
+// Window size for LZ77 (32KB)
+const WINDOW_SIZE: u32 = 32768;
+const WINDOW_MASK: u32 = 32767;  // For modulo operation
+const MIN_MATCH: u32 = 3;
+const MAX_MATCH: u32 = 258;
+const MAX_CHAIN_LEN: u32 = 128;  // Limit chain traversal for speed
+
+// Hash 3 bytes to a 16-bit value
+fn hash3(a: u8, b: u8, c: u8) -> u32 {
+    // Simple multiplicative hash
+    return (((a as u32) << 10) ^ ((b as u32) << 5) ^ (c as u32)) & 0xFFFF;
+}
+
+// Find the longest match at position `pos` in input
+// Returns (match_length, match_distance) where length=0 means no match found
+fn find_match(
+    input: &[u8],
+    pos: u64,
+    head: &u32[65536],
+    prev: &u32[32768]
+) -> u64 {
+    let in_len: u64 = input.len();
+
+    // Need at least 3 bytes for a match
+    if pos + 3 > in_len {
+        return 0;  // No match
+    }
+
+    // Compute hash of next 3 bytes
+    let h: u32 = hash3(input[pos], input[pos + 1], input[pos + 2]);
+
+    // Get first candidate position from hash table
+    let mut candidate: u32 = head[h];
+
+    let mut best_len: u32 = 0;
+    let mut best_dist: u32 = 0;
+    let mut chain_count: u32 = 0;
+
+    // Walk the hash chain looking for matches
+    while candidate > 0 && chain_count < MAX_CHAIN_LEN {
+        let cand_pos: u64 = (candidate - 1) as u64;  // Stored as 1-based
+        let dist: u64 = pos - cand_pos;
+
+        // Check if still within window
+        if dist > WINDOW_SIZE as u64 {
+            break;
+        }
+
+        // Quick check: compare first and last bytes of current best
+        if best_len > 0 {
+            if input[cand_pos] != input[pos] ||
+               input[cand_pos + best_len as u64] != input[pos + best_len as u64] {
+                // Skip this candidate
+                candidate = prev[(cand_pos as u32) & WINDOW_MASK];
+                chain_count = chain_count + 1;
+                continue;
+            }
+        }
+
+        // Count matching bytes
+        let mut match_len: u32 = 0;
+        let max_len: u64 = in_len - pos;
+        let mut max_len_capped: u32 = max_len as u32;
+        if max_len > MAX_MATCH as u64 {
+            max_len_capped = MAX_MATCH;
+        }
+
+        while match_len < max_len_capped {
+            if input[cand_pos + match_len as u64] != input[pos + match_len as u64] {
+                break;
+            }
+            match_len = match_len + 1;
+        }
+
+        // Update best if this is longer
+        if match_len >= MIN_MATCH && match_len > best_len {
+            best_len = match_len;
+            best_dist = dist as u32;
+
+            // Early exit if max length found
+            if best_len >= MAX_MATCH {
+                break;
+            }
+        }
+
+        // Move to next in chain
+        candidate = prev[(cand_pos as u32) & WINDOW_MASK];
+        chain_count = chain_count + 1;
+    }
+
+    // Pack length and distance into single u64
+    // Low 32 bits = length, high 32 bits = distance
+    return (best_len as u64) | ((best_dist as u64) << 32);
+}
+
+// Compress data using fixed Huffman codes with LZ77 matching
+// Returns number of bytes written to output
+fn deflate_compress_fixed(input: &[u8], output: &mut [u8]) -> u64 {
+    let mut writer: BitWriter = BitWriter {
+        data: output,
+        byte_pos: 0,
+        bit_buf: 0,
+        buf_used: 0
+    };
+
+    // Write block header: BFINAL=1, BTYPE=01 (fixed Huffman)
+    bitwriter_write(&mut writer, 1, 1);  // BFINAL
+    bitwriter_write(&mut writer, 1, 2);  // BTYPE = 01 (fixed)
+
+    let in_len: u64 = input.len();
+
+    // Hash table: head[hash] = position+1 of most recent occurrence (0 = none)
+    let mut head: u32[65536] = [0; 65536];
+    // Chain: prev[pos % WINDOW_SIZE] = previous position+1 with same hash
+    let mut prev: u32[32768] = [0; 32768];
+
+    let mut pos: u64 = 0;
+
+    while pos < in_len {
+        // Try to find a match
+        let match_result: u64 = find_match(input, pos, &head, &prev);
+        let match_len: u32 = (match_result & 0xFFFFFFFF) as u32;
+        let match_dist: u32 = (match_result >> 32) as u32;
+
+        if match_len >= MIN_MATCH {
+            // Emit length/distance pair
+            let len_code: u32 = encode_length(match_len);
+            let len_extra: u32 = get_length_extra_bits(match_len, len_code);
+            let len_extra_bits: u8 = LENGTH_EXTRA[len_code - 257];
+
+            // Write length code
+            write_fixed_lit(&mut writer, len_code);
+
+            // Write length extra bits if any
+            if len_extra_bits > 0 {
+                bitwriter_write(&mut writer, len_extra, len_extra_bits as u32);
+            }
+
+            // Write distance code
+            let dist_code: u32 = encode_distance(match_dist);
+            write_fixed_dist(&mut writer, dist_code);
+
+            // Write distance extra bits if any
+            let dist_extra_bits: u8 = DIST_EXTRA[dist_code];
+            if dist_extra_bits > 0 {
+                let dist_extra: u32 = get_distance_extra_bits(match_dist, dist_code);
+                bitwriter_write(&mut writer, dist_extra, dist_extra_bits as u32);
+            }
+
+            // Update hash table for all positions in the match
+            for i in 0..match_len {
+                let p: u64 = pos + i as u64;
+                if p + 2 < in_len {
+                    let h: u32 = hash3(input[p], input[p + 1], input[p + 2]);
+                    let win_pos: u32 = (p as u32) & WINDOW_MASK;
+                    prev[win_pos] = head[h];
+                    head[h] = (p as u32) + 1;
+                }
+            }
+
+            pos = pos + match_len as u64;
+        } else {
+            // Emit literal
+            write_fixed_lit(&mut writer, input[pos] as u32);
+
+            // Update hash table for this position
+            if pos + 2 < in_len {
+                let h: u32 = hash3(input[pos], input[pos + 1], input[pos + 2]);
+                let win_pos: u32 = (pos as u32) & WINDOW_MASK;
+                prev[win_pos] = head[h];
+                head[h] = (pos as u32) + 1;
+            }
+
+            pos = pos + 1;
+        }
+    }
+
+    // Write end-of-block marker
+    write_fixed_lit(&mut writer, 256);
+
+    // Finish and return byte count
+    return bitwriter_finish(&mut writer);
+}
+
+// Compress data using fixed Huffman codes with LZ77, starting at a given offset
+// Returns number of bytes written to output
+fn deflate_compress_at(input: &[u8], output: &mut [u8], out_offset: u64) -> u64 {
+    let mut writer: BitWriter = BitWriter {
+        data: output,
+        byte_pos: out_offset,
+        bit_buf: 0,
+        buf_used: 0
+    };
+
+    // Write block header: BFINAL=1, BTYPE=01 (fixed Huffman)
+    bitwriter_write(&mut writer, 1, 1);  // BFINAL
+    bitwriter_write(&mut writer, 1, 2);  // BTYPE = 01 (fixed)
+
+    let in_len: u64 = input.len();
+
+    // Hash table: head[hash] = position+1 of most recent occurrence (0 = none)
+    let mut head: u32[65536] = [0; 65536];
+    // Chain: prev[pos % WINDOW_SIZE] = previous position+1 with same hash
+    let mut prev: u32[32768] = [0; 32768];
+
+    let mut pos: u64 = 0;
+
+    while pos < in_len {
+        // Try to find a match
+        let match_result: u64 = find_match(input, pos, &head, &prev);
+        let match_len: u32 = (match_result & 0xFFFFFFFF) as u32;
+        let match_dist: u32 = (match_result >> 32) as u32;
+
+        if match_len >= MIN_MATCH {
+            // Emit length/distance pair
+            let len_code: u32 = encode_length(match_len);
+            let len_extra: u32 = get_length_extra_bits(match_len, len_code);
+            let len_extra_bits: u8 = LENGTH_EXTRA[len_code - 257];
+
+            // Write length code
+            write_fixed_lit(&mut writer, len_code);
+
+            // Write length extra bits if any
+            if len_extra_bits > 0 {
+                bitwriter_write(&mut writer, len_extra, len_extra_bits as u32);
+            }
+
+            // Write distance code
+            let dist_code: u32 = encode_distance(match_dist);
+            write_fixed_dist(&mut writer, dist_code);
+
+            // Write distance extra bits if any
+            let dist_extra_bits: u8 = DIST_EXTRA[dist_code];
+            if dist_extra_bits > 0 {
+                let dist_extra: u32 = get_distance_extra_bits(match_dist, dist_code);
+                bitwriter_write(&mut writer, dist_extra, dist_extra_bits as u32);
+            }
+
+            // Update hash table for all positions in the match
+            for i in 0..match_len {
+                let p: u64 = pos + i as u64;
+                if p + 2 < in_len {
+                    let h: u32 = hash3(input[p], input[p + 1], input[p + 2]);
+                    let win_pos: u32 = (p as u32) & WINDOW_MASK;
+                    prev[win_pos] = head[h];
+                    head[h] = (p as u32) + 1;
+                }
+            }
+
+            pos = pos + match_len as u64;
+        } else {
+            // Emit literal
+            write_fixed_lit(&mut writer, input[pos] as u32);
+
+            // Update hash table for this position
+            if pos + 2 < in_len {
+                let h: u32 = hash3(input[pos], input[pos + 1], input[pos + 2]);
+                let win_pos: u32 = (pos as u32) & WINDOW_MASK;
+                prev[win_pos] = head[h];
+                head[h] = (pos as u32) + 1;
+            }
+
+            pos = pos + 1;
+        }
+    }
+
+    // Write end-of-block marker
+    write_fixed_lit(&mut writer, 256);
+
+    // Finish and return byte count
+    let final_pos: u64 = bitwriter_finish(&mut writer);
+    return final_pos - out_offset;
+}
+
+// Wrapper for simple DEFLATE compression
+fn deflate_compress(input: &[u8], output: &mut [u8]) -> u64 {
+    return deflate_compress_at(input, output, 0);
+}

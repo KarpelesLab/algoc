@@ -66,7 +66,7 @@ impl JavaScriptGenerator {
             // These builtin expressions produce arrays
             ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
             // Array literals
-            ExprKind::Array(_) => true,
+            ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
             // Slice expressions produce array views
             ExprKind::Slice { .. } => true,
             // References to arrays are still arrays
@@ -533,6 +533,14 @@ impl JavaScriptGenerator {
                     }
                 }
             }
+            ExprKind::ArrayRepeat { value, count } => {
+                // Generate new Array(count).fill(value)
+                self.write("new Array(");
+                self.write(&count.to_string());
+                self.write(").fill(");
+                self.generate_expr(value);
+                self.write(")");
+            }
             ExprKind::Cast { expr, .. } => {
                 // In JavaScript, casts are mostly no-ops for numeric types
                 // For now, just generate the expression
@@ -657,13 +665,24 @@ impl CodeGenerator for JavaScriptGenerator {
             self.writeln("");
         }
 
-        // Export functions
+        // Export functions and struct creators
         self.writeln("// Exports");
         self.writeln("if (typeof module !== 'undefined' && module.exports) {");
         self.indent();
         self.write_indent();
         self.write("module.exports = { ");
         let mut first = true;
+        // Export struct creators
+        for item in &ast.ast.items {
+            if let ItemKind::Struct(s) = &item.kind {
+                if !first {
+                    self.write(", ");
+                }
+                self.write(&format!("create_{}", s.name.name));
+                first = false;
+            }
+        }
+        // Export functions
         for item in &ast.ast.items {
             if let ItemKind::Function(func) = &item.kind {
                 if !first {

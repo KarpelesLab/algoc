@@ -1,0 +1,291 @@
+// Gzip compression/decompression implementation
+// Based on RFC 1952 - GZIP file format specification
+//
+// This implementation supports:
+// - Decompression of gzip files
+// - Basic compression (using DEFLATE stored blocks for simplicity)
+
+use "../runtime.algoc";
+use "crc32.algoc";
+use "deflate.algoc";
+
+// ============================================================================
+// Gzip Constants
+// ============================================================================
+
+// Magic numbers
+const GZIP_ID1: u8 = 0x1F;
+const GZIP_ID2: u8 = 0x8B;
+
+// Compression method
+const CM_DEFLATE: u8 = 8;
+
+// Flag bits
+const FTEXT: u8 = 1;      // Text file (hint only)
+const FHCRC: u8 = 2;      // Header CRC present
+const FEXTRA: u8 = 4;     // Extra field present
+const FNAME: u8 = 8;      // Original file name present
+const FCOMMENT: u8 = 16;  // Comment present
+
+// ============================================================================
+// Gzip Decompression
+// ============================================================================
+
+// Decompress gzip data
+// Returns: number of bytes written to output, or 0 on error
+fn gzip_decompress(input: &[u8], output: &mut [u8]) -> u64 {
+    // Check minimum size (10 byte header + 8 byte trailer)
+    if input.len() < 18 {
+        return 0;
+    }
+
+    // Check magic numbers
+    if input[0] != GZIP_ID1 || input[1] != GZIP_ID2 {
+        return 0;
+    }
+
+    // Check compression method
+    if input[2] != CM_DEFLATE {
+        return 0;
+    }
+
+    let flags: u8 = input[3];
+    // Skip MTIME (4 bytes), XFL (1 byte), OS (1 byte)
+    let mut pos: u64 = 10;
+
+    // Skip extra field if present
+    if (flags & FEXTRA) != 0 {
+        if pos + 2 > input.len() {
+            return 0;
+        }
+        let xlen: u64 = (input[pos] as u64) | ((input[pos + 1] as u64) << 8);
+        pos = pos + 2 + xlen;
+    }
+
+    // Skip filename if present (null-terminated)
+    if (flags & FNAME) != 0 {
+        while pos < input.len() && input[pos] != 0 {
+            pos = pos + 1;
+        }
+        pos = pos + 1; // Skip the null terminator
+    }
+
+    // Skip comment if present (null-terminated)
+    if (flags & FCOMMENT) != 0 {
+        while pos < input.len() && input[pos] != 0 {
+            pos = pos + 1;
+        }
+        pos = pos + 1; // Skip the null terminator
+    }
+
+    // Skip header CRC if present
+    if (flags & FHCRC) != 0 {
+        pos = pos + 2;
+    }
+
+    // The DEFLATE data ends 8 bytes before the end (CRC32 + ISIZE)
+    if pos + 8 > input.len() {
+        return 0;
+    }
+    let deflate_end: u64 = input.len() - 8;
+    let deflate_len: u64 = deflate_end - pos;
+
+    // Decompress the DEFLATE data
+    let out_len: u64 = deflate_decompress_at(input, pos, deflate_len, output);
+
+    // Read expected CRC32 and size from trailer
+    let trailer_pos: u64 = input.len() - 8;
+    let expected_crc: u32 = read_u32_le(input, trailer_pos);
+    let expected_size: u32 = read_u32_le(input, trailer_pos + 4);
+
+    // Verify CRC32
+    let actual_crc: u32 = crc32_range_mut(output, 0, out_len);
+    if actual_crc != expected_crc {
+        // CRC mismatch - return 0 to indicate error
+        // In a real implementation, we might want to return a different error code
+        return 0;
+    }
+
+    // Verify size (mod 2^32)
+    let actual_size: u32 = out_len as u32;
+    if actual_size != expected_size {
+        return 0;
+    }
+
+    return out_len;
+}
+
+// ============================================================================
+// Gzip Compression (Basic - using stored blocks)
+// ============================================================================
+
+// Compress data to gzip format using stored blocks (no compression)
+// This is a simple implementation that doesn't actually compress
+// but produces valid gzip output
+// Returns: number of bytes written to output
+fn gzip_compress_stored(input: &[u8], output: &mut [u8]) -> u64 {
+    let mut pos: u64 = 0;
+
+    // Write gzip header (10 bytes minimum)
+    output[pos] = GZIP_ID1;
+    pos = pos + 1;
+    output[pos] = GZIP_ID2;
+    pos = pos + 1;
+    output[pos] = CM_DEFLATE;
+    pos = pos + 1;
+    output[pos] = 0; // FLG - no extra fields
+    pos = pos + 1;
+
+    // MTIME - set to 0 (unknown)
+    output[pos] = 0;
+    output[pos + 1] = 0;
+    output[pos + 2] = 0;
+    output[pos + 3] = 0;
+    pos = pos + 4;
+
+    // XFL - extra flags
+    output[pos] = 0;
+    pos = pos + 1;
+
+    // OS - unknown
+    output[pos] = 255;
+    pos = pos + 1;
+
+    // Write DEFLATE data using stored blocks
+    // For stored blocks, data is split into 65535-byte chunks
+    let mut remaining: u64 = input.len();
+    let mut in_pos: u64 = 0;
+
+    while remaining > 0 {
+        let mut bfinal: u8 = 0;
+
+        // Limit block size to 65535
+        let mut chunk_size: u64 = remaining;
+        if chunk_size > 65535 {
+            chunk_size = 65535;
+        }
+
+        // Check if this is the final block
+        if remaining <= 65535 {
+            bfinal = 1;
+        }
+
+        // Write block header
+        // BFINAL (1 bit) + BTYPE=00 (2 bits) = stored block
+        // Remaining 5 bits are padding to byte boundary
+        output[pos] = bfinal; // BFINAL=bfinal, BTYPE=00, padding=00000
+        pos = pos + 1;
+
+        // Write LEN and NLEN
+        let len_lo: u8 = (chunk_size & 0xFF) as u8;
+        let len_hi: u8 = ((chunk_size >> 8) & 0xFF) as u8;
+        output[pos] = len_lo;
+        output[pos + 1] = len_hi;
+        // NLEN is one's complement of LEN (XOR with 0xFF)
+        output[pos + 2] = len_lo ^ 0xFF;
+        output[pos + 3] = len_hi ^ 0xFF;
+        pos = pos + 4;
+
+        // Copy literal data
+        for i in 0..chunk_size {
+            output[pos] = input[in_pos + i];
+            pos = pos + 1;
+        }
+
+        in_pos = in_pos + chunk_size;
+        remaining = remaining - chunk_size;
+    }
+
+    // Handle empty input - write an empty final stored block
+    if input.len() == 0 {
+        output[pos] = 1; // BFINAL=1, BTYPE=00
+        pos = pos + 1;
+        output[pos] = 0; // LEN low
+        output[pos + 1] = 0; // LEN high
+        output[pos + 2] = 255; // NLEN low (one's complement)
+        output[pos + 3] = 255; // NLEN high
+        pos = pos + 4;
+    }
+
+    // Write CRC32 of original data
+    let crc: u32 = crc32(input);
+    write_u32_le(output, pos, crc);
+    pos = pos + 4;
+
+    // Write original size (mod 2^32)
+    let size: u32 = input.len() as u32;
+    write_u32_le(output, pos, size);
+    pos = pos + 4;
+
+    return pos;
+}
+
+// ============================================================================
+// Gzip Compression (Using DEFLATE with fixed Huffman)
+// ============================================================================
+
+// Compress data to gzip format using DEFLATE with fixed Huffman codes
+// Returns: number of bytes written to output
+fn gzip_compress(input: &[u8], output: &mut [u8]) -> u64 {
+    let mut pos: u64 = 0;
+
+    // Write gzip header (10 bytes minimum)
+    output[pos] = GZIP_ID1;
+    pos = pos + 1;
+    output[pos] = GZIP_ID2;
+    pos = pos + 1;
+    output[pos] = CM_DEFLATE;
+    pos = pos + 1;
+    output[pos] = 0; // FLG - no extra fields
+    pos = pos + 1;
+
+    // MTIME - set to 0 (unknown)
+    output[pos] = 0;
+    output[pos + 1] = 0;
+    output[pos + 2] = 0;
+    output[pos + 3] = 0;
+    pos = pos + 4;
+
+    // XFL - extra flags
+    output[pos] = 0;
+    pos = pos + 1;
+
+    // OS - unknown
+    output[pos] = 255;
+    pos = pos + 1;
+
+    // Compress using DEFLATE
+    // We need to write directly to output starting at pos
+    // Create a temporary view of the remaining output
+    let deflate_len: u64 = deflate_compress_at(input, output, pos);
+    pos = pos + deflate_len;
+
+    // Write CRC32 of original data
+    let crc: u32 = crc32(input);
+    write_u32_le(output, pos, crc);
+    pos = pos + 4;
+
+    // Write original size (mod 2^32)
+    let size: u32 = input.len() as u32;
+    write_u32_le(output, pos, size);
+    pos = pos + 4;
+
+    return pos;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test gzip_decompress_empty() {
+    // Gzip compressed empty file
+    // Generated with: echo -n "" | gzip | xxd -i
+    let compressed: u8[20] = [
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    ];
+    let mut output: u8[100] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    let out_len: u64 = gzip_decompress(&compressed, &mut output);
+    assert(out_len == 0);
+}

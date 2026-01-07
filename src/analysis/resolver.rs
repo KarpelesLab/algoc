@@ -350,6 +350,9 @@ impl Resolver {
                     self.resolve_expr(elem);
                 }
             }
+            parser::ExprKind::ArrayRepeat { value, .. } => {
+                self.resolve_expr(value);
+            }
             parser::ExprKind::Cast { expr, ty } => {
                 self.resolve_expr(expr);
                 self.resolve_type(ty);
