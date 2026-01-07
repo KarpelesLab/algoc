@@ -7,8 +7,12 @@
 pub mod errors;
 pub mod lexer;
 pub mod parser;
+pub mod analysis;
+pub mod codegen;
 
 // Re-export commonly used types
 pub use errors::{AlgocError, AlgocResult, SourceSpan};
 pub use lexer::{Lexer, Token, TokenKind};
 pub use parser::{Ast, Parser};
+pub use analysis::{analyze, AnalyzedAst};
+pub use codegen::{CodeGenerator, JavaScriptGenerator};

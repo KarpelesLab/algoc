@@ -6,13 +6,15 @@ mod types;
 mod scope;
 mod resolver;
 mod checker;
+mod validator;
 
 pub use types::{Type, TypeKind, TypeError};
 pub use scope::{Scope, Symbol, SymbolKind};
 pub use resolver::Resolver;
 pub use checker::TypeChecker;
+pub use validator::Validator;
 
-use crate::errors::{AlgocError, AlgocResult};
+use crate::errors::AlgocResult;
 use crate::parser::Ast;
 
 /// Analyzed program with resolved types and symbols
@@ -25,12 +27,16 @@ pub struct AnalyzedAst {
 /// Run all analysis passes on the AST
 pub fn analyze(ast: Ast) -> AlgocResult<AnalyzedAst> {
     // Pass 1: Resolve names and build symbol tables
-    let mut resolver = Resolver::new();
+    let resolver = Resolver::new();
     let global_scope = resolver.resolve(&ast)?;
 
     // Pass 2: Type check all expressions and statements
-    let mut checker = TypeChecker::new(&global_scope);
+    let checker = TypeChecker::new(&global_scope);
     checker.check(&ast)?;
+
+    // Pass 3: Semantic validation (break/continue in loops, etc.)
+    let validator = Validator::new();
+    validator.validate(&ast)?;
 
     Ok(AnalyzedAst { ast, global_scope })
 }

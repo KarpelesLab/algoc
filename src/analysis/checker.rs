@@ -1,0 +1,841 @@
+//! Type checking pass
+//!
+//! Verifies that all expressions have compatible types.
+
+use crate::errors::{AlgocError, AlgocResult, SourceSpan};
+use crate::parser::{self, Ast, Item, ItemKind, BinaryOp, UnaryOp, BuiltinFunc, PrimitiveType as AstPrimitive};
+use super::scope::{Scope, ScopeStack, Symbol, SymbolKind};
+use super::types::{Type, TypeKind};
+
+/// Type checker that verifies type correctness
+pub struct TypeChecker<'a> {
+    /// The global scope from name resolution
+    global_scope: &'a Scope,
+    /// Current scope stack for local lookups
+    scopes: ScopeStack,
+    /// Current function's return type (for checking return statements)
+    current_return_type: Option<Type>,
+    /// Collected errors
+    errors: Vec<AlgocError>,
+}
+
+impl<'a> TypeChecker<'a> {
+    /// Create a new type checker
+    pub fn new(global_scope: &'a Scope) -> Self {
+        Self {
+            global_scope,
+            scopes: ScopeStack::new(),
+            current_return_type: None,
+            errors: Vec::new(),
+        }
+    }
+
+    /// Type check the entire AST
+    pub fn check(mut self, ast: &Ast) -> AlgocResult<()> {
+        // Copy global symbols to local scope stack
+        for (name, sym) in self.global_scope.symbols() {
+            let _ = self.scopes.define(name.clone(), sym.clone());
+        }
+
+        for item in &ast.items {
+            self.check_item(item);
+        }
+
+        if !self.errors.is_empty() {
+            return Err(self.errors.remove(0));
+        }
+
+        Ok(())
+    }
+
+    /// Record an error
+    fn error(&mut self, message: impl Into<String>, span: SourceSpan) {
+        self.errors.push(AlgocError::type_error(message, span));
+    }
+
+    /// Convert an AST type to a checked type
+    fn ast_to_type(&self, ty: &parser::Type) -> Type {
+        match &ty.kind {
+            parser::TypeKind::Primitive(p) => self.primitive_to_type(*p),
+            parser::TypeKind::Array { element, size } => {
+                Type::array(self.ast_to_type(element), *size)
+            }
+            parser::TypeKind::Slice { element } => {
+                Type::slice(self.ast_to_type(element))
+            }
+            parser::TypeKind::ArrayRef { element, size } => {
+                Type::reference(Type::array(self.ast_to_type(element), *size), false)
+            }
+            parser::TypeKind::MutRef(inner) => {
+                Type::reference(self.ast_to_type(inner), true)
+            }
+            parser::TypeKind::Ref(inner) => {
+                Type::reference(self.ast_to_type(inner), false)
+            }
+            parser::TypeKind::Named(ident) => {
+                Type::struct_type(ident.name.clone())
+            }
+        }
+    }
+
+    fn primitive_to_type(&self, p: AstPrimitive) -> Type {
+        match p {
+            AstPrimitive::U8 => Type::int(8, false),
+            AstPrimitive::U16 => Type::int(16, false),
+            AstPrimitive::U32 => Type::int(32, false),
+            AstPrimitive::U64 => Type::int(64, false),
+            AstPrimitive::U128 => Type::int(128, false),
+            AstPrimitive::I8 => Type::int(8, true),
+            AstPrimitive::I16 => Type::int(16, true),
+            AstPrimitive::I32 => Type::int(32, true),
+            AstPrimitive::I64 => Type::int(64, true),
+            AstPrimitive::I128 => Type::int(128, true),
+            AstPrimitive::Bool => Type::bool(),
+        }
+    }
+
+    /// Check a top-level item
+    fn check_item(&mut self, item: &Item) {
+        match &item.kind {
+            ItemKind::Function(func) => {
+                let return_type = func.return_type.as_ref()
+                    .map(|t| self.ast_to_type(t))
+                    .unwrap_or_else(Type::unit);
+                self.current_return_type = Some(return_type);
+
+                self.scopes.push();
+
+                // Add parameters to scope
+                for param in &func.params {
+                    let ty = self.ast_to_type(&param.ty);
+                    let symbol = Symbol::parameter(ty, param.span);
+                    let _ = self.scopes.define(param.name.name.clone(), symbol);
+                }
+
+                self.check_block(&func.body);
+
+                self.scopes.pop();
+                self.current_return_type = None;
+            }
+            ItemKind::Const(c) => {
+                let declared_ty = self.ast_to_type(&c.ty);
+                let actual_ty = self.infer_expr(&c.value);
+                if !actual_ty.is_compatible_with(&declared_ty) {
+                    self.error(
+                        format!("constant '{}' has type {}, but initializer has type {}",
+                            c.name.name, declared_ty, actual_ty),
+                        c.value.span,
+                    );
+                }
+            }
+            ItemKind::Test(_) => {
+                // Tests are checked at runtime
+            }
+            ItemKind::Struct(_) | ItemKind::Layout(_) => {
+                // Type definitions don't need checking
+            }
+        }
+    }
+
+    /// Check a block of statements
+    fn check_block(&mut self, block: &parser::Block) {
+        for stmt in &block.stmts {
+            self.check_stmt(stmt);
+        }
+    }
+
+    /// Check a statement
+    fn check_stmt(&mut self, stmt: &parser::Stmt) {
+        match &stmt.kind {
+            parser::StmtKind::Let { name, ty, init, mutable } => {
+                let declared_ty = ty.as_ref().map(|t| self.ast_to_type(t));
+
+                if let Some(init) = init {
+                    let init_ty = self.infer_expr(init);
+                    if let Some(ref declared) = declared_ty {
+                        if !init_ty.is_compatible_with(declared) {
+                            self.error(
+                                format!("cannot assign {} to variable of type {}", init_ty, declared),
+                                init.span,
+                            );
+                        }
+                    }
+                }
+
+                let var_ty = declared_ty.unwrap_or_else(|| {
+                    if let Some(init) = init {
+                        self.infer_expr(init)
+                    } else {
+                        self.error("variable without type annotation must have initializer", name.span);
+                        Type::error()
+                    }
+                });
+
+                let symbol = Symbol::variable(var_ty, name.span, *mutable);
+                let _ = self.scopes.define(name.name.clone(), symbol);
+            }
+            parser::StmtKind::Expr(expr) => {
+                self.infer_expr(expr);
+            }
+            parser::StmtKind::Assign { target, value } => {
+                let target_ty = self.infer_expr(target);
+                let value_ty = self.infer_expr(value);
+
+                // Check assignability
+                if !value_ty.is_compatible_with(&target_ty) {
+                    self.error(
+                        format!("cannot assign {} to {}", value_ty, target_ty),
+                        value.span,
+                    );
+                }
+
+                // Check that target is assignable (lvalue)
+                self.check_assignable(target);
+            }
+            parser::StmtKind::CompoundAssign { target, op, value } => {
+                let target_ty = self.infer_expr(target);
+                let value_ty = self.infer_expr(value);
+
+                // For compound assignment, both sides should be numeric
+                if !target_ty.is_integer() || !value_ty.is_integer() {
+                    self.error(
+                        format!("compound assignment requires integer types, got {} and {}", target_ty, value_ty),
+                        stmt.span,
+                    );
+                }
+
+                self.check_assignable(target);
+            }
+            parser::StmtKind::If { condition, then_block, else_block } => {
+                let cond_ty = self.infer_expr(condition);
+                if !cond_ty.is_bool() && !cond_ty.is_error() {
+                    self.error(
+                        format!("if condition must be bool, got {}", cond_ty),
+                        condition.span,
+                    );
+                }
+
+                self.scopes.push();
+                self.check_block(then_block);
+                self.scopes.pop();
+
+                if let Some(else_block) = else_block {
+                    self.scopes.push();
+                    self.check_block(else_block);
+                    self.scopes.pop();
+                }
+            }
+            parser::StmtKind::For { var, start, end, body, .. } => {
+                let start_ty = self.infer_expr(start);
+                let end_ty = self.infer_expr(end);
+
+                if !start_ty.is_integer() && !start_ty.is_error() {
+                    self.error(
+                        format!("for loop start must be integer, got {}", start_ty),
+                        start.span,
+                    );
+                }
+                if !end_ty.is_integer() && !end_ty.is_error() {
+                    self.error(
+                        format!("for loop end must be integer, got {}", end_ty),
+                        end.span,
+                    );
+                }
+
+                self.scopes.push();
+                // Loop variable has same type as range bounds (default to u64)
+                let var_ty = if start_ty.is_integer() { start_ty } else { Type::int(64, false) };
+                let symbol = Symbol::variable(var_ty, var.span, false);
+                let _ = self.scopes.define(var.name.clone(), symbol);
+                self.check_block(body);
+                self.scopes.pop();
+            }
+            parser::StmtKind::While { condition, body } => {
+                let cond_ty = self.infer_expr(condition);
+                if !cond_ty.is_bool() && !cond_ty.is_error() {
+                    self.error(
+                        format!("while condition must be bool, got {}", cond_ty),
+                        condition.span,
+                    );
+                }
+
+                self.scopes.push();
+                self.check_block(body);
+                self.scopes.pop();
+            }
+            parser::StmtKind::Loop { body } => {
+                self.scopes.push();
+                self.check_block(body);
+                self.scopes.pop();
+            }
+            parser::StmtKind::Break | parser::StmtKind::Continue => {
+                // Could check if we're inside a loop, but that's a semantic check
+            }
+            parser::StmtKind::Return(expr) => {
+                let return_ty = expr.as_ref()
+                    .map(|e| self.infer_expr(e))
+                    .unwrap_or_else(Type::unit);
+
+                if let Some(ref expected) = self.current_return_type {
+                    if !return_ty.is_compatible_with(expected) {
+                        self.error(
+                            format!("return type mismatch: expected {}, got {}", expected, return_ty),
+                            stmt.span,
+                        );
+                    }
+                }
+            }
+            parser::StmtKind::Block(block) => {
+                self.scopes.push();
+                self.check_block(block);
+                self.scopes.pop();
+            }
+        }
+    }
+
+    /// Check that an expression is assignable (is an lvalue)
+    fn check_assignable(&mut self, expr: &parser::Expr) {
+        match &expr.kind {
+            parser::ExprKind::Ident(ident) => {
+                if let Some(sym) = self.scopes.lookup(&ident.name) {
+                    if !sym.mutable && sym.kind == SymbolKind::Variable {
+                        self.error(
+                            format!("cannot assign to immutable variable '{}'", ident.name),
+                            ident.span,
+                        );
+                    }
+                }
+            }
+            parser::ExprKind::Index { array, .. } => {
+                // Indexing into an array is assignable if the array is mutable
+                self.check_assignable(array);
+            }
+            parser::ExprKind::Field { object, .. } => {
+                // Field access is assignable if the object is mutable
+                self.check_assignable(object);
+            }
+            parser::ExprKind::Deref(inner) => {
+                // Dereferencing is assignable if inner is a mutable reference
+                let inner_ty = self.infer_expr(inner);
+                if !inner_ty.is_mut_ref() && !inner_ty.is_error() {
+                    self.error("cannot assign through immutable reference", expr.span);
+                }
+            }
+            _ => {
+                self.error("expression is not assignable", expr.span);
+            }
+        }
+    }
+
+    /// Infer the type of an expression
+    fn infer_expr(&mut self, expr: &parser::Expr) -> Type {
+        match &expr.kind {
+            parser::ExprKind::Integer(n) => {
+                // Infer smallest type that fits
+                if *n <= u8::MAX as u128 {
+                    Type::int(8, false)
+                } else if *n <= u16::MAX as u128 {
+                    Type::int(16, false)
+                } else if *n <= u32::MAX as u128 {
+                    Type::int(32, false)
+                } else if *n <= u64::MAX as u128 {
+                    Type::int(64, false)
+                } else {
+                    Type::int(128, false)
+                }
+            }
+            parser::ExprKind::Bool(_) => Type::bool(),
+            parser::ExprKind::String(_) => {
+                // Strings are slices of u8
+                Type::slice(Type::int(8, false))
+            }
+            parser::ExprKind::Bytes(_) | parser::ExprKind::Hex(_) => {
+                // bytes() and hex() return byte slices
+                Type::slice(Type::int(8, false))
+            }
+            parser::ExprKind::Ident(ident) => {
+                if let Some(sym) = self.scopes.lookup(&ident.name) {
+                    sym.ty.clone()
+                } else if let Some(sym) = self.global_scope.get(&ident.name) {
+                    sym.ty.clone()
+                } else {
+                    self.error(format!("undefined variable '{}'", ident.name), ident.span);
+                    Type::error()
+                }
+            }
+            parser::ExprKind::Binary { left, op, right } => {
+                let left_ty = self.infer_expr(left);
+                let right_ty = self.infer_expr(right);
+                self.check_binary_op(*op, &left_ty, &right_ty, expr.span)
+            }
+            parser::ExprKind::Unary { op, operand } => {
+                let operand_ty = self.infer_expr(operand);
+                self.check_unary_op(*op, &operand_ty, expr.span)
+            }
+            parser::ExprKind::Index { array, index } => {
+                let array_ty = self.infer_expr(array);
+                let index_ty = self.infer_expr(index);
+
+                if !index_ty.is_integer() && !index_ty.is_error() {
+                    self.error(
+                        format!("index must be integer, got {}", index_ty),
+                        index.span,
+                    );
+                }
+
+                if let Some(elem_ty) = array_ty.element_type() {
+                    elem_ty.clone()
+                } else if !array_ty.is_error() {
+                    self.error(
+                        format!("cannot index into type {}", array_ty),
+                        array.span,
+                    );
+                    Type::error()
+                } else {
+                    Type::error()
+                }
+            }
+            parser::ExprKind::Slice { array, start, end, .. } => {
+                let array_ty = self.infer_expr(array);
+                let start_ty = self.infer_expr(start);
+                let end_ty = self.infer_expr(end);
+
+                if !start_ty.is_integer() && !start_ty.is_error() {
+                    self.error(format!("slice start must be integer, got {}", start_ty), start.span);
+                }
+                if !end_ty.is_integer() && !end_ty.is_error() {
+                    self.error(format!("slice end must be integer, got {}", end_ty), end.span);
+                }
+
+                if let Some(elem_ty) = array_ty.element_type() {
+                    Type::slice(elem_ty.clone())
+                } else if !array_ty.is_error() {
+                    self.error(format!("cannot slice type {}", array_ty), array.span);
+                    Type::error()
+                } else {
+                    Type::error()
+                }
+            }
+            parser::ExprKind::Field { object, field } => {
+                let object_ty = self.infer_expr(object);
+
+                // Handle references
+                let base_ty = if let Some(inner) = object_ty.deref_type() {
+                    inner
+                } else {
+                    &object_ty
+                };
+
+                match &base_ty.kind {
+                    TypeKind::Struct { name } => {
+                        if let Some(struct_def) = self.global_scope.get_struct(name) {
+                            if let Some(field_def) = struct_def.get_field(&field.name) {
+                                field_def.ty.clone()
+                            } else {
+                                self.error(
+                                    format!("struct '{}' has no field '{}'", name, field.name),
+                                    field.span,
+                                );
+                                Type::error()
+                            }
+                        } else {
+                            Type::error()
+                        }
+                    }
+                    TypeKind::Error => Type::error(),
+                    _ => {
+                        self.error(
+                            format!("cannot access field '{}' on type {}", field.name, object_ty),
+                            field.span,
+                        );
+                        Type::error()
+                    }
+                }
+            }
+            parser::ExprKind::Call { func, args } => {
+                // Check for method calls (e.g., slice.len())
+                if let parser::ExprKind::Field { object, field } = &func.kind {
+                    let object_ty = self.infer_expr(object);
+                    if let Some(result_ty) = self.check_method_call(&object_ty, &field.name, args, expr.span) {
+                        return result_ty;
+                    }
+                }
+
+                let func_ty = self.infer_expr(func);
+
+                match &func_ty.kind {
+                    TypeKind::Function { params, return_type } => {
+                        if args.len() != params.len() {
+                            self.error(
+                                format!("expected {} arguments, got {}", params.len(), args.len()),
+                                expr.span,
+                            );
+                        }
+
+                        for (arg, param_ty) in args.iter().zip(params.iter()) {
+                            let arg_ty = self.infer_expr(arg);
+                            if !arg_ty.is_compatible_with(param_ty) {
+                                self.error(
+                                    format!("argument type mismatch: expected {}, got {}", param_ty, arg_ty),
+                                    arg.span,
+                                );
+                            }
+                        }
+
+                        (**return_type).clone()
+                    }
+                    TypeKind::Error => Type::error(),
+                    _ => {
+                        self.error(format!("cannot call non-function type {}", func_ty), expr.span);
+                        Type::error()
+                    }
+                }
+            }
+            parser::ExprKind::Builtin { name, args } => {
+                self.check_builtin(*name, args, expr.span)
+            }
+            parser::ExprKind::Array(elements) => {
+                if elements.is_empty() {
+                    self.error("cannot infer type of empty array literal", expr.span);
+                    return Type::error();
+                }
+
+                let elem_ty = self.infer_expr(&elements[0]);
+                for elem in elements.iter().skip(1) {
+                    let ty = self.infer_expr(elem);
+                    if !ty.is_compatible_with(&elem_ty) {
+                        self.error(
+                            format!("array element type mismatch: expected {}, got {}", elem_ty, ty),
+                            elem.span,
+                        );
+                    }
+                }
+
+                Type::array(elem_ty, elements.len() as u64)
+            }
+            parser::ExprKind::Cast { expr: inner, ty } => {
+                let _ = self.infer_expr(inner);
+                self.ast_to_type(ty)
+            }
+            parser::ExprKind::Ref(inner) => {
+                let inner_ty = self.infer_expr(inner);
+                Type::reference(inner_ty, false)
+            }
+            parser::ExprKind::MutRef(inner) => {
+                let inner_ty = self.infer_expr(inner);
+                Type::reference(inner_ty, true)
+            }
+            parser::ExprKind::Deref(inner) => {
+                let inner_ty = self.infer_expr(inner);
+                if let Some(deref_ty) = inner_ty.deref_type() {
+                    deref_ty.clone()
+                } else if !inner_ty.is_error() {
+                    self.error(format!("cannot dereference type {}", inner_ty), expr.span);
+                    Type::error()
+                } else {
+                    Type::error()
+                }
+            }
+            parser::ExprKind::Range { start, end, .. } => {
+                let start_ty = self.infer_expr(start);
+                let end_ty = self.infer_expr(end);
+                if !start_ty.is_integer() && !start_ty.is_error() {
+                    self.error(format!("range start must be integer, got {}", start_ty), start.span);
+                }
+                if !end_ty.is_integer() && !end_ty.is_error() {
+                    self.error(format!("range end must be integer, got {}", end_ty), end.span);
+                }
+                // Range type - for now just return the start type
+                start_ty
+            }
+            parser::ExprKind::Paren(inner) => self.infer_expr(inner),
+            parser::ExprKind::StructLit { name, fields } => {
+                if let Some(struct_def) = self.global_scope.get_struct(&name.name) {
+                    // Check all required fields are provided
+                    for field_def in &struct_def.fields {
+                        if !fields.iter().any(|(n, _)| n.name == field_def.name) {
+                            self.error(
+                                format!("missing field '{}' in struct literal", field_def.name),
+                                expr.span,
+                            );
+                        }
+                    }
+
+                    // Check provided fields
+                    for (field_name, field_value) in fields {
+                        if let Some(field_def) = struct_def.get_field(&field_name.name) {
+                            let value_ty = self.infer_expr(field_value);
+                            if !value_ty.is_compatible_with(&field_def.ty) {
+                                self.error(
+                                    format!("field '{}' expects {}, got {}",
+                                        field_name.name, field_def.ty, value_ty),
+                                    field_value.span,
+                                );
+                            }
+                        } else {
+                            self.error(
+                                format!("struct '{}' has no field '{}'", name.name, field_name.name),
+                                field_name.span,
+                            );
+                        }
+                    }
+
+                    Type::struct_type(name.name.clone())
+                } else {
+                    Type::error()
+                }
+            }
+        }
+    }
+
+    /// Check binary operator types
+    fn check_binary_op(&mut self, op: BinaryOp, left: &Type, right: &Type, span: SourceSpan) -> Type {
+        if left.is_error() || right.is_error() {
+            return Type::error();
+        }
+
+        match op {
+            // Arithmetic operators: integer -> integer
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+                if !left.is_integer() || !right.is_integer() {
+                    self.error(
+                        format!("arithmetic operator requires integer operands, got {} and {}", left, right),
+                        span,
+                    );
+                    return Type::error();
+                }
+                // Result type is the larger of the two
+                if left.bit_width() >= right.bit_width() {
+                    left.clone()
+                } else {
+                    right.clone()
+                }
+            }
+            // Bitwise operators: integer -> integer
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                if !left.is_integer() || !right.is_integer() {
+                    self.error(
+                        format!("bitwise operator requires integer operands, got {} and {}", left, right),
+                        span,
+                    );
+                    return Type::error();
+                }
+                if left.bit_width() >= right.bit_width() {
+                    left.clone()
+                } else {
+                    right.clone()
+                }
+            }
+            // Shift operators: integer, integer -> integer
+            BinaryOp::Shl | BinaryOp::Shr => {
+                if !left.is_integer() || !right.is_integer() {
+                    self.error(
+                        format!("shift operator requires integer operands, got {} and {}", left, right),
+                        span,
+                    );
+                    return Type::error();
+                }
+                left.clone()
+            }
+            // Comparison operators: comparable -> bool
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                if !left.is_compatible_with(right) {
+                    self.error(
+                        format!("cannot compare {} and {}", left, right),
+                        span,
+                    );
+                }
+                Type::bool()
+            }
+            // Logical operators: bool, bool -> bool
+            BinaryOp::And | BinaryOp::Or => {
+                if !left.is_bool() || !right.is_bool() {
+                    self.error(
+                        format!("logical operator requires boolean operands, got {} and {}", left, right),
+                        span,
+                    );
+                    return Type::error();
+                }
+                Type::bool()
+            }
+        }
+    }
+
+    /// Check unary operator types
+    fn check_unary_op(&mut self, op: UnaryOp, operand: &Type, span: SourceSpan) -> Type {
+        if operand.is_error() {
+            return Type::error();
+        }
+
+        match op {
+            UnaryOp::Neg => {
+                if !operand.is_integer() {
+                    self.error(format!("negation requires integer, got {}", operand), span);
+                    return Type::error();
+                }
+                operand.clone()
+            }
+            UnaryOp::Not => {
+                if !operand.is_bool() {
+                    self.error(format!("logical not requires bool, got {}", operand), span);
+                    return Type::error();
+                }
+                Type::bool()
+            }
+            UnaryOp::BitNot => {
+                if !operand.is_integer() {
+                    self.error(format!("bitwise not requires integer, got {}", operand), span);
+                    return Type::error();
+                }
+                operand.clone()
+            }
+        }
+    }
+
+    /// Check builtin function types
+    fn check_builtin(&mut self, name: BuiltinFunc, args: &[parser::Expr], span: SourceSpan) -> Type {
+        match name {
+            BuiltinFunc::Rotr | BuiltinFunc::Rotl => {
+                if args.len() != 2 {
+                    self.error(format!("rotr/rotl requires 2 arguments, got {}", args.len()), span);
+                    return Type::error();
+                }
+                let value_ty = self.infer_expr(&args[0]);
+                let shift_ty = self.infer_expr(&args[1]);
+                if !value_ty.is_integer() {
+                    self.error(format!("rotr/rotl value must be integer, got {}", value_ty), args[0].span);
+                }
+                if !shift_ty.is_integer() {
+                    self.error(format!("rotr/rotl shift must be integer, got {}", shift_ty), args[1].span);
+                }
+                value_ty
+            }
+            BuiltinFunc::Bswap => {
+                if args.len() != 1 {
+                    self.error(format!("bswap requires 1 argument, got {}", args.len()), span);
+                    return Type::error();
+                }
+                let value_ty = self.infer_expr(&args[0]);
+                if !value_ty.is_integer() {
+                    self.error(format!("bswap value must be integer, got {}", value_ty), args[0].span);
+                }
+                value_ty
+            }
+            BuiltinFunc::ReadU8 => {
+                self.check_read_args(args, 8, span)
+            }
+            BuiltinFunc::ReadU16Be | BuiltinFunc::ReadU16Le => {
+                self.check_read_args(args, 16, span)
+            }
+            BuiltinFunc::ReadU32Be | BuiltinFunc::ReadU32Le => {
+                self.check_read_args(args, 32, span)
+            }
+            BuiltinFunc::ReadU64Be | BuiltinFunc::ReadU64Le => {
+                self.check_read_args(args, 64, span)
+            }
+            BuiltinFunc::WriteU8 => {
+                self.check_write_args(args, 8, span);
+                Type::unit()
+            }
+            BuiltinFunc::WriteU16Be | BuiltinFunc::WriteU16Le => {
+                self.check_write_args(args, 16, span);
+                Type::unit()
+            }
+            BuiltinFunc::WriteU32Be | BuiltinFunc::WriteU32Le => {
+                self.check_write_args(args, 32, span);
+                Type::unit()
+            }
+            BuiltinFunc::WriteU64Be | BuiltinFunc::WriteU64Le => {
+                self.check_write_args(args, 64, span);
+                Type::unit()
+            }
+            BuiltinFunc::ConstantTimeEq => {
+                if args.len() != 2 {
+                    self.error(format!("constant_time_eq requires 2 arguments, got {}", args.len()), span);
+                    return Type::error();
+                }
+                for arg in args {
+                    self.infer_expr(arg);
+                }
+                Type::bool()
+            }
+            BuiltinFunc::SecureZero => {
+                if args.len() != 1 {
+                    self.error(format!("secure_zero requires 1 argument, got {}", args.len()), span);
+                    return Type::error();
+                }
+                let arg_ty = self.infer_expr(&args[0]);
+                if !arg_ty.is_mut_ref() && !arg_ty.is_error() {
+                    self.error("secure_zero requires mutable reference", args[0].span);
+                }
+                Type::unit()
+            }
+        }
+    }
+
+    fn check_read_args(&mut self, args: &[parser::Expr], bits: u32, span: SourceSpan) -> Type {
+        if args.len() != 2 {
+            self.error(format!("read function requires 2 arguments (buffer, offset), got {}", args.len()), span);
+            return Type::error();
+        }
+        let buf_ty = self.infer_expr(&args[0]);
+        let offset_ty = self.infer_expr(&args[1]);
+
+        // Buffer should be a reference to bytes
+        if !buf_ty.is_ref() && !buf_ty.is_error() {
+            self.error(format!("read buffer must be a reference, got {}", buf_ty), args[0].span);
+        }
+        if !offset_ty.is_integer() && !offset_ty.is_error() {
+            self.error(format!("offset must be integer, got {}", offset_ty), args[1].span);
+        }
+
+        Type::int(bits, false)
+    }
+
+    fn check_write_args(&mut self, args: &[parser::Expr], bits: u32, span: SourceSpan) {
+        if args.len() != 3 {
+            self.error(format!("write function requires 3 arguments (buffer, offset, value), got {}", args.len()), span);
+            return;
+        }
+        let buf_ty = self.infer_expr(&args[0]);
+        let offset_ty = self.infer_expr(&args[1]);
+        let value_ty = self.infer_expr(&args[2]);
+
+        if !buf_ty.is_mut_ref() && !buf_ty.is_error() {
+            self.error(format!("write buffer must be a mutable reference, got {}", buf_ty), args[0].span);
+        }
+        if !offset_ty.is_integer() && !offset_ty.is_error() {
+            self.error(format!("offset must be integer, got {}", offset_ty), args[1].span);
+        }
+        if !value_ty.is_integer() && !value_ty.is_error() {
+            self.error(format!("value must be integer, got {}", value_ty), args[2].span);
+        }
+    }
+
+    /// Check method call on a type (e.g., slice.len())
+    /// Returns Some(result_type) if it's a valid method call, None if not a method
+    fn check_method_call(&mut self, object_ty: &Type, method: &str, args: &[parser::Expr], span: SourceSpan) -> Option<Type> {
+        // Handle references by dereferencing
+        let base_ty = if let Some(inner) = object_ty.deref_type() {
+            inner
+        } else {
+            object_ty
+        };
+
+        match method {
+            "len" => {
+                // .len() is valid on arrays and slices
+                match &base_ty.kind {
+                    TypeKind::Array { .. } | TypeKind::Slice { .. } => {
+                        if !args.is_empty() {
+                            self.error("len() takes no arguments", span);
+                        }
+                        Some(Type::int(64, false)) // u64
+                    }
+                    _ => None,
+                }
+            }
+            _ => None, // Not a known method
+        }
+    }
+}

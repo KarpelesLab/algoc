@@ -49,7 +49,7 @@ fn sha256_init(state: &mut Sha256State) {
 // SHA-256 compression function
 fn sha256_compress(state: &mut Sha256State, block: &[u8; 64]) {
     // Message schedule array
-    let w: u32[64];
+    let mut w: u32[64];
 
     // Prepare message schedule
     for i in 0..16 {
@@ -63,14 +63,14 @@ fn sha256_compress(state: &mut Sha256State, block: &[u8; 64]) {
     }
 
     // Working variables
-    let a = state.h[0];
-    let b = state.h[1];
-    let c = state.h[2];
-    let d = state.h[3];
-    let e = state.h[4];
-    let f = state.h[5];
-    let g = state.h[6];
-    let h = state.h[7];
+    let mut a = state.h[0];
+    let mut b = state.h[1];
+    let mut c = state.h[2];
+    let mut d = state.h[3];
+    let mut e = state.h[4];
+    let mut f = state.h[5];
+    let mut g = state.h[6];
+    let mut h = state.h[7];
 
     // Compression loop
     for i in 0..64 {
@@ -121,8 +121,8 @@ fn sha256_update(state: &mut Sha256State, data: &[u8]) {
 
     // Process full blocks directly
     while offset + 64 <= data_len {
-        // Create a reference to the 64-byte slice
-        let block_ref = &data[offset..offset + 64];
+        // Get the 64-byte slice (slicing already returns a reference)
+        let block_ref = data[offset..offset + 64];
         sha256_compress(state, block_ref);
         offset = offset + 64;
     }
@@ -178,7 +178,7 @@ fn sha256_final(state: &mut Sha256State, digest: &mut [u8; 32]) {
 
 // Convenience function: hash a complete message
 fn sha256(message: &[u8], digest: &mut [u8; 32]) {
-    let state: Sha256State;
+    let mut state: Sha256State;
     sha256_init(&mut state);
     sha256_update(&mut state, message);
     sha256_final(&mut state, digest);
