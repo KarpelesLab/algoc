@@ -46,6 +46,26 @@ pub enum Keyword {
     I128,
     Bool,
 
+    // Big-endian types
+    U16Be,
+    U32Be,
+    U64Be,
+    U128Be,
+    I16Be,
+    I32Be,
+    I64Be,
+    I128Be,
+
+    // Little-endian types
+    U16Le,
+    U32Le,
+    U64Le,
+    U128Le,
+    I16Le,
+    I32Le,
+    I64Le,
+    I128Le,
+
     // Control flow
     If,
     Else,
@@ -104,6 +124,26 @@ impl Keyword {
             "i128" => Some(Keyword::I128),
             "bool" => Some(Keyword::Bool),
 
+            // Big-endian types
+            "u16be" => Some(Keyword::U16Be),
+            "u32be" => Some(Keyword::U32Be),
+            "u64be" => Some(Keyword::U64Be),
+            "u128be" => Some(Keyword::U128Be),
+            "i16be" => Some(Keyword::I16Be),
+            "i32be" => Some(Keyword::I32Be),
+            "i64be" => Some(Keyword::I64Be),
+            "i128be" => Some(Keyword::I128Be),
+
+            // Little-endian types
+            "u16le" => Some(Keyword::U16Le),
+            "u32le" => Some(Keyword::U32Le),
+            "u64le" => Some(Keyword::U64Le),
+            "u128le" => Some(Keyword::U128Le),
+            "i16le" => Some(Keyword::I16Le),
+            "i32le" => Some(Keyword::I32Le),
+            "i64le" => Some(Keyword::I64Le),
+            "i128le" => Some(Keyword::I128Le),
+
             // Control flow
             "if" => Some(Keyword::If),
             "else" => Some(Keyword::Else),
@@ -161,6 +201,22 @@ impl fmt::Display for Keyword {
             Keyword::I64 => "i64",
             Keyword::I128 => "i128",
             Keyword::Bool => "bool",
+            Keyword::U16Be => "u16be",
+            Keyword::U32Be => "u32be",
+            Keyword::U64Be => "u64be",
+            Keyword::U128Be => "u128be",
+            Keyword::I16Be => "i16be",
+            Keyword::I32Be => "i32be",
+            Keyword::I64Be => "i64be",
+            Keyword::I128Be => "i128be",
+            Keyword::U16Le => "u16le",
+            Keyword::U32Le => "u32le",
+            Keyword::U64Le => "u64le",
+            Keyword::U128Le => "u128le",
+            Keyword::I16Le => "i16le",
+            Keyword::I32Le => "i32le",
+            Keyword::I64Le => "i64le",
+            Keyword::I128Le => "i128le",
             Keyword::If => "if",
             Keyword::Else => "else",
             Keyword::For => "for",

@@ -5,7 +5,7 @@
 use crate::errors::{AlgocError, AlgocResult, SourceSpan};
 use crate::parser::{self, Ast, Item, ItemKind, PrimitiveType as AstPrimitive};
 use super::scope::{Scope, ScopeStack, Symbol, StructDef, StructField};
-use super::types::{Type, TypeKind};
+use super::types::{Type, TypeKind, Endianness};
 
 /// Name resolver that builds symbol tables
 pub struct Resolver {
@@ -87,6 +87,7 @@ impl Resolver {
     /// Convert an AST primitive type to a resolved type
     fn primitive_to_type(&self, p: AstPrimitive) -> Type {
         match p {
+            // Native endian types
             AstPrimitive::U8 => Type::int(8, false),
             AstPrimitive::U16 => Type::int(16, false),
             AstPrimitive::U32 => Type::int(32, false),
@@ -98,6 +99,24 @@ impl Resolver {
             AstPrimitive::I64 => Type::int(64, true),
             AstPrimitive::I128 => Type::int(128, true),
             AstPrimitive::Bool => Type::bool(),
+            // Big-endian types
+            AstPrimitive::U16Be => Type::int_endian(16, false, Endianness::Big),
+            AstPrimitive::U32Be => Type::int_endian(32, false, Endianness::Big),
+            AstPrimitive::U64Be => Type::int_endian(64, false, Endianness::Big),
+            AstPrimitive::U128Be => Type::int_endian(128, false, Endianness::Big),
+            AstPrimitive::I16Be => Type::int_endian(16, true, Endianness::Big),
+            AstPrimitive::I32Be => Type::int_endian(32, true, Endianness::Big),
+            AstPrimitive::I64Be => Type::int_endian(64, true, Endianness::Big),
+            AstPrimitive::I128Be => Type::int_endian(128, true, Endianness::Big),
+            // Little-endian types
+            AstPrimitive::U16Le => Type::int_endian(16, false, Endianness::Little),
+            AstPrimitive::U32Le => Type::int_endian(32, false, Endianness::Little),
+            AstPrimitive::U64Le => Type::int_endian(64, false, Endianness::Little),
+            AstPrimitive::U128Le => Type::int_endian(128, false, Endianness::Little),
+            AstPrimitive::I16Le => Type::int_endian(16, true, Endianness::Little),
+            AstPrimitive::I32Le => Type::int_endian(32, true, Endianness::Little),
+            AstPrimitive::I64Le => Type::int_endian(64, true, Endianness::Little),
+            AstPrimitive::I128Le => Type::int_endian(128, true, Endianness::Little),
         }
     }
 

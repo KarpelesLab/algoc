@@ -479,6 +479,24 @@ impl<'src> Parser<'src> {
                 Keyword::I64 => Some(PrimitiveType::I64),
                 Keyword::I128 => Some(PrimitiveType::I128),
                 Keyword::Bool => Some(PrimitiveType::Bool),
+                // Big-endian types
+                Keyword::U16Be => Some(PrimitiveType::U16Be),
+                Keyword::U32Be => Some(PrimitiveType::U32Be),
+                Keyword::U64Be => Some(PrimitiveType::U64Be),
+                Keyword::U128Be => Some(PrimitiveType::U128Be),
+                Keyword::I16Be => Some(PrimitiveType::I16Be),
+                Keyword::I32Be => Some(PrimitiveType::I32Be),
+                Keyword::I64Be => Some(PrimitiveType::I64Be),
+                Keyword::I128Be => Some(PrimitiveType::I128Be),
+                // Little-endian types
+                Keyword::U16Le => Some(PrimitiveType::U16Le),
+                Keyword::U32Le => Some(PrimitiveType::U32Le),
+                Keyword::U64Le => Some(PrimitiveType::U64Le),
+                Keyword::U128Le => Some(PrimitiveType::U128Le),
+                Keyword::I16Le => Some(PrimitiveType::I16Le),
+                Keyword::I32Le => Some(PrimitiveType::I32Le),
+                Keyword::I64Le => Some(PrimitiveType::I64Le),
+                Keyword::I128Le => Some(PrimitiveType::I128Le),
                 _ => None,
             };
 

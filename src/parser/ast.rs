@@ -156,6 +156,17 @@ pub enum TypeKind {
     Named(Ident),
 }
 
+/// Endianness for primitive types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endianness {
+    /// Native/system endianness (default)
+    Native,
+    /// Big endian (network byte order)
+    Big,
+    /// Little endian
+    Little,
+}
+
 /// Primitive types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimitiveType {
@@ -170,6 +181,24 @@ pub enum PrimitiveType {
     I64,
     I128,
     Bool,
+    // Big-endian types
+    U16Be,
+    U32Be,
+    U64Be,
+    U128Be,
+    I16Be,
+    I32Be,
+    I64Be,
+    I128Be,
+    // Little-endian types
+    U16Le,
+    U32Le,
+    U64Le,
+    U128Le,
+    I16Le,
+    I32Le,
+    I64Le,
+    I128Le,
 }
 
 impl PrimitiveType {
@@ -177,10 +206,18 @@ impl PrimitiveType {
     pub fn bit_width(&self) -> u32 {
         match self {
             PrimitiveType::U8 | PrimitiveType::I8 => 8,
-            PrimitiveType::U16 | PrimitiveType::I16 => 16,
-            PrimitiveType::U32 | PrimitiveType::I32 => 32,
-            PrimitiveType::U64 | PrimitiveType::I64 => 64,
-            PrimitiveType::U128 | PrimitiveType::I128 => 128,
+            PrimitiveType::U16 | PrimitiveType::I16 |
+            PrimitiveType::U16Be | PrimitiveType::I16Be |
+            PrimitiveType::U16Le | PrimitiveType::I16Le => 16,
+            PrimitiveType::U32 | PrimitiveType::I32 |
+            PrimitiveType::U32Be | PrimitiveType::I32Be |
+            PrimitiveType::U32Le | PrimitiveType::I32Le => 32,
+            PrimitiveType::U64 | PrimitiveType::I64 |
+            PrimitiveType::U64Be | PrimitiveType::I64Be |
+            PrimitiveType::U64Le | PrimitiveType::I64Le => 64,
+            PrimitiveType::U128 | PrimitiveType::I128 |
+            PrimitiveType::U128Be | PrimitiveType::I128Be |
+            PrimitiveType::U128Le | PrimitiveType::I128Le => 128,
             PrimitiveType::Bool => 1,
         }
     }
@@ -189,12 +226,43 @@ impl PrimitiveType {
     pub fn is_signed(&self) -> bool {
         matches!(
             self,
-            PrimitiveType::I8
-                | PrimitiveType::I16
-                | PrimitiveType::I32
-                | PrimitiveType::I64
-                | PrimitiveType::I128
+            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 |
+            PrimitiveType::I64 | PrimitiveType::I128 |
+            PrimitiveType::I16Be | PrimitiveType::I32Be |
+            PrimitiveType::I64Be | PrimitiveType::I128Be |
+            PrimitiveType::I16Le | PrimitiveType::I32Le |
+            PrimitiveType::I64Le | PrimitiveType::I128Le
         )
+    }
+
+    /// Get the endianness of this type
+    pub fn endianness(&self) -> Endianness {
+        match self {
+            PrimitiveType::U16Be | PrimitiveType::U32Be |
+            PrimitiveType::U64Be | PrimitiveType::U128Be |
+            PrimitiveType::I16Be | PrimitiveType::I32Be |
+            PrimitiveType::I64Be | PrimitiveType::I128Be => Endianness::Big,
+            PrimitiveType::U16Le | PrimitiveType::U32Le |
+            PrimitiveType::U64Le | PrimitiveType::U128Le |
+            PrimitiveType::I16Le | PrimitiveType::I32Le |
+            PrimitiveType::I64Le | PrimitiveType::I128Le => Endianness::Little,
+            _ => Endianness::Native,
+        }
+    }
+
+    /// Get the native (no endianness) version of this type
+    pub fn to_native(&self) -> PrimitiveType {
+        match self {
+            PrimitiveType::U16Be | PrimitiveType::U16Le => PrimitiveType::U16,
+            PrimitiveType::U32Be | PrimitiveType::U32Le => PrimitiveType::U32,
+            PrimitiveType::U64Be | PrimitiveType::U64Le => PrimitiveType::U64,
+            PrimitiveType::U128Be | PrimitiveType::U128Le => PrimitiveType::U128,
+            PrimitiveType::I16Be | PrimitiveType::I16Le => PrimitiveType::I16,
+            PrimitiveType::I32Be | PrimitiveType::I32Le => PrimitiveType::I32,
+            PrimitiveType::I64Be | PrimitiveType::I64Le => PrimitiveType::I64,
+            PrimitiveType::I128Be | PrimitiveType::I128Le => PrimitiveType::I128,
+            other => *other,
+        }
     }
 }
 

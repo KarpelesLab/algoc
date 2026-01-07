@@ -4,6 +4,24 @@
 
 use std::fmt;
 
+/// Endianness of an integer type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endianness {
+    /// Native/system endianness (default)
+    Native,
+    /// Big endian (network byte order)
+    Big,
+    /// Little endian
+    Little,
+}
+
+impl Endianness {
+    /// Check if this is a specific (non-native) endianness
+    pub fn is_specific(&self) -> bool {
+        !matches!(self, Endianness::Native)
+    }
+}
+
 /// A resolved type
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Type {
@@ -15,9 +33,14 @@ impl Type {
         Self { kind }
     }
 
-    /// Create an integer type
+    /// Create an integer type with native endianness
     pub fn int(bits: u32, signed: bool) -> Self {
-        Self::new(TypeKind::Int { bits, signed })
+        Self::new(TypeKind::Int { bits, signed, endian: Endianness::Native })
+    }
+
+    /// Create an integer type with specific endianness
+    pub fn int_endian(bits: u32, signed: bool, endian: Endianness) -> Self {
+        Self::new(TypeKind::Int { bits, signed, endian })
     }
 
     /// Create a boolean type
@@ -126,6 +149,27 @@ impl Type {
         }
     }
 
+    /// Get the endianness if this is an integer type
+    pub fn endianness(&self) -> Option<Endianness> {
+        match &self.kind {
+            TypeKind::Int { endian, .. } => Some(*endian),
+            _ => None,
+        }
+    }
+
+    /// Check if this integer type has specific (non-native) endianness
+    pub fn has_specific_endian(&self) -> bool {
+        matches!(&self.kind, TypeKind::Int { endian, .. } if endian.is_specific())
+    }
+
+    /// Get the native version of this type (strip endianness)
+    pub fn to_native_endian(&self) -> Type {
+        match &self.kind {
+            TypeKind::Int { bits, signed, .. } => Type::int(*bits, *signed),
+            _ => self.clone(),
+        }
+    }
+
     /// Check if this type is assignable to another type
     pub fn is_assignable_to(&self, other: &Type) -> bool {
         if self.is_error() || other.is_error() {
@@ -139,9 +183,14 @@ impl Type {
 
         // Integer widening: smaller integers can be assigned to larger ones of same signedness
         // Also allow unsigned to unsigned and signed to signed regardless of size for literals
+        // Different endianness is allowed (implicit conversion will be generated)
         match (&self.kind, &other.kind) {
-            (TypeKind::Int { bits: from_bits, signed: from_signed },
-             TypeKind::Int { bits: to_bits, signed: to_signed }) => {
+            (TypeKind::Int { bits: from_bits, signed: from_signed, .. },
+             TypeKind::Int { bits: to_bits, signed: to_signed, .. }) => {
+                // Same size and signedness with different endianness is ok
+                if from_bits == to_bits && from_signed == to_signed {
+                    return true;
+                }
                 // Allow widening (small to large) with same signedness
                 if from_signed == to_signed && from_bits <= to_bits {
                     return true;
@@ -204,8 +253,8 @@ impl Type {
 /// The kind of a type
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
-    /// Integer type with bit width and signedness
-    Int { bits: u32, signed: bool },
+    /// Integer type with bit width, signedness, and endianness
+    Int { bits: u32, signed: bool, endian: Endianness },
     /// Boolean type
     Bool,
     /// Unit type (void, no value)
@@ -230,9 +279,14 @@ pub enum TypeKind {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            TypeKind::Int { bits, signed } => {
+            TypeKind::Int { bits, signed, endian } => {
                 let prefix = if *signed { "i" } else { "u" };
-                write!(f, "{}{}", prefix, bits)
+                let suffix = match endian {
+                    Endianness::Native => "",
+                    Endianness::Big => "be",
+                    Endianness::Little => "le",
+                };
+                write!(f, "{}{}{}", prefix, bits, suffix)
             }
             TypeKind::Bool => write!(f, "bool"),
             TypeKind::Unit => write!(f, "()"),
