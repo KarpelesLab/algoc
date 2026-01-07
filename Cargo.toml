@@ -1,0 +1,21 @@
+[package]
+name = "algoc"
+version = "0.1.0"
+edition = "2024"
+description = "Algorithm pseudocode to multi-language transpiler"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+ariadne = "0.5"       # Beautiful error reporting
+
+[dev-dependencies]
+pretty_assertions = "1"
+
+[[bin]]
+name = "algoc"
+path = "src/main.rs"
+
+[lib]
+name = "algoc"
+path = "src/lib.rs"

@@ -1,0 +1,36 @@
+//! Semantic analysis for AlgoC
+//!
+//! This module handles name resolution, type checking, and semantic validation.
+
+mod types;
+mod scope;
+mod resolver;
+mod checker;
+
+pub use types::{Type, TypeKind, TypeError};
+pub use scope::{Scope, Symbol, SymbolKind};
+pub use resolver::Resolver;
+pub use checker::TypeChecker;
+
+use crate::errors::{AlgocError, AlgocResult};
+use crate::parser::Ast;
+
+/// Analyzed program with resolved types and symbols
+#[derive(Debug)]
+pub struct AnalyzedAst {
+    pub ast: Ast,
+    pub global_scope: Scope,
+}
+
+/// Run all analysis passes on the AST
+pub fn analyze(ast: Ast) -> AlgocResult<AnalyzedAst> {
+    // Pass 1: Resolve names and build symbol tables
+    let mut resolver = Resolver::new();
+    let global_scope = resolver.resolve(&ast)?;
+
+    // Pass 2: Type check all expressions and statements
+    let mut checker = TypeChecker::new(&global_scope);
+    checker.check(&ast)?;
+
+    Ok(AnalyzedAst { ast, global_scope })
+}
