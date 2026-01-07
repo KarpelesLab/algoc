@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use algoc::{Parser, analyze, errors::print_error, CodeGenerator, JavaScriptGenerator};
+use algoc::{Parser, analyze, errors::print_error, CodeGenerator, JavaScriptGenerator, PythonGenerator};
 use algoc::parser::{Ast, Item, ItemKind};
 
 /// Load and parse a file, recursively processing `use` statements
@@ -81,7 +81,7 @@ fn main() -> ExitCode {
         println!("  compile <file> -t <target> [-o <output>]");
         println!("                         Compile to target language");
         println!();
-        println!("Targets: javascript (js)");
+        println!("Targets: javascript (js), python (py)");
         println!();
         return ExitCode::SUCCESS;
     }
@@ -234,7 +234,7 @@ fn main() -> ExitCode {
                 Some(t) => t,
                 None => {
                     eprintln!("Error: -t <target> is required");
-                    eprintln!("Available targets: javascript (js)");
+                    eprintln!("Available targets: javascript (js), python (py)");
                     return ExitCode::FAILURE;
                 }
             };
@@ -269,9 +269,19 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                "python" | "py" => {
+                    let mut generator = PythonGenerator::new().with_tests(include_tests);
+                    match generator.generate(&analyzed) {
+                        Ok(code) => (code, generator.file_extension()),
+                        Err(e) => {
+                            print_error(&source, filename, &e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
                 _ => {
                     eprintln!("Unknown target: {}", target);
-                    eprintln!("Available targets: javascript (js)");
+                    eprintln!("Available targets: javascript (js), python (py)");
                     return ExitCode::FAILURE;
                 }
             };

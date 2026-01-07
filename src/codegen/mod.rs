@@ -3,8 +3,10 @@
 //! This module provides code generators for various target languages.
 
 mod javascript;
+mod python;
 
 pub use javascript::JavaScriptGenerator;
+pub use python::PythonGenerator;
 
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
