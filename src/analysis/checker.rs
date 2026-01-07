@@ -128,8 +128,13 @@ impl<'a> TypeChecker<'a> {
                     );
                 }
             }
-            ItemKind::Test(_) => {
-                // Tests are checked at runtime
+            ItemKind::Test(test) => {
+                // Tests are like functions with no parameters and no return type
+                self.current_return_type = Some(Type::unit());
+                self.scopes.push();
+                self.check_block(&test.body);
+                self.scopes.pop();
+                self.current_return_type = None;
             }
             ItemKind::Struct(_) | ItemKind::Layout(_) => {
                 // Type definitions don't need checking
@@ -767,6 +772,17 @@ impl<'a> TypeChecker<'a> {
                 let arg_ty = self.infer_expr(&args[0]);
                 if !arg_ty.is_mut_ref() && !arg_ty.is_error() {
                     self.error("secure_zero requires mutable reference", args[0].span);
+                }
+                Type::unit()
+            }
+            BuiltinFunc::Assert => {
+                if args.len() != 1 {
+                    self.error(format!("assert requires 1 argument, got {}", args.len()), span);
+                    return Type::error();
+                }
+                let cond_ty = self.infer_expr(&args[0]);
+                if !cond_ty.is_bool() && !cond_ty.is_error() {
+                    self.error(format!("assert condition must be bool, got {}", cond_ty), args[0].span);
                 }
                 Type::unit()
             }

@@ -90,24 +90,12 @@ pub struct ConstDef {
     pub value: Expr,
 }
 
-/// A test definition
+/// A test definition (function-like)
 #[derive(Debug, Clone)]
 pub struct TestDef {
     pub name: Ident,
-    pub cases: Vec<TestCase>,
-}
-
-/// A test case with input/output
-#[derive(Debug, Clone)]
-pub struct TestCase {
-    pub kind: TestCaseKind,
+    pub body: Block,
     pub span: SourceSpan,
-}
-
-#[derive(Debug, Clone)]
-pub enum TestCaseKind {
-    Input(Expr),
-    Expect(Expr),
 }
 
 /// An identifier with source location
@@ -466,4 +454,7 @@ pub enum BuiltinFunc {
     // Crypto safety
     ConstantTimeEq,
     SecureZero,
+
+    // Testing
+    Assert,
 }

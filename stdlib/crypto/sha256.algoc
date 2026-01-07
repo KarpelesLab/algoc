@@ -185,17 +185,20 @@ fn sha256(message: &[u8], digest: &mut [u8; 32]) {
 }
 
 // Test vectors from FIPS 180-4
-test sha256_empty {
-    input: bytes(""),
-    expect: hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+test sha256_empty() {
+    let mut digest: [u8; 32];
+    sha256(bytes(""), &mut digest);
+    assert(digest == hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
 }
 
-test sha256_abc {
-    input: bytes("abc"),
-    expect: hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+test sha256_abc() {
+    let mut digest: [u8; 32];
+    sha256(bytes("abc"), &mut digest);
+    assert(digest == hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 }
 
-test sha256_long {
-    input: bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-    expect: hex("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+test sha256_long() {
+    let mut digest: [u8; 32];
+    sha256(bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), &mut digest);
+    assert(digest == hex("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
 }

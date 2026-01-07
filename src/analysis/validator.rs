@@ -46,8 +46,9 @@ impl Validator {
             ItemKind::Const(_) => {
                 // Constants are validated by type checker
             }
-            ItemKind::Test(_) => {
-                // Tests don't need semantic validation
+            ItemKind::Test(test) => {
+                // Validate test body like a function
+                self.validate_block(&test.body);
             }
             ItemKind::Struct(_) | ItemKind::Layout(_) => {
                 // Type definitions don't need validation

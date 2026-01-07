@@ -192,15 +192,10 @@ impl Resolver {
                 self.resolve_expr(&c.value);
             }
             ItemKind::Test(t) => {
-                // Resolve test expressions
-                for case in &t.cases {
-                    match &case.kind {
-                        parser::TestCaseKind::Input(expr) |
-                        parser::TestCaseKind::Expect(expr) => {
-                            self.resolve_expr(expr);
-                        }
-                    }
-                }
+                // Tests are like functions - resolve their body
+                self.scopes.push();
+                self.resolve_block(&t.body);
+                self.scopes.pop();
             }
             ItemKind::Struct(_) | ItemKind::Layout(_) => {
                 // Already handled in declare_item

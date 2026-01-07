@@ -340,40 +340,19 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_test(&mut self) -> AlgocResult<TestDef> {
+        let start = self.current_span();
         self.expect_keyword(Keyword::Test, "expected 'test'")?;
         let name = self.parse_ident()?;
 
-        self.expect(&TokenKind::LBrace, "expected '{' after test name")?;
+        // Parse optional () - tests are like functions but with no params
+        self.expect(&TokenKind::LParen, "expected '(' after test name")?;
+        self.expect(&TokenKind::RParen, "expected ')' after '('")?;
 
-        let mut cases = Vec::new();
-        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            cases.push(self.parse_test_case()?);
-            self.match_token(&TokenKind::Comma);
-        }
-
-        self.expect(&TokenKind::RBrace, "expected '}' after test cases")?;
-
-        Ok(TestDef { name, cases })
-    }
-
-    fn parse_test_case(&mut self) -> AlgocResult<TestCase> {
-        let start = self.current_span();
-
-        let kind = if self.match_keyword(Keyword::Input) {
-            self.expect(&TokenKind::Colon, "expected ':' after 'input'")?;
-            TestCaseKind::Input(self.parse_expr()?)
-        } else if self.match_keyword(Keyword::Expect) {
-            self.expect(&TokenKind::Colon, "expected ':' after 'expect'")?;
-            TestCaseKind::Expect(self.parse_expr()?)
-        } else {
-            return Err(AlgocError::parser(
-                format!("expected 'input' or 'expect', found {}", self.peek().kind),
-                self.current_span(),
-            ));
-        };
-
+        // Parse body
+        let body = self.parse_block()?;
         let span = start.merge(self.previous().span);
-        Ok(TestCase { kind, span })
+
+        Ok(TestDef { name, body, span })
     }
 
     // ==================== Types ====================
@@ -1140,6 +1119,7 @@ impl<'src> Parser<'src> {
             TokenKind::Keyword(Keyword::WriteU64Le) => Some(BuiltinFunc::WriteU64Le),
             TokenKind::Keyword(Keyword::ConstantTimeEq) => Some(BuiltinFunc::ConstantTimeEq),
             TokenKind::Keyword(Keyword::SecureZero) => Some(BuiltinFunc::SecureZero),
+            TokenKind::Keyword(Keyword::Assert) => Some(BuiltinFunc::Assert),
             _ => None,
         };
 
@@ -1247,9 +1227,10 @@ mod tests {
     fn test_parse_test() {
         let ast = parse(
             r#"
-            test sha256_empty {
-                input: bytes(""),
-                expect: hex("e3b0c442")
+            test sha256_empty() {
+                let mut out: [u8; 32];
+                sha256(bytes(""), &mut out);
+                assert(out == hex("e3b0c442"));
             }
             "#,
         )
@@ -1257,7 +1238,7 @@ mod tests {
         assert_eq!(ast.items.len(), 1);
         if let ItemKind::Test(t) = &ast.items[0].kind {
             assert_eq!(t.name.name, "sha256_empty");
-            assert_eq!(t.cases.len(), 2);
+            assert!(!t.body.stmts.is_empty());
         } else {
             panic!("expected test");
         }

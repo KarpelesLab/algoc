@@ -175,6 +175,11 @@ impl Type {
                 }
                 from_inner.is_assignable_to(to_inner)
             }
+            // Allow arrays and slices with compatible element types to be compared
+            (TypeKind::Array { element: arr_elem, .. }, TypeKind::Slice { element: slice_elem }) |
+            (TypeKind::Slice { element: slice_elem }, TypeKind::Array { element: arr_elem, .. }) => {
+                arr_elem.is_assignable_to(slice_elem) || slice_elem.is_assignable_to(arr_elem)
+            }
             _ => false,
         }
     }

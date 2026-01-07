@@ -63,7 +63,7 @@ fn main() -> ExitCode {
                                 println!("  const {}", c.name.name);
                             }
                             algoc::parser::ItemKind::Test(t) => {
-                                println!("  test {} ({} cases)", t.name.name, t.cases.len());
+                                println!("  test {} ({} statements)", t.name.name, t.body.stmts.len());
                             }
                         }
                     }
@@ -142,6 +142,7 @@ fn main() -> ExitCode {
             // Parse arguments
             let mut target = None;
             let mut output = None;
+            let mut include_tests = false;
             let mut i = 3;
             while i < args.len() {
                 match args[i].as_str() {
@@ -162,6 +163,10 @@ fn main() -> ExitCode {
                             eprintln!("Error: -o requires an output path");
                             return ExitCode::FAILURE;
                         }
+                    }
+                    "--test" => {
+                        include_tests = true;
+                        i += 1;
                     }
                     _ => {
                         eprintln!("Unknown option: {}", args[i]);
@@ -209,7 +214,7 @@ fn main() -> ExitCode {
             // Generate code
             let (code, ext) = match target.as_str() {
                 "javascript" | "js" => {
-                    let mut generator = JavaScriptGenerator::new();
+                    let mut generator = JavaScriptGenerator::new().with_tests(include_tests);
                     match generator.generate(&analyzed) {
                         Ok(code) => (code, generator.file_extension()),
                         Err(e) => {

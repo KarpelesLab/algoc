@@ -17,6 +17,8 @@ pub struct JavaScriptGenerator {
     indent: usize,
     /// Output buffer
     output: String,
+    /// Whether to include test functions and runner
+    include_tests: bool,
 }
 
 impl JavaScriptGenerator {
@@ -24,7 +26,14 @@ impl JavaScriptGenerator {
         Self {
             indent: 0,
             output: String::new(),
+            include_tests: false,
         }
+    }
+
+    /// Set whether to include tests in the output
+    pub fn with_tests(mut self, include: bool) -> Self {
+        self.include_tests = include;
+        self
     }
 
     fn write(&mut self, s: &str) {
@@ -49,6 +58,53 @@ impl JavaScriptGenerator {
 
     fn dedent(&mut self) {
         self.indent = self.indent.saturating_sub(1);
+    }
+
+    /// Check if an expression is likely an array type (used for comparison)
+    fn is_array_like_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // These builtin expressions produce arrays
+            ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
+            // Array literals
+            ExprKind::Array(_) => true,
+            // Slice expressions produce array views
+            ExprKind::Slice { .. } => true,
+            // References to arrays are still arrays
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
+                self.is_array_like_expr(inner)
+            }
+            // Parenthesized expressions
+            ExprKind::Paren(inner) => self.is_array_like_expr(inner),
+            // Builtins that return arrays
+            ExprKind::Builtin { name, .. } => {
+                matches!(name, BuiltinFunc::Rotr | BuiltinFunc::Rotl) == false
+                    && matches!(name, BuiltinFunc::ConstantTimeEq) == false
+                    && matches!(name, BuiltinFunc::Assert) == false
+                    && matches!(name, BuiltinFunc::SecureZero) == false
+                    && matches!(name, BuiltinFunc::Bswap) == false
+                    && matches!(name,
+                        BuiltinFunc::ReadU8 | BuiltinFunc::ReadU16Be | BuiltinFunc::ReadU16Le |
+                        BuiltinFunc::ReadU32Be | BuiltinFunc::ReadU32Le |
+                        BuiltinFunc::ReadU64Be | BuiltinFunc::ReadU64Le
+                    ) == false
+                    && matches!(name,
+                        BuiltinFunc::WriteU8 | BuiltinFunc::WriteU16Be | BuiltinFunc::WriteU16Le |
+                        BuiltinFunc::WriteU32Be | BuiltinFunc::WriteU32Le |
+                        BuiltinFunc::WriteU64Be | BuiltinFunc::WriteU64Le
+                    ) == false
+            }
+            // Index into array returns element, not array
+            ExprKind::Index { .. } => false,
+            // Field access could be array, assume yes if we don't know
+            ExprKind::Field { .. } => true,
+            // Identifiers - we don't have type info, but commonly arrays are compared
+            // We'll assume identifiers being compared are arrays if the other side is
+            ExprKind::Ident(_) => false, // Will be caught if other side is array-like
+            // Function calls could return arrays
+            ExprKind::Call { .. } => false, // Can't know without type info
+            // Other expressions
+            _ => false,
+        }
     }
 
     /// Generate the runtime helper functions
@@ -153,6 +209,29 @@ impl JavaScriptGenerator {
         self.writeln("");
     }
 
+    /// Generate test runtime helpers (only when include_tests is true)
+    fn generate_test_runtime(&mut self) {
+        self.writeln("// Test Helpers");
+        self.writeln("");
+
+        // Assert function that throws on failure
+        self.writeln("let __test_failures = 0;");
+        self.writeln("let __test_name = '';");
+        self.writeln("");
+
+        self.writeln("function __assert(condition) {");
+        self.indent();
+        self.writeln("if (!condition) {");
+        self.indent();
+        self.writeln("__test_failures++;");
+        self.writeln("console.log('  ASSERTION FAILED in ' + __test_name);");
+        self.dedent();
+        self.writeln("}");
+        self.dedent();
+        self.writeln("}");
+        self.writeln("");
+    }
+
     fn generate_ast(&mut self, ast: &Ast) {
         for item in &ast.items {
             self.generate_item(item);
@@ -165,10 +244,21 @@ impl JavaScriptGenerator {
             ItemKind::Const(c) => self.generate_const(c),
             ItemKind::Struct(s) => self.generate_struct(s),
             ItemKind::Layout(l) => self.generate_layout(l),
-            ItemKind::Test(_) => {
-                // Tests are generated separately
+            ItemKind::Test(test) => {
+                if self.include_tests {
+                    self.generate_test(test);
+                }
             }
         }
+    }
+
+    fn generate_test(&mut self, test: &crate::parser::TestDef) {
+        self.writeln(&format!("function test_{}() {{", test.name.name));
+        self.indent();
+        self.generate_block(&test.body);
+        self.dedent();
+        self.writeln("}");
+        self.writeln("");
     }
 
     fn generate_const(&mut self, c: &crate::parser::ConstDef) {
@@ -411,6 +501,24 @@ impl JavaScriptGenerator {
                 self.write(&ident.name);
             }
             ExprKind::Binary { left, op, right } => {
+                // For array comparisons, use constant_time_eq instead of ===
+                if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+                    let left_is_array = self.is_array_like_expr(left);
+                    let right_is_array = self.is_array_like_expr(right);
+
+                    if left_is_array || right_is_array {
+                        if matches!(op, BinaryOp::Ne) {
+                            self.write("!");
+                        }
+                        self.write("constant_time_eq(");
+                        self.generate_expr(left);
+                        self.write(", ");
+                        self.generate_expr(right);
+                        self.write(")");
+                        return;
+                    }
+                }
+
                 // For bitwise operations on 32-bit values, we need >>> 0 to ensure unsigned
                 let needs_unsigned = matches!(op,
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul |
@@ -695,6 +803,11 @@ impl JavaScriptGenerator {
                 self.generate_expr(&args[0]);
                 self.write(")");
             }
+            BuiltinFunc::Assert => {
+                self.write("__assert(");
+                self.generate_expr(&args[0]);
+                self.write(")");
+            }
         }
     }
 }
@@ -714,7 +827,67 @@ impl CodeGenerator for JavaScriptGenerator {
         self.writeln("");
 
         self.generate_runtime();
+
+        if self.include_tests {
+            self.generate_test_runtime();
+        }
+
         self.generate_ast(&ast.ast);
+
+        // Collect test names for the runner
+        let test_names: Vec<_> = ast.ast.items.iter()
+            .filter_map(|item| {
+                if let ItemKind::Test(t) = &item.kind {
+                    Some(t.name.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Generate test runner if tests are included
+        if self.include_tests && !test_names.is_empty() {
+            self.writeln("// Test Runner");
+            self.writeln("function run_tests() {");
+            self.indent();
+            self.writeln("let __passed = 0;");
+            self.writeln("let __failed = 0;");
+            self.writeln("");
+
+            for name in &test_names {
+                self.writeln(&format!("__test_name = '{}';", name));
+                self.writeln("__test_failures = 0;");
+                self.writeln("try {");
+                self.indent();
+                self.writeln(&format!("test_{}();", name));
+                self.writeln("if (__test_failures === 0) {");
+                self.indent();
+                self.writeln(&format!("console.log('PASS: {}');", name));
+                self.writeln("__passed++;");
+                self.dedent();
+                self.writeln("} else {");
+                self.indent();
+                self.writeln(&format!("console.log('FAIL: {}');", name));
+                self.writeln("__failed++;");
+                self.dedent();
+                self.writeln("}");
+                self.dedent();
+                self.writeln("} catch (e) {");
+                self.indent();
+                self.writeln(&format!("console.log('FAIL: {} - ' + e.message);", name));
+                self.writeln("__failed++;");
+                self.dedent();
+                self.writeln("}");
+                self.writeln("");
+            }
+
+            self.writeln("console.log('');");
+            self.writeln("console.log(__passed + ' passed, ' + __failed + ' failed');");
+            self.writeln("return __failed === 0;");
+            self.dedent();
+            self.writeln("}");
+            self.writeln("");
+        }
 
         // Export functions
         self.writeln("// Exports");
@@ -732,9 +905,26 @@ impl CodeGenerator for JavaScriptGenerator {
                 first = false;
             }
         }
+        if self.include_tests && !test_names.is_empty() {
+            if !first {
+                self.write(", ");
+            }
+            self.write("run_tests");
+        }
         self.write(" };\n");
         self.dedent();
         self.writeln("}");
+
+        // Auto-run tests if this is the main module
+        if self.include_tests && !test_names.is_empty() {
+            self.writeln("");
+            self.writeln("// Auto-run tests if executed directly");
+            self.writeln("if (typeof require !== 'undefined' && require.main === module) {");
+            self.indent();
+            self.writeln("process.exit(run_tests() ? 0 : 1);");
+            self.dedent();
+            self.writeln("}");
+        }
 
         Ok(self.output.clone())
     }

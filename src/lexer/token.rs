@@ -89,7 +89,7 @@ pub enum Keyword {
 
     // Test helpers
     Input,
-    Expect,
+    Assert,
     Bytes,
     Hex,
 
@@ -168,7 +168,7 @@ impl Keyword {
 
             // Test helpers
             "input" => Some(Keyword::Input),
-            "expect" => Some(Keyword::Expect),
+            "assert" => Some(Keyword::Assert),
             "bytes" => Some(Keyword::Bytes),
             "hex" => Some(Keyword::Hex),
 
@@ -237,7 +237,7 @@ impl fmt::Display for Keyword {
             Keyword::ConstantTimeEq => "constant_time_eq",
             Keyword::SecureZero => "secure_zero",
             Keyword::Input => "input",
-            Keyword::Expect => "expect",
+            Keyword::Assert => "assert",
             Keyword::Bytes => "bytes",
             Keyword::Hex => "hex",
             Keyword::As => "as",
