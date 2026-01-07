@@ -139,6 +139,9 @@ impl<'a> TypeChecker<'a> {
             ItemKind::Struct(_) | ItemKind::Layout(_) => {
                 // Type definitions don't need checking
             }
+            ItemKind::Use(_) => {
+                // Use statements are handled during loading
+            }
         }
     }
 
@@ -748,81 +751,6 @@ impl<'a> TypeChecker<'a> {
     /// Check builtin function types
     fn check_builtin(&mut self, name: BuiltinFunc, args: &[parser::Expr], span: SourceSpan) -> Type {
         match name {
-            BuiltinFunc::Rotr | BuiltinFunc::Rotl => {
-                if args.len() != 2 {
-                    self.error(format!("rotr/rotl requires 2 arguments, got {}", args.len()), span);
-                    return Type::error();
-                }
-                let value_ty = self.infer_expr(&args[0]);
-                let shift_ty = self.infer_expr(&args[1]);
-                if !value_ty.is_integer() {
-                    self.error(format!("rotr/rotl value must be integer, got {}", value_ty), args[0].span);
-                }
-                if !shift_ty.is_integer() {
-                    self.error(format!("rotr/rotl shift must be integer, got {}", shift_ty), args[1].span);
-                }
-                value_ty
-            }
-            BuiltinFunc::Bswap => {
-                if args.len() != 1 {
-                    self.error(format!("bswap requires 1 argument, got {}", args.len()), span);
-                    return Type::error();
-                }
-                let value_ty = self.infer_expr(&args[0]);
-                if !value_ty.is_integer() {
-                    self.error(format!("bswap value must be integer, got {}", value_ty), args[0].span);
-                }
-                value_ty
-            }
-            BuiltinFunc::ReadU8 => {
-                self.check_read_args(args, 8, span)
-            }
-            BuiltinFunc::ReadU16Be | BuiltinFunc::ReadU16Le => {
-                self.check_read_args(args, 16, span)
-            }
-            BuiltinFunc::ReadU32Be | BuiltinFunc::ReadU32Le => {
-                self.check_read_args(args, 32, span)
-            }
-            BuiltinFunc::ReadU64Be | BuiltinFunc::ReadU64Le => {
-                self.check_read_args(args, 64, span)
-            }
-            BuiltinFunc::WriteU8 => {
-                self.check_write_args(args, 8, span);
-                Type::unit()
-            }
-            BuiltinFunc::WriteU16Be | BuiltinFunc::WriteU16Le => {
-                self.check_write_args(args, 16, span);
-                Type::unit()
-            }
-            BuiltinFunc::WriteU32Be | BuiltinFunc::WriteU32Le => {
-                self.check_write_args(args, 32, span);
-                Type::unit()
-            }
-            BuiltinFunc::WriteU64Be | BuiltinFunc::WriteU64Le => {
-                self.check_write_args(args, 64, span);
-                Type::unit()
-            }
-            BuiltinFunc::ConstantTimeEq => {
-                if args.len() != 2 {
-                    self.error(format!("constant_time_eq requires 2 arguments, got {}", args.len()), span);
-                    return Type::error();
-                }
-                for arg in args {
-                    self.infer_expr(arg);
-                }
-                Type::bool()
-            }
-            BuiltinFunc::SecureZero => {
-                if args.len() != 1 {
-                    self.error(format!("secure_zero requires 1 argument, got {}", args.len()), span);
-                    return Type::error();
-                }
-                let arg_ty = self.infer_expr(&args[0]);
-                if !arg_ty.is_mut_ref() && !arg_ty.is_error() {
-                    self.error("secure_zero requires mutable reference", args[0].span);
-                }
-                Type::unit()
-            }
             BuiltinFunc::Assert => {
                 if args.len() != 1 {
                     self.error(format!("assert requires 1 argument, got {}", args.len()), span);
@@ -837,6 +765,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn check_read_args(&mut self, args: &[parser::Expr], bits: u32, span: SourceSpan) -> Type {
         if args.len() != 2 {
             self.error(format!("read function requires 2 arguments (buffer, offset), got {}", args.len()), span);

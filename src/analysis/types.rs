@@ -98,11 +98,13 @@ impl Type {
         matches!(self.kind, TypeKind::Error)
     }
 
-    /// Get the element type if this is an array or slice
+    /// Get the element type if this is an array, slice, or reference to array/slice
     pub fn element_type(&self) -> Option<&Type> {
         match &self.kind {
             TypeKind::Array { element, .. } => Some(element),
             TypeKind::Slice { element } => Some(element),
+            // References to arrays/slices can also be indexed
+            TypeKind::Ref { inner, .. } => inner.element_type(),
             _ => None,
         }
     }
@@ -155,6 +157,15 @@ impl Type {
             (TypeKind::Slice { element: from_elem },
              TypeKind::Ref { inner, mutable: false }) => {
                 if let TypeKind::Array { element: to_elem, .. } = &inner.kind {
+                    from_elem.is_assignable_to(to_elem)
+                } else {
+                    false
+                }
+            }
+            // Allow &[T; N] to be passed where &[T] (slice) is expected
+            (TypeKind::Ref { inner, mutable: _ },
+             TypeKind::Slice { element: to_elem }) => {
+                if let TypeKind::Array { element: from_elem, .. } = &inner.kind {
                     from_elem.is_assignable_to(to_elem)
                 } else {
                     false
@@ -226,9 +237,16 @@ impl fmt::Display for Type {
             TypeKind::Bool => write!(f, "bool"),
             TypeKind::Unit => write!(f, "()"),
             TypeKind::Array { element, size } => write!(f, "{}[{}]", element, size),
-            TypeKind::Slice { element } => write!(f, "&[{}]", element),
+            TypeKind::Slice { element } => write!(f, "[{}]", element),
             TypeKind::Ref { inner, mutable } => {
-                if *mutable {
+                // Special case: reference to slice should display as &[T] or &mut [T]
+                if let TypeKind::Slice { element } = &inner.kind {
+                    if *mutable {
+                        write!(f, "&mut [{}]", element)
+                    } else {
+                        write!(f, "&[{}]", element)
+                    }
+                } else if *mutable {
                     write!(f, "&mut {}", inner)
                 } else {
                     write!(f, "&{}", inner)

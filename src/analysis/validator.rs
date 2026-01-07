@@ -53,6 +53,9 @@ impl Validator {
             ItemKind::Struct(_) | ItemKind::Layout(_) => {
                 // Type definitions don't need validation
             }
+            ItemKind::Use(_) => {
+                // Use statements are handled during loading
+            }
         }
     }
 

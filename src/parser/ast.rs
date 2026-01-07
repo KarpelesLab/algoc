@@ -20,6 +20,8 @@ pub struct Item {
 
 #[derive(Debug, Clone)]
 pub enum ItemKind {
+    /// Use/import declaration: `use "path/to/file.algoc";`
+    Use(UseDef),
     /// Function definition: `fn name(params) -> RetType { body }`
     Function(Function),
     /// Struct definition: `struct Name { fields }`
@@ -30,6 +32,13 @@ pub enum ItemKind {
     Const(ConstDef),
     /// Test definition: `test name { input: ..., expect: ... }`
     Test(TestDef),
+}
+
+/// A use/import declaration
+#[derive(Debug, Clone)]
+pub struct UseDef {
+    pub path: String,
+    pub span: SourceSpan,
 }
 
 /// A function definition
@@ -421,40 +430,9 @@ pub enum UnaryOp {
     BitNot, // ~
 }
 
-/// Built-in functions
+/// Built-in functions (compiler intrinsics)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFunc {
-    // Bit manipulation
-    Rotr,
-    Rotl,
-    Bswap,
-
-    // Memory read (big-endian)
-    ReadU8,
-    ReadU16Be,
-    ReadU32Be,
-    ReadU64Be,
-
-    // Memory read (little-endian)
-    ReadU16Le,
-    ReadU32Le,
-    ReadU64Le,
-
-    // Memory write (big-endian)
-    WriteU8,
-    WriteU16Be,
-    WriteU32Be,
-    WriteU64Be,
-
-    // Memory write (little-endian)
-    WriteU16Le,
-    WriteU32Le,
-    WriteU64Le,
-
-    // Crypto safety
-    ConstantTimeEq,
-    SecureZero,
-
-    // Testing
+    // Testing - compiler handles this specially
     Assert,
 }

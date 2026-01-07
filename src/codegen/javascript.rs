@@ -75,24 +75,8 @@ impl JavaScriptGenerator {
             }
             // Parenthesized expressions
             ExprKind::Paren(inner) => self.is_array_like_expr(inner),
-            // Builtins that return arrays
-            ExprKind::Builtin { name, .. } => {
-                matches!(name, BuiltinFunc::Rotr | BuiltinFunc::Rotl) == false
-                    && matches!(name, BuiltinFunc::ConstantTimeEq) == false
-                    && matches!(name, BuiltinFunc::Assert) == false
-                    && matches!(name, BuiltinFunc::SecureZero) == false
-                    && matches!(name, BuiltinFunc::Bswap) == false
-                    && matches!(name,
-                        BuiltinFunc::ReadU8 | BuiltinFunc::ReadU16Be | BuiltinFunc::ReadU16Le |
-                        BuiltinFunc::ReadU32Be | BuiltinFunc::ReadU32Le |
-                        BuiltinFunc::ReadU64Be | BuiltinFunc::ReadU64Le
-                    ) == false
-                    && matches!(name,
-                        BuiltinFunc::WriteU8 | BuiltinFunc::WriteU16Be | BuiltinFunc::WriteU16Le |
-                        BuiltinFunc::WriteU32Be | BuiltinFunc::WriteU32Le |
-                        BuiltinFunc::WriteU64Be | BuiltinFunc::WriteU64Le
-                    ) == false
-            }
+            // Builtins - only Assert remains and it doesn't return an array
+            ExprKind::Builtin { .. } => false,
             // Index into array returns element, not array
             ExprKind::Index { .. } => false,
             // Field access could be array, assume yes if we don't know
@@ -109,114 +93,9 @@ impl JavaScriptGenerator {
 
     /// Generate the runtime helper functions
     fn generate_runtime(&mut self) {
+        // Most runtime is now in stdlib/runtime.algoc
+        // Only generate minimal helpers needed by the compiler
         self.writeln("// AlgoC Runtime Helpers");
-        self.writeln("");
-
-        // Rotate right for 32-bit values
-        self.writeln("function rotr32(x, n) {");
-        self.indent();
-        self.writeln("return ((x >>> n) | (x << (32 - n))) >>> 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Rotate left for 32-bit values
-        self.writeln("function rotl32(x, n) {");
-        self.indent();
-        self.writeln("return ((x << n) | (x >>> (32 - n))) >>> 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Read u32 big-endian
-        self.writeln("function read_u32_be(buf, offset) {");
-        self.indent();
-        self.writeln("return ((buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Read u32 little-endian
-        self.writeln("function read_u32_le(buf, offset) {");
-        self.indent();
-        self.writeln("return ((buf[offset + 3] << 24) | (buf[offset + 2] << 16) | (buf[offset + 1] << 8) | buf[offset]) >>> 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Write u32 big-endian
-        self.writeln("function write_u32_be(buf, offset, value) {");
-        self.indent();
-        self.writeln("buf[offset] = (value >>> 24) & 0xff;");
-        self.writeln("buf[offset + 1] = (value >>> 16) & 0xff;");
-        self.writeln("buf[offset + 2] = (value >>> 8) & 0xff;");
-        self.writeln("buf[offset + 3] = value & 0xff;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Write u32 little-endian
-        self.writeln("function write_u32_le(buf, offset, value) {");
-        self.indent();
-        self.writeln("buf[offset] = value & 0xff;");
-        self.writeln("buf[offset + 1] = (value >>> 8) & 0xff;");
-        self.writeln("buf[offset + 2] = (value >>> 16) & 0xff;");
-        self.writeln("buf[offset + 3] = (value >>> 24) & 0xff;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Write u64 big-endian (using BigInt internally but storing as bytes)
-        self.writeln("function write_u64_be(buf, offset, value) {");
-        self.indent();
-        self.writeln("const hi = Math.floor(value / 0x100000000);");
-        self.writeln("const lo = value >>> 0;");
-        self.writeln("write_u32_be(buf, offset, hi);");
-        self.writeln("write_u32_be(buf, offset + 4, lo);");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Write u64 little-endian
-        self.writeln("function write_u64_le(buf, offset, value) {");
-        self.indent();
-        self.writeln("const lo = value >>> 0;");
-        self.writeln("const hi = Math.floor(value / 0x100000000);");
-        self.writeln("write_u32_le(buf, offset, lo);");
-        self.writeln("write_u32_le(buf, offset + 4, hi);");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Secure zero (best effort in JS)
-        self.writeln("function secure_zero(buf) {");
-        self.indent();
-        self.writeln("if (buf instanceof Uint8Array || buf instanceof Uint32Array) {");
-        self.indent();
-        self.writeln("buf.fill(0);");
-        self.dedent();
-        self.writeln("} else if (Array.isArray(buf)) {");
-        self.indent();
-        self.writeln("buf.fill(0);");
-        self.dedent();
-        self.writeln("}");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Constant-time comparison
-        self.writeln("function constant_time_eq(a, b) {");
-        self.indent();
-        self.writeln("if (a.length !== b.length) return false;");
-        self.writeln("let result = 0;");
-        self.writeln("for (let i = 0; i < a.length; i++) {");
-        self.indent();
-        self.writeln("result |= a[i] ^ b[i];");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return result === 0;");
-        self.dedent();
-        self.writeln("}");
         self.writeln("");
     }
 
@@ -259,6 +138,9 @@ impl JavaScriptGenerator {
                 if self.include_tests {
                     self.generate_test(test);
                 }
+            }
+            ItemKind::Use(_) => {
+                // Use statements are handled during loading, items are already merged
             }
         }
     }
@@ -486,9 +368,9 @@ impl JavaScriptGenerator {
     fn generate_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Integer(n) => {
-                // For values that fit in 32 bits, use regular numbers
-                // For larger values, we'd use BigInt but our DSL mostly uses 32-bit
-                if *n <= u32::MAX as u128 {
+                // JavaScript numbers can safely represent integers up to 2^53
+                // Use regular numbers for all values in that range
+                if *n <= (1u128 << 53) {
                     self.write(&format!("{}", n));
                 } else {
                     self.write(&format!("{}n", n));
@@ -689,137 +571,6 @@ impl JavaScriptGenerator {
 
     fn generate_builtin(&mut self, name: BuiltinFunc, args: &[Expr]) {
         match name {
-            BuiltinFunc::Rotr => {
-                self.write("rotr32(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(")");
-            }
-            BuiltinFunc::Rotl => {
-                self.write("rotl32(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(")");
-            }
-            BuiltinFunc::Bswap => {
-                // Byte swap for 32-bit
-                self.write("(((");
-                self.generate_expr(&args[0]);
-                self.write(" & 0xff) << 24) | ((");
-                self.generate_expr(&args[0]);
-                self.write(" & 0xff00) << 8) | ((");
-                self.generate_expr(&args[0]);
-                self.write(" & 0xff0000) >>> 8) | ((");
-                self.generate_expr(&args[0]);
-                self.write(" & 0xff000000) >>> 24))");
-            }
-            BuiltinFunc::ReadU8 => {
-                self.generate_expr(&args[0]);
-                self.write("[");
-                self.generate_expr(&args[1]);
-                self.write("]");
-            }
-            BuiltinFunc::ReadU16Be => {
-                self.write("((");
-                self.generate_expr(&args[0]);
-                self.write("[");
-                self.generate_expr(&args[1]);
-                self.write("] << 8) | ");
-                self.generate_expr(&args[0]);
-                self.write("[");
-                self.generate_expr(&args[1]);
-                self.write(" + 1])");
-            }
-            BuiltinFunc::ReadU16Le => {
-                self.write("(");
-                self.generate_expr(&args[0]);
-                self.write("[");
-                self.generate_expr(&args[1]);
-                self.write("] | (");
-                self.generate_expr(&args[0]);
-                self.write("[");
-                self.generate_expr(&args[1]);
-                self.write(" + 1] << 8))");
-            }
-            BuiltinFunc::ReadU32Be => {
-                self.write("read_u32_be(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(")");
-            }
-            BuiltinFunc::ReadU32Le => {
-                self.write("read_u32_le(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(")");
-            }
-            BuiltinFunc::ReadU64Be | BuiltinFunc::ReadU64Le => {
-                // For 64-bit reads, use BigInt
-                self.write("/* TODO: 64-bit read */0");
-            }
-            BuiltinFunc::WriteU8 => {
-                self.generate_expr(&args[0]);
-                self.write("[");
-                self.generate_expr(&args[1]);
-                self.write("] = ");
-                self.generate_expr(&args[2]);
-            }
-            BuiltinFunc::WriteU16Be | BuiltinFunc::WriteU16Le => {
-                // Inline 16-bit write
-                self.write("/* TODO: 16-bit write */");
-            }
-            BuiltinFunc::WriteU32Be => {
-                self.write("write_u32_be(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(", ");
-                self.generate_expr(&args[2]);
-                self.write(")");
-            }
-            BuiltinFunc::WriteU32Le => {
-                self.write("write_u32_le(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(", ");
-                self.generate_expr(&args[2]);
-                self.write(")");
-            }
-            BuiltinFunc::WriteU64Be => {
-                self.write("write_u64_be(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(", ");
-                self.generate_expr(&args[2]);
-                self.write(")");
-            }
-            BuiltinFunc::WriteU64Le => {
-                self.write("write_u64_le(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(", ");
-                self.generate_expr(&args[2]);
-                self.write(")");
-            }
-            BuiltinFunc::ConstantTimeEq => {
-                self.write("constant_time_eq(");
-                self.generate_expr(&args[0]);
-                self.write(", ");
-                self.generate_expr(&args[1]);
-                self.write(")");
-            }
-            BuiltinFunc::SecureZero => {
-                self.write("secure_zero(");
-                self.generate_expr(&args[0]);
-                self.write(")");
-            }
             BuiltinFunc::Assert => {
                 self.write("__assert(");
                 self.generate_expr(&args[0]);

@@ -3,6 +3,8 @@
 // This implements the MD5 hash function as specified in RFC 1321.
 // Note: MD5 is cryptographically broken and should not be used for security.
 
+use "../runtime.algoc";
+
 // Per-round shift amounts
 const S: u32[64] = [
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,

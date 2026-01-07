@@ -1,10 +1,70 @@
 //! AlgoC CLI - Algorithm pseudocode transpiler
 
+use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use algoc::{Parser, analyze, errors::print_error, CodeGenerator, JavaScriptGenerator};
+use algoc::parser::{Ast, Item, ItemKind};
+
+/// Load and parse a file, recursively processing `use` statements
+fn load_with_imports(
+    filepath: &Path,
+    loaded: &mut HashSet<PathBuf>,
+) -> Result<Ast, (String, String)> {
+    // Canonicalize to detect circular/duplicate imports
+    let canonical = filepath.canonicalize()
+        .map_err(|e| (filepath.display().to_string(), format!("cannot resolve path: {}", e)))?;
+
+    // Skip if already loaded
+    if loaded.contains(&canonical) {
+        return Ok(Ast { items: Vec::new() });
+    }
+    loaded.insert(canonical.clone());
+
+    // Read source
+    let source = fs::read_to_string(filepath)
+        .map_err(|e| (filepath.display().to_string(), format!("cannot read file: {}", e)))?;
+
+    // Parse
+    let parser = Parser::new(&source);
+    let ast = parser.parse()
+        .map_err(|e| (filepath.display().to_string(), format!("{}", e)))?;
+
+    // Process imports and collect items
+    let mut all_items: Vec<Item> = Vec::new();
+    let base_dir = filepath.parent().unwrap_or(Path::new("."));
+
+    for item in ast.items {
+        if let ItemKind::Use(ref use_def) = item.kind {
+            // Resolve relative path
+            let import_path = base_dir.join(&use_def.path);
+
+            // Recursively load
+            let imported_ast = load_with_imports(&import_path, loaded)?;
+            all_items.extend(imported_ast.items);
+        } else {
+            all_items.push(item);
+        }
+    }
+
+    Ok(Ast { items: all_items })
+}
+
+/// Load a file with all its imports resolved
+fn load_file(filename: &str) -> Result<(Ast, String), (String, String)> {
+    let path = Path::new(filename);
+    let mut loaded = HashSet::new();
+
+    // Read the source for error reporting
+    let source = fs::read_to_string(path)
+        .map_err(|e| (filename.to_string(), format!("cannot read file: {}", e)))?;
+
+    let ast = load_with_imports(path, &mut loaded)?;
+    Ok((ast, source))
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -65,6 +125,9 @@ fn main() -> ExitCode {
                             algoc::parser::ItemKind::Test(t) => {
                                 println!("  test {} ({} statements)", t.name.name, t.body.stmts.len());
                             }
+                            algoc::parser::ItemKind::Use(u) => {
+                                println!("  use \"{}\"", u.path);
+                            }
                         }
                     }
                     ExitCode::SUCCESS
@@ -82,20 +145,12 @@ fn main() -> ExitCode {
             }
 
             let filename = &args[2];
-            let source = match fs::read_to_string(filename) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error reading file '{}': {}", filename, e);
-                    return ExitCode::FAILURE;
-                }
-            };
 
-            // Parse
-            let parser = Parser::new(&source);
-            let ast = match parser.parse() {
-                Ok(ast) => ast,
-                Err(e) => {
-                    print_error(&source, filename, &e);
+            // Load file with imports
+            let (ast, source) = match load_file(filename) {
+                Ok((ast, source)) => (ast, source),
+                Err((file, msg)) => {
+                    eprintln!("Error in '{}': {}", file, msg);
                     return ExitCode::FAILURE;
                 }
             };
@@ -184,20 +239,11 @@ fn main() -> ExitCode {
                 }
             };
 
-            let source = match fs::read_to_string(filename) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error reading file '{}': {}", filename, e);
-                    return ExitCode::FAILURE;
-                }
-            };
-
-            // Parse
-            let parser = Parser::new(&source);
-            let ast = match parser.parse() {
-                Ok(ast) => ast,
-                Err(e) => {
-                    print_error(&source, filename, &e);
+            // Load file with imports
+            let (ast, source) = match load_file(filename) {
+                Ok((ast, source)) => (ast, source),
+                Err((file, msg)) => {
+                    eprintln!("Error in '{}': {}", file, msg);
                     return ExitCode::FAILURE;
                 }
             };

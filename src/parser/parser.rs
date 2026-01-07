@@ -155,7 +155,9 @@ impl<'src> Parser<'src> {
     fn parse_item(&mut self) -> AlgocResult<Item> {
         let start = self.current_span();
 
-        let kind = if self.check_keyword(Keyword::Fn) {
+        let kind = if self.check_keyword(Keyword::Use) {
+            ItemKind::Use(self.parse_use()?)
+        } else if self.check_keyword(Keyword::Fn) {
             ItemKind::Function(self.parse_function()?)
         } else if self.check_keyword(Keyword::Struct) {
             ItemKind::Struct(self.parse_struct()?)
@@ -167,13 +169,38 @@ impl<'src> Parser<'src> {
             ItemKind::Test(self.parse_test()?)
         } else {
             return Err(AlgocError::parser(
-                format!("expected item (fn, struct, const, test), found {}", self.peek().kind),
+                format!("expected item (use, fn, struct, const, test), found {}", self.peek().kind),
                 self.current_span(),
             ));
         };
 
         let span = start.merge(self.previous().span);
         Ok(Item { kind, span })
+    }
+
+    fn parse_use(&mut self) -> AlgocResult<UseDef> {
+        let start = self.current_span();
+        self.expect_keyword(Keyword::Use, "expected 'use'")?;
+
+        // Expect a string literal for the path
+        let path = match &self.peek().kind {
+            TokenKind::String(s) => {
+                let path = s.clone();
+                self.advance();
+                path
+            }
+            _ => {
+                return Err(AlgocError::parser(
+                    format!("expected path string after 'use', found {}", self.peek().kind),
+                    self.current_span(),
+                ));
+            }
+        };
+
+        self.expect(&TokenKind::Semicolon, "expected ';' after use declaration")?;
+
+        let span = start.merge(self.previous().span);
+        Ok(UseDef { path, span })
     }
 
     fn parse_function(&mut self) -> AlgocResult<Function> {
@@ -360,42 +387,52 @@ impl<'src> Parser<'src> {
     fn parse_type(&mut self) -> AlgocResult<Type> {
         let start = self.current_span();
 
-        // Reference types: &T, &mut T, &[T], &[T; N]
+        // Reference types: &T, &mut T, &[T], &[T; N], &mut [T]
         if self.match_token(&TokenKind::Amp) {
-            if self.match_keyword(Keyword::Mut) {
-                let inner = self.parse_type()?;
-                let span = start.merge(self.previous().span);
-                return Ok(Type {
-                    kind: TypeKind::MutRef(Box::new(inner)),
-                    span,
-                });
-            }
+            let is_mut = self.match_keyword(Keyword::Mut);
 
-            // Could be &T, &[T], or &[T; N]
+            // Could be &[T], &[T; N], &mut [T], or &T / &mut T
             if self.match_token(&TokenKind::LBracket) {
                 let element = self.parse_type()?;
 
                 if self.match_token(&TokenKind::Semicolon) {
-                    // &[T; N]
+                    // &[T; N] or &mut [T; N] - fixed size array reference
                     let size = self.parse_integer_literal()?;
                     self.expect(&TokenKind::RBracket, "expected ']' after array size")?;
                     let span = start.merge(self.previous().span);
-                    return Ok(Type {
-                        kind: TypeKind::ArrayRef {
+                    let array_ty = Type {
+                        kind: TypeKind::Array {
                             element: Box::new(element),
                             size,
                         },
                         span,
+                    };
+                    return Ok(Type {
+                        kind: if is_mut {
+                            TypeKind::MutRef(Box::new(array_ty))
+                        } else {
+                            TypeKind::Ref(Box::new(array_ty))
+                        },
+                        span,
                     });
                 } else {
-                    // &[T]
+                    // &[T] or &mut [T] - slice reference
                     self.expect(&TokenKind::RBracket, "expected ']' after slice type")?;
                     let span = start.merge(self.previous().span);
-                    return Ok(Type {
+                    let slice_ty = Type {
                         kind: TypeKind::Slice {
                             element: Box::new(element),
                         },
                         span,
+                    };
+                    return Ok(if is_mut {
+                        Type {
+                            kind: TypeKind::MutRef(Box::new(slice_ty)),
+                            span,
+                        }
+                    } else {
+                        // For immutable slices, we use the Slice type directly
+                        slice_ty
                     });
                 }
             }
@@ -403,7 +440,11 @@ impl<'src> Parser<'src> {
             let inner = self.parse_type()?;
             let span = start.merge(self.previous().span);
             return Ok(Type {
-                kind: TypeKind::Ref(Box::new(inner)),
+                kind: if is_mut {
+                    TypeKind::MutRef(Box::new(inner))
+                } else {
+                    TypeKind::Ref(Box::new(inner))
+                },
                 span,
             });
         }
@@ -1099,26 +1140,8 @@ impl<'src> Parser<'src> {
     fn try_parse_builtin(&mut self) -> Option<AlgocResult<Expr>> {
         let start = self.current_span();
 
+        // Only a few things remain as true builtins (compiler intrinsics)
         let builtin = match &self.peek().kind {
-            TokenKind::Keyword(Keyword::Rotr) => Some(BuiltinFunc::Rotr),
-            TokenKind::Keyword(Keyword::Rotl) => Some(BuiltinFunc::Rotl),
-            TokenKind::Keyword(Keyword::Bswap) => Some(BuiltinFunc::Bswap),
-            TokenKind::Keyword(Keyword::ReadU8) => Some(BuiltinFunc::ReadU8),
-            TokenKind::Keyword(Keyword::ReadU16Be) => Some(BuiltinFunc::ReadU16Be),
-            TokenKind::Keyword(Keyword::ReadU16Le) => Some(BuiltinFunc::ReadU16Le),
-            TokenKind::Keyword(Keyword::ReadU32Be) => Some(BuiltinFunc::ReadU32Be),
-            TokenKind::Keyword(Keyword::ReadU32Le) => Some(BuiltinFunc::ReadU32Le),
-            TokenKind::Keyword(Keyword::ReadU64Be) => Some(BuiltinFunc::ReadU64Be),
-            TokenKind::Keyword(Keyword::ReadU64Le) => Some(BuiltinFunc::ReadU64Le),
-            TokenKind::Keyword(Keyword::WriteU8) => Some(BuiltinFunc::WriteU8),
-            TokenKind::Keyword(Keyword::WriteU16Be) => Some(BuiltinFunc::WriteU16Be),
-            TokenKind::Keyword(Keyword::WriteU16Le) => Some(BuiltinFunc::WriteU16Le),
-            TokenKind::Keyword(Keyword::WriteU32Be) => Some(BuiltinFunc::WriteU32Be),
-            TokenKind::Keyword(Keyword::WriteU32Le) => Some(BuiltinFunc::WriteU32Le),
-            TokenKind::Keyword(Keyword::WriteU64Be) => Some(BuiltinFunc::WriteU64Be),
-            TokenKind::Keyword(Keyword::WriteU64Le) => Some(BuiltinFunc::WriteU64Le),
-            TokenKind::Keyword(Keyword::ConstantTimeEq) => Some(BuiltinFunc::ConstantTimeEq),
-            TokenKind::Keyword(Keyword::SecureZero) => Some(BuiltinFunc::SecureZero),
             TokenKind::Keyword(Keyword::Assert) => Some(BuiltinFunc::Assert),
             _ => None,
         };

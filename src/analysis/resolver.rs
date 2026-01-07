@@ -162,6 +162,9 @@ impl Resolver {
             ItemKind::Test(_) => {
                 // Tests don't declare symbols
             }
+            ItemKind::Use(_) => {
+                // Use statements are handled during loading, not here
+            }
         }
     }
 
@@ -199,6 +202,9 @@ impl Resolver {
             }
             ItemKind::Struct(_) | ItemKind::Layout(_) => {
                 // Already handled in declare_item
+            }
+            ItemKind::Use(_) => {
+                // Use statements are handled during loading
             }
         }
     }

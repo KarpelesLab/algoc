@@ -24,6 +24,7 @@ impl Token {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Keyword {
     // Declarations
+    Use,
     Fn,
     Struct,
     Layout,
@@ -66,29 +67,7 @@ pub enum Keyword {
     Aligned,
     Packed,
 
-    // Built-in functions (recognized as keywords)
-    Rotr,
-    Rotl,
-    Bswap,
-    ReadU8,
-    ReadU16Be,
-    ReadU16Le,
-    ReadU32Be,
-    ReadU32Le,
-    ReadU64Be,
-    ReadU64Le,
-    WriteU8,
-    WriteU16Be,
-    WriteU16Le,
-    WriteU32Be,
-    WriteU32Le,
-    WriteU64Be,
-    WriteU64Le,
-    ConstantTimeEq,
-    SecureZero,
-
-    // Test helpers
-    Input,
+    // Test helpers (these are still builtins for now)
     Assert,
     Bytes,
     Hex,
@@ -103,6 +82,7 @@ impl Keyword {
     pub fn from_str(s: &str) -> Option<Keyword> {
         match s {
             // Declarations
+            "use" => Some(Keyword::Use),
             "fn" => Some(Keyword::Fn),
             "struct" => Some(Keyword::Struct),
             "layout" => Some(Keyword::Layout),
@@ -145,29 +125,7 @@ impl Keyword {
             "aligned" => Some(Keyword::Aligned),
             "packed" => Some(Keyword::Packed),
 
-            // Built-ins
-            "rotr" => Some(Keyword::Rotr),
-            "rotl" => Some(Keyword::Rotl),
-            "bswap" => Some(Keyword::Bswap),
-            "read_u8" => Some(Keyword::ReadU8),
-            "read_u16_be" => Some(Keyword::ReadU16Be),
-            "read_u16_le" => Some(Keyword::ReadU16Le),
-            "read_u32_be" => Some(Keyword::ReadU32Be),
-            "read_u32_le" => Some(Keyword::ReadU32Le),
-            "read_u64_be" => Some(Keyword::ReadU64Be),
-            "read_u64_le" => Some(Keyword::ReadU64Le),
-            "write_u8" => Some(Keyword::WriteU8),
-            "write_u16_be" => Some(Keyword::WriteU16Be),
-            "write_u16_le" => Some(Keyword::WriteU16Le),
-            "write_u32_be" => Some(Keyword::WriteU32Be),
-            "write_u32_le" => Some(Keyword::WriteU32Le),
-            "write_u64_be" => Some(Keyword::WriteU64Be),
-            "write_u64_le" => Some(Keyword::WriteU64Le),
-            "constant_time_eq" => Some(Keyword::ConstantTimeEq),
-            "secure_zero" => Some(Keyword::SecureZero),
-
             // Test helpers
-            "input" => Some(Keyword::Input),
             "assert" => Some(Keyword::Assert),
             "bytes" => Some(Keyword::Bytes),
             "hex" => Some(Keyword::Hex),
@@ -184,6 +142,7 @@ impl Keyword {
 impl fmt::Display for Keyword {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
+            Keyword::Use => "use",
             Keyword::Fn => "fn",
             Keyword::Struct => "struct",
             Keyword::Layout => "layout",
@@ -217,26 +176,6 @@ impl fmt::Display for Keyword {
             Keyword::LittleEndian => "little_endian",
             Keyword::Aligned => "aligned",
             Keyword::Packed => "packed",
-            Keyword::Rotr => "rotr",
-            Keyword::Rotl => "rotl",
-            Keyword::Bswap => "bswap",
-            Keyword::ReadU8 => "read_u8",
-            Keyword::ReadU16Be => "read_u16_be",
-            Keyword::ReadU16Le => "read_u16_le",
-            Keyword::ReadU32Be => "read_u32_be",
-            Keyword::ReadU32Le => "read_u32_le",
-            Keyword::ReadU64Be => "read_u64_be",
-            Keyword::ReadU64Le => "read_u64_le",
-            Keyword::WriteU8 => "write_u8",
-            Keyword::WriteU16Be => "write_u16_be",
-            Keyword::WriteU16Le => "write_u16_le",
-            Keyword::WriteU32Be => "write_u32_be",
-            Keyword::WriteU32Le => "write_u32_le",
-            Keyword::WriteU64Be => "write_u64_be",
-            Keyword::WriteU64Le => "write_u64_le",
-            Keyword::ConstantTimeEq => "constant_time_eq",
-            Keyword::SecureZero => "secure_zero",
-            Keyword::Input => "input",
             Keyword::Assert => "assert",
             Keyword::Bytes => "bytes",
             Keyword::Hex => "hex",

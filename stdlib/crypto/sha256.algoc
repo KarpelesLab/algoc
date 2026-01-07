@@ -3,6 +3,8 @@
 // This implements the SHA-256 cryptographic hash function as specified
 // in FIPS 180-4.
 
+use "../runtime.algoc";
+
 // Round constants (first 32 bits of fractional parts of cube roots of first 64 primes)
 const K: u32[64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
