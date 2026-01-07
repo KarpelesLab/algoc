@@ -177,6 +177,17 @@ impl JavaScriptGenerator {
         self.writeln("}");
         self.writeln("");
 
+        // Write u64 little-endian
+        self.writeln("function write_u64_le(buf, offset, value) {");
+        self.indent();
+        self.writeln("const lo = value >>> 0;");
+        self.writeln("const hi = Math.floor(value / 0x100000000);");
+        self.writeln("write_u32_le(buf, offset, lo);");
+        self.writeln("write_u32_le(buf, offset + 4, hi);");
+        self.dedent();
+        self.writeln("}");
+        self.writeln("");
+
         // Secure zero (best effort in JS)
         self.writeln("function secure_zero(buf) {");
         self.indent();
@@ -789,7 +800,13 @@ impl JavaScriptGenerator {
                 self.write(")");
             }
             BuiltinFunc::WriteU64Le => {
-                self.write("/* TODO: write_u64_le */");
+                self.write("write_u64_le(");
+                self.generate_expr(&args[0]);
+                self.write(", ");
+                self.generate_expr(&args[1]);
+                self.write(", ");
+                self.generate_expr(&args[2]);
+                self.write(")");
             }
             BuiltinFunc::ConstantTimeEq => {
                 self.write("constant_time_eq(");

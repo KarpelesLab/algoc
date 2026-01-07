@@ -119,7 +119,7 @@ impl<'a> TypeChecker<'a> {
             }
             ItemKind::Const(c) => {
                 let declared_ty = self.ast_to_type(&c.ty);
-                let actual_ty = self.infer_expr(&c.value);
+                let actual_ty = self.infer_expr_with_hint(&c.value, Some(&declared_ty));
                 if !actual_ty.is_compatible_with(&declared_ty) {
                     self.error(
                         format!("constant '{}' has type {}, but initializer has type {}",
@@ -330,6 +330,54 @@ impl<'a> TypeChecker<'a> {
                 self.error("expression is not assignable", expr.span);
             }
         }
+    }
+
+    /// Infer the type of an expression with an optional expected type hint
+    fn infer_expr_with_hint(&mut self, expr: &parser::Expr, hint: Option<&Type>) -> Type {
+        // Handle array literals specially when we have a type hint
+        if let parser::ExprKind::Array(elements) = &expr.kind {
+            if let Some(expected) = hint {
+                if let TypeKind::Array { element: expected_elem, size } = &expected.kind {
+                    // Use the expected element type for each element
+                    for elem in elements {
+                        let elem_ty = self.infer_expr_with_hint(elem, Some(expected_elem));
+                        if !elem_ty.is_compatible_with(expected_elem) {
+                            self.error(
+                                format!("array element type mismatch: expected {}, got {}", expected_elem, elem_ty),
+                                elem.span,
+                            );
+                        }
+                    }
+                    if elements.len() as u64 != *size {
+                        self.error(
+                            format!("array length mismatch: expected {}, got {}", size, elements.len()),
+                            expr.span,
+                        );
+                    }
+                    return expected.clone();
+                }
+            }
+        }
+
+        // Handle integer literals with type hint
+        if let parser::ExprKind::Integer(n) = &expr.kind {
+            if let Some(expected) = hint {
+                if let TypeKind::Int { bits, signed } = &expected.kind {
+                    // Check that the value fits in the expected type
+                    let max_val = if *signed {
+                        (1u128 << (bits - 1)) - 1
+                    } else {
+                        (1u128 << bits) - 1
+                    };
+                    if *n <= max_val {
+                        return expected.clone();
+                    }
+                }
+            }
+        }
+
+        // Fall back to regular inference
+        self.infer_expr(expr)
     }
 
     /// Infer the type of an expression
