@@ -616,8 +616,13 @@ impl<'a> TypeChecker<'a> {
                 Type::array(elem_ty, *count)
             }
             parser::ExprKind::Cast { expr: inner, ty } => {
-                let _ = self.infer_expr(inner);
-                self.ast_to_type(ty)
+                let from_ty = self.infer_expr(inner);
+                let to_ty = self.ast_to_type(ty);
+
+                // Validate the cast
+                self.check_cast(&from_ty, &to_ty, expr.span);
+
+                to_ty
             }
             parser::ExprKind::Ref(inner) => {
                 let inner_ty = self.infer_expr(inner);
@@ -875,6 +880,95 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             _ => None, // Not a known method
+        }
+    }
+
+    /// Check if a cast is valid
+    fn check_cast(&mut self, from_ty: &Type, to_ty: &Type, span: SourceSpan) {
+        if from_ty.is_error() || to_ty.is_error() {
+            return; // Skip checking if there's already an error
+        }
+
+        // Integer to integer casts are always allowed (including endianness changes)
+        if from_ty.is_integer() && to_ty.is_integer() {
+            return;
+        }
+
+        // Bool to integer and integer to bool
+        if (from_ty.is_bool() && to_ty.is_integer()) || (from_ty.is_integer() && to_ty.is_bool()) {
+            return;
+        }
+
+        // Slice/array of u8 to integer type (byte reinterpretation)
+        // e.g., buf[0..4] as u32be
+        if to_ty.is_integer() {
+            let elem_ty = self.get_element_type(from_ty);
+            if let Some(elem) = elem_ty {
+                // Check element is u8
+                if let TypeKind::Int { bits: 8, signed: false, .. } = &elem.kind {
+                    // Valid: byte slice/array to integer
+                    // The size check is done at runtime (slice) or could be checked
+                    // at compile time for fixed-size arrays
+                    if let TypeKind::Array { size, .. } = &from_ty.kind {
+                        let required_bytes = to_ty.bit_width().unwrap_or(0) / 8;
+                        if *size != required_bytes as u64 {
+                            self.error(
+                                format!("cannot cast [u8; {}] to {}: expected {} bytes",
+                                    size, to_ty, required_bytes),
+                                span,
+                            );
+                        }
+                    }
+                    // For slices, size is checked at runtime
+                    return;
+                }
+            }
+        }
+
+        // Integer to byte array (for writing endian values)
+        // e.g., value as u8[4] - this produces bytes in the integer's endian format
+        if from_ty.is_integer() {
+            if let TypeKind::Array { element, size } = &to_ty.kind {
+                if let TypeKind::Int { bits: 8, signed: false, .. } = &element.kind {
+                    let from_bytes = from_ty.bit_width().unwrap_or(0) / 8;
+                    if *size == from_bytes as u64 {
+                        return; // Valid: integer to byte array
+                    } else {
+                        self.error(
+                            format!("cannot cast {} to [u8; {}]: {} has {} bytes",
+                                from_ty, size, from_ty, from_bytes),
+                            span,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Reference casts (strip mutability, etc.)
+        if from_ty.is_ref() && to_ty.is_ref() {
+            // Check inner types are compatible
+            if let (Some(from_inner), Some(to_inner)) = (from_ty.deref_type(), to_ty.deref_type()) {
+                if from_inner.is_compatible_with(to_inner) {
+                    return;
+                }
+            }
+        }
+
+        // If none of the above, it's an invalid cast
+        self.error(
+            format!("cannot cast {} to {}", from_ty, to_ty),
+            span,
+        );
+    }
+
+    /// Helper to get element type from array, slice, or reference to array/slice
+    fn get_element_type<'b>(&self, ty: &'b Type) -> Option<&'b Type> {
+        match &ty.kind {
+            TypeKind::Array { element, .. } => Some(element),
+            TypeKind::Slice { element } => Some(element),
+            TypeKind::Ref { inner, .. } => self.get_element_type(inner),
+            _ => None,
         }
     }
 }

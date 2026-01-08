@@ -600,35 +600,7 @@ impl PythonGenerator {
                 self.write(&count.to_string());
             }
             ExprKind::Cast { expr, ty } => {
-                // In Python, we need to mask for integer type casts
-                match &ty.kind {
-                    crate::parser::TypeKind::Primitive(p) => {
-                        match p {
-                            crate::parser::PrimitiveType::U8 | crate::parser::PrimitiveType::I8 => {
-                                self.write("_u8(");
-                                self.generate_expr(expr);
-                                self.write(")");
-                            }
-                            crate::parser::PrimitiveType::U32 | crate::parser::PrimitiveType::I32 => {
-                                self.write("_u32(");
-                                self.generate_expr(expr);
-                                self.write(")");
-                            }
-                            crate::parser::PrimitiveType::U64 | crate::parser::PrimitiveType::I64 => {
-                                self.write("_u64(");
-                                self.generate_expr(expr);
-                                self.write(")");
-                            }
-                            _ => {
-                                // For other types, just generate the expression
-                                self.generate_expr(expr);
-                            }
-                        }
-                    }
-                    _ => {
-                        self.generate_expr(expr);
-                    }
-                }
+                self.generate_cast(expr, ty);
             }
             ExprKind::Ref(inner) | ExprKind::MutRef(inner) => {
                 // References in Python are just the value
@@ -662,6 +634,166 @@ impl PythonGenerator {
                 self.write(")");
             }
         }
+    }
+
+    fn generate_cast(&mut self, expr: &Expr, ty: &crate::parser::Type) {
+        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+
+        // Check for endian byte conversions (byte slice/array to integer)
+        // e.g., buf[0..4] as u32be -> int.from_bytes(buf[0:4], 'big')
+        if let TypeKind::Primitive(p) = &ty.kind {
+            let endian = p.endianness();
+            if endian != Endianness::Native {
+                // This is an endian-qualified type
+                let byte_order = if endian == Endianness::Big {
+                    "'big'"
+                } else {
+                    "'little'"
+                };
+
+                // Check if source is a slice/array (byte conversion)
+                if self.is_byte_sequence_expr(expr) {
+                    self.write("int.from_bytes(bytes(");
+                    self.generate_expr(expr);
+                    self.write("), ");
+                    self.write(byte_order);
+                    self.write(")");
+                    return;
+                }
+
+                // Integer to different endian - just mask to the appropriate size
+                let native = p.to_native();
+                let bits = match native {
+                    PrimitiveType::U16 | PrimitiveType::I16 => 16,
+                    PrimitiveType::U32 | PrimitiveType::I32 => 32,
+                    PrimitiveType::U64 | PrimitiveType::I64 => 64,
+                    PrimitiveType::U128 | PrimitiveType::I128 => 128,
+                    _ => 32,
+                };
+                match bits {
+                    16 => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") & 0xFFFF)");
+                    }
+                    64 => {
+                        self.write("_u64(");
+                        self.generate_expr(expr);
+                        self.write(")");
+                    }
+                    128 => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") & ((1 << 128) - 1))");
+                    }
+                    _ => {
+                        self.write("_u32(");
+                        self.generate_expr(expr);
+                        self.write(")");
+                    }
+                }
+                return;
+            }
+        }
+
+        // Check for integer to byte array cast
+        // e.g., value as u8[4] -> value.to_bytes(4, 'big')
+        if let TypeKind::Array { element, size } = &ty.kind {
+            if let TypeKind::Primitive(PrimitiveType::U8) = &element.kind {
+                // Get the endianness from the source expression if it's an endian type
+                let byte_order = self.get_expr_endianness(expr);
+                self.write("(");
+                self.generate_expr(expr);
+                self.write(&format!(").to_bytes({}, {})", size, byte_order));
+                return;
+            }
+        }
+
+        // Standard integer casts (masking)
+        match &ty.kind {
+            TypeKind::Primitive(p) => {
+                match p {
+                    PrimitiveType::U8 | PrimitiveType::I8 => {
+                        self.write("_u8(");
+                        self.generate_expr(expr);
+                        self.write(")");
+                    }
+                    PrimitiveType::U16 | PrimitiveType::I16 => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") & 0xFFFF)");
+                    }
+                    PrimitiveType::U32 | PrimitiveType::I32 => {
+                        self.write("_u32(");
+                        self.generate_expr(expr);
+                        self.write(")");
+                    }
+                    PrimitiveType::U64 | PrimitiveType::I64 => {
+                        self.write("_u64(");
+                        self.generate_expr(expr);
+                        self.write(")");
+                    }
+                    PrimitiveType::U128 | PrimitiveType::I128 => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") & ((1 << 128) - 1))");
+                    }
+                    PrimitiveType::Bool => {
+                        self.write("bool(");
+                        self.generate_expr(expr);
+                        self.write(")");
+                    }
+                    // Endian types that reach here (shouldn't normally, but fallback)
+                    _ => {
+                        self.generate_expr(expr);
+                    }
+                }
+            }
+            _ => {
+                self.generate_expr(expr);
+            }
+        }
+    }
+
+    /// Check if an expression produces a byte sequence (for from_bytes conversion)
+    fn is_byte_sequence_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Slice { .. } => true,
+            ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
+            ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
+            ExprKind::Index { array, .. } => {
+                // array[i] is a single byte, not a sequence
+                false
+            }
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Paren(inner) => {
+                self.is_byte_sequence_expr(inner)
+            }
+            ExprKind::Ident(_) => {
+                // Could be a byte array/slice variable - assume yes for safety
+                // The type checker will have validated this
+                true
+            }
+            ExprKind::Field { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Get the byte order string for an expression based on its type
+    fn get_expr_endianness(&self, expr: &Expr) -> &'static str {
+        use crate::parser::{TypeKind, Endianness};
+
+        // Check if the expression is a cast to an endian type
+        if let ExprKind::Cast { ty, .. } = &expr.kind {
+            if let TypeKind::Primitive(p) = &ty.kind {
+                return match p.endianness() {
+                    Endianness::Big => "'big'",
+                    Endianness::Little => "'little'",
+                    Endianness::Native => "'little'", // Default to little for native
+                };
+            }
+        }
+        // Default to little endian (most common)
+        "'little'"
     }
 }
 

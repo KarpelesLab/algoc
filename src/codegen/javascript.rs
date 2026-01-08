@@ -3,7 +3,7 @@
 //! Generates JavaScript code from the analyzed AST.
 //! Uses TypedArrays for byte buffers and handles bitwise operations.
 
-use crate::analysis::{AnalyzedAst, Type, TypeKind};
+use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
     Ast, Item, ItemKind, Function, Stmt, StmtKind, Expr, ExprKind,
@@ -513,9 +513,20 @@ impl JavaScriptGenerator {
                 if elements.is_empty() {
                     self.write("[]");
                 } else {
-                    // Check if all elements are integers
+                    // Check if all elements are small integers (bytes)
+                    let all_bytes = elements.iter().all(|e| {
+                        if let ExprKind::Integer(n) = &e.kind {
+                            *n <= 255
+                        } else {
+                            false
+                        }
+                    });
                     let all_ints = elements.iter().all(|e| matches!(e.kind, ExprKind::Integer(_)));
-                    if all_ints {
+
+                    if all_bytes {
+                        // Use Uint8Array for byte arrays
+                        self.write("new Uint8Array([");
+                    } else if all_ints {
                         self.write("new Uint32Array([");
                     } else {
                         self.write("[");
@@ -526,7 +537,7 @@ impl JavaScriptGenerator {
                         }
                         self.generate_expr(elem);
                     }
-                    if all_ints {
+                    if all_bytes || all_ints {
                         self.write("])");
                     } else {
                         self.write("]");
@@ -541,10 +552,8 @@ impl JavaScriptGenerator {
                 self.generate_expr(value);
                 self.write(")");
             }
-            ExprKind::Cast { expr, .. } => {
-                // In JavaScript, casts are mostly no-ops for numeric types
-                // For now, just generate the expression
-                self.generate_expr(expr);
+            ExprKind::Cast { expr: inner, ty } => {
+                self.generate_cast(inner, ty);
             }
             ExprKind::Ref(inner) | ExprKind::MutRef(inner) => {
                 // References in JS are just the value (pass by reference for objects)
@@ -585,6 +594,204 @@ impl JavaScriptGenerator {
                 self.write(")");
             }
         }
+    }
+
+    fn generate_cast(&mut self, expr: &Expr, ty: &crate::parser::Type) {
+        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+
+        // Check for endian byte conversions (byte slice/array to integer)
+        // e.g., buf[0..4] as u32be -> use DataView
+        if let TypeKind::Primitive(p) = &ty.kind {
+            let endian = p.endianness();
+            if endian != Endianness::Native {
+                // This is an endian-qualified type
+                let little_endian = endian == Endianness::Little;
+                let native = p.to_native();
+
+                // Check if source is a slice/array (byte conversion)
+                if self.is_byte_sequence_expr(expr) {
+                    // Use DataView to read the bytes
+                    // new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(0, littleEndian)
+                    let getter = match native {
+                        PrimitiveType::U16 | PrimitiveType::I16 => "getUint16",
+                        PrimitiveType::U32 | PrimitiveType::I32 => "getUint32",
+                        PrimitiveType::U64 | PrimitiveType::I64 => "getBigUint64",
+                        PrimitiveType::U128 | PrimitiveType::I128 => {
+                            // JavaScript doesn't have 128-bit support in DataView
+                            // Fall back to manual byte manipulation
+                            self.write("(() => { const __b = ");
+                            self.generate_expr(expr);
+                            if little_endian {
+                                self.write("; return BigInt(__b[0]) | (BigInt(__b[1]) << 8n) | (BigInt(__b[2]) << 16n) | (BigInt(__b[3]) << 24n) | (BigInt(__b[4]) << 32n) | (BigInt(__b[5]) << 40n) | (BigInt(__b[6]) << 48n) | (BigInt(__b[7]) << 56n) | (BigInt(__b[8]) << 64n) | (BigInt(__b[9]) << 72n) | (BigInt(__b[10]) << 80n) | (BigInt(__b[11]) << 88n) | (BigInt(__b[12]) << 96n) | (BigInt(__b[13]) << 104n) | (BigInt(__b[14]) << 112n) | (BigInt(__b[15]) << 120n); })()");
+                            } else {
+                                self.write("; return (BigInt(__b[0]) << 120n) | (BigInt(__b[1]) << 112n) | (BigInt(__b[2]) << 104n) | (BigInt(__b[3]) << 96n) | (BigInt(__b[4]) << 88n) | (BigInt(__b[5]) << 80n) | (BigInt(__b[6]) << 72n) | (BigInt(__b[7]) << 64n) | (BigInt(__b[8]) << 56n) | (BigInt(__b[9]) << 48n) | (BigInt(__b[10]) << 40n) | (BigInt(__b[11]) << 32n) | (BigInt(__b[12]) << 24n) | (BigInt(__b[13]) << 16n) | (BigInt(__b[14]) << 8n) | BigInt(__b[15]); })()");
+                            }
+                            return;
+                        }
+                        _ => "getUint32", // Fallback
+                    };
+
+                    self.write("(() => { const __b = ");
+                    self.generate_expr(expr);
+                    self.write(&format!("; return new DataView(__b.buffer, __b.byteOffset, __b.byteLength).{}(0, {}); }})()", getter, little_endian));
+                    return;
+                }
+
+                // Integer to integer with different endianness - just mask
+                match native {
+                    PrimitiveType::U16 | PrimitiveType::I16 => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") & 0xFFFF)");
+                    }
+                    PrimitiveType::U64 | PrimitiveType::I64 => {
+                        self.write("BigInt.asUintN(64, BigInt(");
+                        self.generate_expr(expr);
+                        self.write("))");
+                    }
+                    _ => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") >>> 0)");
+                    }
+                }
+                return;
+            }
+        }
+
+        // Check for integer to byte array cast
+        // e.g., value as u8[4] -> create Uint8Array and use DataView
+        if let TypeKind::Array { element, size } = &ty.kind {
+            if let TypeKind::Primitive(PrimitiveType::U8) = &element.kind {
+                // Get the endianness from the source expression
+                let (little_endian, bits) = self.get_expr_endianness_info(expr);
+
+                if bits <= 64 {
+                    let setter = match bits {
+                        16 => "setUint16",
+                        64 => "setBigUint64",
+                        _ => "setUint32",
+                    };
+
+                    self.write(&format!("(() => {{ const __a = new Uint8Array({}); new DataView(__a.buffer).{}(0, ", size, setter));
+                    if bits == 64 {
+                        self.write("BigInt(");
+                        self.generate_expr(expr);
+                        self.write(")");
+                    } else {
+                        self.generate_expr(expr);
+                    }
+                    self.write(&format!(", {}); return __a; }})()", little_endian));
+                    return;
+                } else {
+                    // 128-bit - manual byte manipulation
+                    let inner_expr = if let ExprKind::Cast { expr: inner, .. } = &expr.kind {
+                        inner
+                    } else {
+                        expr
+                    };
+
+                    self.write(&format!("(() => {{ const __v = BigInt("));
+                    self.generate_expr(inner_expr);
+                    self.write("); const __a = new Uint8Array(16);");
+                    if little_endian {
+                        for i in 0..16 {
+                            self.write(&format!(" __a[{}] = Number((__v >> {}n) & 0xFFn);", i, i * 8));
+                        }
+                    } else {
+                        for i in 0..16 {
+                            self.write(&format!(" __a[{}] = Number((__v >> {}n) & 0xFFn);", i, (15 - i) * 8));
+                        }
+                    }
+                    self.write(" return __a; })()");
+                    return;
+                }
+            }
+        }
+
+        // Standard casts - mostly no-ops in JavaScript
+        // But we should mask to appropriate bit widths
+        match &ty.kind {
+            TypeKind::Primitive(p) => {
+                match p {
+                    PrimitiveType::U8 | PrimitiveType::I8 => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") & 0xFF)");
+                    }
+                    PrimitiveType::U16 | PrimitiveType::I16 => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") & 0xFFFF)");
+                    }
+                    PrimitiveType::U32 | PrimitiveType::I32 => {
+                        self.write("((");
+                        self.generate_expr(expr);
+                        self.write(") >>> 0)");
+                    }
+                    PrimitiveType::U64 | PrimitiveType::I64 => {
+                        self.write("BigInt.asUintN(64, BigInt(");
+                        self.generate_expr(expr);
+                        self.write("))");
+                    }
+                    PrimitiveType::U128 | PrimitiveType::I128 => {
+                        self.write("BigInt.asUintN(128, BigInt(");
+                        self.generate_expr(expr);
+                        self.write("))");
+                    }
+                    PrimitiveType::Bool => {
+                        self.write("!!(");
+                        self.generate_expr(expr);
+                        self.write(")");
+                    }
+                    // Native endian types that need masking
+                    _ => {
+                        self.generate_expr(expr);
+                    }
+                }
+            }
+            _ => {
+                self.generate_expr(expr);
+            }
+        }
+    }
+
+    /// Check if an expression produces a byte sequence (for from_bytes conversion)
+    fn is_byte_sequence_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Slice { .. } => true,
+            ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
+            ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
+            ExprKind::Index { .. } => false, // Single element
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Paren(inner) => {
+                self.is_byte_sequence_expr(inner)
+            }
+            ExprKind::Ident(_) => true, // Assume variables can be byte sequences
+            ExprKind::Field { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Get endianness info from an expression (little_endian, bits)
+    fn get_expr_endianness_info(&self, expr: &Expr) -> (bool, u32) {
+        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+
+        if let ExprKind::Cast { ty, .. } = &expr.kind {
+            if let TypeKind::Primitive(p) = &ty.kind {
+                let endian = p.endianness();
+                let little = endian == Endianness::Little;
+                let bits = match p.to_native() {
+                    PrimitiveType::U16 | PrimitiveType::I16 => 16,
+                    PrimitiveType::U32 | PrimitiveType::I32 => 32,
+                    PrimitiveType::U64 | PrimitiveType::I64 => 64,
+                    PrimitiveType::U128 | PrimitiveType::I128 => 128,
+                    _ => 32,
+                };
+                return (little, bits);
+            }
+        }
+        // Default to little endian, 32 bits
+        (true, 32)
     }
 }
 
