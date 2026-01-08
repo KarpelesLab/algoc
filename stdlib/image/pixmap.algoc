@@ -1,0 +1,191 @@
+// Pixmap - shared image buffer structure for AlgoC
+//
+// This provides a common representation for image data that can be
+// used across different image format encoders and decoders.
+
+use "../runtime.algoc";
+
+// ============================================================================
+// Pixel Format Constants
+// ============================================================================
+
+// Grayscale formats
+const PIXFMT_GRAY8: u8 = 1;      // 8-bit grayscale
+
+// RGB formats (red first in memory)
+const PIXFMT_RGB24: u8 = 10;     // 24-bit RGB (3 bytes: R, G, B)
+const PIXFMT_RGBA32: u8 = 11;    // 32-bit RGBA (4 bytes: R, G, B, A)
+
+// BGR formats (blue first in memory, Windows native)
+const PIXFMT_BGR24: u8 = 20;     // 24-bit BGR (3 bytes: B, G, R)
+const PIXFMT_BGRA32: u8 = 21;    // 32-bit BGRA (4 bytes: B, G, R, A)
+
+// ============================================================================
+// Pixmap Structure
+// ============================================================================
+
+// Image buffer with format information
+struct Pixmap {
+    width: u32,         // Image width in pixels
+    height: u32,        // Image height in pixels
+    format: u8,         // Pixel format (PIXFMT_* constant)
+    stride: u32,        // Bytes per row (may include padding)
+    data: &mut [u8]     // Pixel data buffer
+}
+
+// ============================================================================
+// Pixel Format Utilities
+// ============================================================================
+
+// Get bytes per pixel for a given format
+fn pixfmt_bytes_per_pixel(format: u8) -> u8 {
+    if format == PIXFMT_GRAY8 {
+        return 1;
+    } else if format == PIXFMT_RGB24 || format == PIXFMT_BGR24 {
+        return 3;
+    } else if format == PIXFMT_RGBA32 || format == PIXFMT_BGRA32 {
+        return 4;
+    }
+    return 0;
+}
+
+// Check if format has alpha channel
+fn pixfmt_has_alpha(format: u8) -> bool {
+    return format == PIXFMT_RGBA32 || format == PIXFMT_BGRA32;
+}
+
+// Check if format is BGR byte order
+fn pixfmt_is_bgr(format: u8) -> bool {
+    return format == PIXFMT_BGR24 || format == PIXFMT_BGRA32;
+}
+
+// Calculate minimum stride for a given width and format
+fn pixmap_min_stride(width: u32, format: u8) -> u32 {
+    let bpp = pixfmt_bytes_per_pixel(format);
+    return width * (bpp as u32);
+}
+
+// Calculate required buffer size for a pixmap
+fn pixmap_buffer_size(width: u32, height: u32, stride: u32) -> u32 {
+    return stride * height;
+}
+
+// ============================================================================
+// Pixel Access Functions
+// ============================================================================
+
+// Get offset to a pixel in the buffer
+fn pixmap_pixel_offset(pix: &Pixmap, x: u32, y: u32) -> u32 {
+    return y * pix.stride + x * (pixfmt_bytes_per_pixel(pix.format) as u32);
+}
+
+// Get red component from a pixel
+fn pixmap_get_r(pix: &Pixmap, x: u32, y: u32) -> u8 {
+    let offset = pixmap_pixel_offset(pix, x, y);
+
+    if pix.format == PIXFMT_GRAY8 {
+        return pix.data[offset];
+    } else if pix.format == PIXFMT_RGB24 || pix.format == PIXFMT_RGBA32 {
+        return pix.data[offset];
+    } else if pix.format == PIXFMT_BGR24 || pix.format == PIXFMT_BGRA32 {
+        return pix.data[offset + 2];
+    }
+    return 0;
+}
+
+// Get green component from a pixel
+fn pixmap_get_g(pix: &Pixmap, x: u32, y: u32) -> u8 {
+    let offset = pixmap_pixel_offset(pix, x, y);
+
+    if pix.format == PIXFMT_GRAY8 {
+        return pix.data[offset];
+    } else if pix.format == PIXFMT_RGB24 || pix.format == PIXFMT_RGBA32 {
+        return pix.data[offset + 1];
+    } else if pix.format == PIXFMT_BGR24 || pix.format == PIXFMT_BGRA32 {
+        return pix.data[offset + 1];
+    }
+    return 0;
+}
+
+// Get blue component from a pixel
+fn pixmap_get_b(pix: &Pixmap, x: u32, y: u32) -> u8 {
+    let offset = pixmap_pixel_offset(pix, x, y);
+
+    if pix.format == PIXFMT_GRAY8 {
+        return pix.data[offset];
+    } else if pix.format == PIXFMT_RGB24 || pix.format == PIXFMT_RGBA32 {
+        return pix.data[offset + 2];
+    } else if pix.format == PIXFMT_BGR24 || pix.format == PIXFMT_BGRA32 {
+        return pix.data[offset];
+    }
+    return 0;
+}
+
+// Get alpha component from a pixel
+fn pixmap_get_a(pix: &Pixmap, x: u32, y: u32) -> u8 {
+    let offset = pixmap_pixel_offset(pix, x, y);
+
+    if pix.format == PIXFMT_RGBA32 {
+        return pix.data[offset + 3];
+    } else if pix.format == PIXFMT_BGRA32 {
+        return pix.data[offset + 3];
+    }
+    return 255;  // Opaque for formats without alpha
+}
+
+// Set RGB values for a pixel
+fn pixmap_set_rgb(pix: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8) {
+    let offset = pixmap_pixel_offset(pix, x, y);
+
+    if pix.format == PIXFMT_GRAY8 {
+        // Convert to grayscale using luminance formula (approximate)
+        let gray = ((r as u32) * 77 + (g as u32) * 150 + (b as u32) * 29) / 256;
+        pix.data[offset] = gray as u8;
+    } else if pix.format == PIXFMT_RGB24 {
+        pix.data[offset] = r;
+        pix.data[offset + 1] = g;
+        pix.data[offset + 2] = b;
+    } else if pix.format == PIXFMT_RGBA32 {
+        pix.data[offset] = r;
+        pix.data[offset + 1] = g;
+        pix.data[offset + 2] = b;
+        pix.data[offset + 3] = 255;
+    } else if pix.format == PIXFMT_BGR24 {
+        pix.data[offset] = b;
+        pix.data[offset + 1] = g;
+        pix.data[offset + 2] = r;
+    } else if pix.format == PIXFMT_BGRA32 {
+        pix.data[offset] = b;
+        pix.data[offset + 1] = g;
+        pix.data[offset + 2] = r;
+        pix.data[offset + 3] = 255;
+    }
+}
+
+// Set RGBA values for a pixel
+fn pixmap_set_rgba(pix: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) {
+    let offset = pixmap_pixel_offset(pix, x, y);
+
+    if pix.format == PIXFMT_GRAY8 {
+        let gray = ((r as u32) * 77 + (g as u32) * 150 + (b as u32) * 29) / 256;
+        pix.data[offset] = gray as u8;
+    } else if pix.format == PIXFMT_RGB24 {
+        pix.data[offset] = r;
+        pix.data[offset + 1] = g;
+        pix.data[offset + 2] = b;
+    } else if pix.format == PIXFMT_RGBA32 {
+        pix.data[offset] = r;
+        pix.data[offset + 1] = g;
+        pix.data[offset + 2] = b;
+        pix.data[offset + 3] = a;
+    } else if pix.format == PIXFMT_BGR24 {
+        pix.data[offset] = b;
+        pix.data[offset + 1] = g;
+        pix.data[offset + 2] = r;
+    } else if pix.format == PIXFMT_BGRA32 {
+        pix.data[offset] = b;
+        pix.data[offset + 1] = g;
+        pix.data[offset + 2] = r;
+        pix.data[offset + 3] = a;
+    }
+}

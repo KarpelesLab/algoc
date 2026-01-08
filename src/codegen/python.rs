@@ -72,7 +72,9 @@ impl PythonGenerator {
             ExprKind::Paren(inner) => self.is_array_like_expr(inner),
             ExprKind::Builtin { .. } => false,
             ExprKind::Index { .. } => false,
-            ExprKind::Field { .. } => true,
+            // Field access - we don't have type info, so assume primitive (not array)
+            // For array field comparisons, users should use constant_time_eq explicitly
+            ExprKind::Field { .. } => false,
             ExprKind::Ident(_) => false,
             ExprKind::Call { .. } => false,
             _ => false,

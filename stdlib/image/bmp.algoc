@@ -1,0 +1,341 @@
+// BMP (Windows Bitmap) encoder for AlgoC
+//
+// Implements BMP file encoding using the BITMAPINFOHEADER format.
+// Supports 24-bit and 32-bit output.
+
+use "../runtime.algoc";
+use "pixmap.algoc";
+
+// ============================================================================
+// BMP Constants
+// ============================================================================
+
+// BMP signature
+const BMP_SIGNATURE: u16 = 0x4D42;  // 'BM' in little-endian
+
+// Header sizes
+const BMP_FILE_HEADER_SIZE: u32 = 14;
+const BMP_INFO_HEADER_SIZE: u32 = 40;  // BITMAPINFOHEADER
+
+// Compression types
+const BI_RGB: u32 = 0;              // Uncompressed
+
+// ============================================================================
+// BMP Size Calculation
+// ============================================================================
+
+// Calculate row size with padding (BMP rows are padded to 4-byte boundary)
+fn bmp_row_size(width: u32, bits_per_pixel: u32) -> u32 {
+    let row_bytes = (width * bits_per_pixel + 7) / 8;
+    // Round up to nearest 4 bytes
+    return (row_bytes + 3) & ~3;
+}
+
+// Calculate total BMP file size for encoding
+fn bmp_encode_size(width: u32, height: u32, bits_per_pixel: u32) -> u32 {
+    let row_size = bmp_row_size(width, bits_per_pixel);
+    let pixel_data_size = row_size * height;
+    return BMP_FILE_HEADER_SIZE + BMP_INFO_HEADER_SIZE + pixel_data_size;
+}
+
+// Calculate BMP file size for a pixmap (24-bit output)
+fn bmp_encode_size_24(pix: &Pixmap) -> u32 {
+    return bmp_encode_size(pix.width, pix.height, 24);
+}
+
+// Calculate BMP file size for a pixmap (32-bit output)
+fn bmp_encode_size_32(pix: &Pixmap) -> u32 {
+    return bmp_encode_size(pix.width, pix.height, 32);
+}
+
+// ============================================================================
+// BMP Encoding
+// ============================================================================
+
+// Encode pixmap to 24-bit BMP format
+// Returns number of bytes written
+fn bmp_encode_24(pix: &Pixmap, output: &mut [u8]) -> u32 {
+    let width = pix.width;
+    let height = pix.height;
+    let row_size = bmp_row_size(width, 24);
+    let pixel_data_size = row_size * height;
+    let file_size = BMP_FILE_HEADER_SIZE + BMP_INFO_HEADER_SIZE + pixel_data_size;
+    let pixel_offset = BMP_FILE_HEADER_SIZE + BMP_INFO_HEADER_SIZE;
+
+    let mut pos: u32 = 0;
+
+    // ========== File Header (14 bytes) ==========
+    // Signature 'BM'
+    output[pos] = 0x42;     // 'B'
+    output[pos + 1] = 0x4D; // 'M'
+    pos = pos + 2;
+
+    // File size (little-endian)
+    output[pos..pos + 4] as u32le = file_size;
+    pos = pos + 4;
+
+    // Reserved (2 + 2 bytes)
+    output[pos] = 0;
+    output[pos + 1] = 0;
+    output[pos + 2] = 0;
+    output[pos + 3] = 0;
+    pos = pos + 4;
+
+    // Pixel data offset
+    output[pos..pos + 4] as u32le = pixel_offset;
+    pos = pos + 4;
+
+    // ========== Info Header (40 bytes) ==========
+    // Header size
+    output[pos..pos + 4] as u32le = BMP_INFO_HEADER_SIZE;
+    pos = pos + 4;
+
+    // Width (signed, but we use unsigned values)
+    output[pos..pos + 4] as u32le = width;
+    pos = pos + 4;
+
+    // Height (positive = bottom-up)
+    output[pos..pos + 4] as u32le = height;
+    pos = pos + 4;
+
+    // Planes (always 1)
+    output[pos..pos + 2] as u16le = 1;
+    pos = pos + 2;
+
+    // Bits per pixel
+    output[pos..pos + 2] as u16le = 24;
+    pos = pos + 2;
+
+    // Compression (BI_RGB = 0)
+    output[pos..pos + 4] as u32le = BI_RGB;
+    pos = pos + 4;
+
+    // Image size (can be 0 for BI_RGB)
+    output[pos..pos + 4] as u32le = pixel_data_size;
+    pos = pos + 4;
+
+    // X pixels per meter (96 DPI = 3780)
+    output[pos..pos + 4] as u32le = 3780;
+    pos = pos + 4;
+
+    // Y pixels per meter
+    output[pos..pos + 4] as u32le = 3780;
+    pos = pos + 4;
+
+    // Colors used (0 = default)
+    output[pos..pos + 4] as u32le = 0;
+    pos = pos + 4;
+
+    // Colors important (0 = all)
+    output[pos..pos + 4] as u32le = 0;
+    pos = pos + 4;
+
+    // ========== Pixel Data ==========
+    // BMP stores pixels bottom-up, in BGR order
+    for row in 0..height {
+        // BMP is bottom-up, so flip Y coordinate
+        let src_y = height - 1 - row;
+
+        for col in 0..width {
+            // Write BGR
+            output[pos] = pixmap_get_b(pix, col, src_y);
+            output[pos + 1] = pixmap_get_g(pix, col, src_y);
+            output[pos + 2] = pixmap_get_r(pix, col, src_y);
+            pos = pos + 3;
+        }
+
+        // Pad row to 4-byte boundary
+        let padding = row_size - (width * 3);
+        for p in 0..padding {
+            output[pos] = 0;
+            pos = pos + 1;
+        }
+    }
+
+    return file_size;
+}
+
+// Encode pixmap to 32-bit BMP format (with alpha channel)
+// Returns number of bytes written
+fn bmp_encode_32(pix: &Pixmap, output: &mut [u8]) -> u32 {
+    let width = pix.width;
+    let height = pix.height;
+    let row_size = bmp_row_size(width, 32);  // 32-bit is always 4-byte aligned
+    let pixel_data_size = row_size * height;
+    let file_size = BMP_FILE_HEADER_SIZE + BMP_INFO_HEADER_SIZE + pixel_data_size;
+    let pixel_offset = BMP_FILE_HEADER_SIZE + BMP_INFO_HEADER_SIZE;
+
+    let mut pos: u32 = 0;
+
+    // ========== File Header (14 bytes) ==========
+    output[pos] = 0x42;     // 'B'
+    output[pos + 1] = 0x4D; // 'M'
+    pos = pos + 2;
+
+    output[pos..pos + 4] as u32le = file_size;
+    pos = pos + 4;
+
+    output[pos] = 0;
+    output[pos + 1] = 0;
+    output[pos + 2] = 0;
+    output[pos + 3] = 0;
+    pos = pos + 4;
+
+    output[pos..pos + 4] as u32le = pixel_offset;
+    pos = pos + 4;
+
+    // ========== Info Header (40 bytes) ==========
+    output[pos..pos + 4] as u32le = BMP_INFO_HEADER_SIZE;
+    pos = pos + 4;
+
+    output[pos..pos + 4] as u32le = width;
+    pos = pos + 4;
+
+    output[pos..pos + 4] as u32le = height;
+    pos = pos + 4;
+
+    output[pos..pos + 2] as u16le = 1;
+    pos = pos + 2;
+
+    output[pos..pos + 2] as u16le = 32;
+    pos = pos + 2;
+
+    output[pos..pos + 4] as u32le = BI_RGB;
+    pos = pos + 4;
+
+    output[pos..pos + 4] as u32le = pixel_data_size;
+    pos = pos + 4;
+
+    output[pos..pos + 4] as u32le = 3780;
+    pos = pos + 4;
+
+    output[pos..pos + 4] as u32le = 3780;
+    pos = pos + 4;
+
+    output[pos..pos + 4] as u32le = 0;
+    pos = pos + 4;
+
+    output[pos..pos + 4] as u32le = 0;
+    pos = pos + 4;
+
+    // ========== Pixel Data ==========
+    for row in 0..height {
+        let src_y = height - 1 - row;
+
+        for col in 0..width {
+            // Write BGRA
+            output[pos] = pixmap_get_b(pix, col, src_y);
+            output[pos + 1] = pixmap_get_g(pix, col, src_y);
+            output[pos + 2] = pixmap_get_r(pix, col, src_y);
+            output[pos + 3] = pixmap_get_a(pix, col, src_y);
+            pos = pos + 4;
+        }
+    }
+
+    return file_size;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test bmp_row_size_24bit() {
+    // 1 pixel = 3 bytes, padded to 4
+    assert(bmp_row_size(1, 24) == 4);
+    // 2 pixels = 6 bytes, padded to 8
+    assert(bmp_row_size(2, 24) == 8);
+    // 3 pixels = 9 bytes, padded to 12
+    assert(bmp_row_size(3, 24) == 12);
+    // 4 pixels = 12 bytes, already aligned
+    assert(bmp_row_size(4, 24) == 12);
+    // 5 pixels = 15 bytes, padded to 16
+    assert(bmp_row_size(5, 24) == 16);
+}
+
+test bmp_row_size_32bit() {
+    // 32-bit is always 4-byte aligned
+    assert(bmp_row_size(1, 32) == 4);
+    assert(bmp_row_size(2, 32) == 8);
+    assert(bmp_row_size(3, 32) == 12);
+    assert(bmp_row_size(4, 32) == 16);
+}
+
+test bmp_encode_size_calc() {
+    // 2x2 image at 24-bit
+    // Row size = 6 bytes -> padded to 8
+    // Pixel data = 8 * 2 = 16
+    // Total = 14 + 40 + 16 = 70
+    assert(bmp_encode_size(2, 2, 24) == 70);
+
+    // 2x2 image at 32-bit
+    // Row size = 8 bytes (already aligned)
+    // Pixel data = 8 * 2 = 16
+    // Total = 14 + 40 + 16 = 70
+    assert(bmp_encode_size(2, 2, 32) == 70);
+}
+
+test bmp_encode_24_header() {
+    // Create a 2x2 red image
+    let mut pixel_data: [u8; 16];  // 2x2 RGBA = 16 bytes
+    // Row 0: red, green
+    pixel_data[0] = 255; pixel_data[1] = 0; pixel_data[2] = 0; pixel_data[3] = 255;
+    pixel_data[4] = 0; pixel_data[5] = 255; pixel_data[6] = 0; pixel_data[7] = 255;
+    // Row 1: blue, white
+    pixel_data[8] = 0; pixel_data[9] = 0; pixel_data[10] = 255; pixel_data[11] = 255;
+    pixel_data[12] = 255; pixel_data[13] = 255; pixel_data[14] = 255; pixel_data[15] = 255;
+
+    let mut pix: Pixmap;
+    pix.width = 2;
+    pix.height = 2;
+    pix.format = PIXFMT_RGBA32;
+    pix.stride = 8;
+    pix.data = &mut pixel_data;
+
+    let mut output: [u8; 128];
+    let size = bmp_encode_24(&pix, &mut output);
+
+    // Check file size
+    assert(size == 70);
+
+    // Check BMP signature
+    assert(output[0] == 0x42);  // 'B'
+    assert(output[1] == 0x4D);  // 'M'
+
+    // Check file size in header
+    assert(output[2..6] as u32le == 70);
+
+    // Check pixel data offset
+    assert(output[10..14] as u32le == 54);
+
+    // Check info header size
+    assert(output[14..18] as u32le == 40);
+
+    // Check dimensions
+    assert(output[18..22] as u32le == 2);  // width
+    assert(output[22..26] as u32le == 2);  // height
+
+    // Check bits per pixel
+    assert(output[28..30] as u16le == 24);
+}
+
+test bmp_encode_32_header() {
+    let mut pixel_data: [u8; 16];
+    for i in 0..16 {
+        pixel_data[i] = 128;
+    }
+
+    let mut pix: Pixmap;
+    pix.width = 2;
+    pix.height = 2;
+    pix.format = PIXFMT_RGBA32;
+    pix.stride = 8;
+    pix.data = &mut pixel_data;
+
+    let mut output: [u8; 128];
+    let size = bmp_encode_32(&pix, &mut output);
+
+    assert(size == 70);
+    assert(output[0] == 0x42);
+    assert(output[1] == 0x4D);
+    assert(output[28..30] as u16le == 32);
+}

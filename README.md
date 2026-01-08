@@ -191,6 +191,10 @@ The `stdlib/` directory contains reference implementations:
 ### Hash
 - **CRC32** (`stdlib/hash/crc32.algoc`) - Checksum computation
 
+### Image
+- **Pixmap** (`stdlib/image/pixmap.algoc`) - Shared image buffer structure with pixel format support
+- **BMP** (`stdlib/image/bmp.algoc`) - Windows Bitmap encoder (24-bit and 32-bit)
+
 ### Runtime
 - **runtime.algoc** (`stdlib/runtime.algoc`) - Bit manipulation utilities, endian helpers
 

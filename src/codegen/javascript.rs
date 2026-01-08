@@ -79,8 +79,9 @@ impl JavaScriptGenerator {
             ExprKind::Builtin { .. } => false,
             // Index into array returns element, not array
             ExprKind::Index { .. } => false,
-            // Field access could be array, assume yes if we don't know
-            ExprKind::Field { .. } => true,
+            // Field access - we don't have type info, so assume primitive (not array)
+            // For array field comparisons, users should use constant_time_eq explicitly
+            ExprKind::Field { .. } => false,
             // Identifiers - we don't have type info, but commonly arrays are compared
             // We'll assume identifiers being compared are arrays if the other side is
             ExprKind::Ident(_) => false, // Will be caught if other side is array-like
