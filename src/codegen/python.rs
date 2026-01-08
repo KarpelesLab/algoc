@@ -629,10 +629,12 @@ impl PythonGenerator {
             }
             ExprKind::ArrayRepeat { value, count } => {
                 // Generate [value] * count
+                // For mutable arrays, we need to use list comprehension to avoid aliasing
                 self.write("[");
                 self.generate_expr(value);
-                self.write("] * ");
-                self.write(&count.to_string());
+                self.write(" for _ in range(");
+                self.generate_expr(count);
+                self.write(")]");
             }
             ExprKind::Cast { expr, ty } => {
                 self.generate_cast(expr, ty);
@@ -657,6 +659,16 @@ impl PythonGenerator {
                 self.write(&format!("{}()", name.name));
                 // Note: This doesn't handle field initialization inline
                 // For proper struct literals, we'd need a different approach
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                // Python conditional: then_expr if condition else else_expr
+                self.write("(");
+                self.generate_expr(then_expr);
+                self.write(" if ");
+                self.generate_expr(condition);
+                self.write(" else ");
+                self.generate_expr(else_expr);
+                self.write(")");
             }
         }
     }

@@ -369,8 +369,9 @@ impl Resolver {
                     self.resolve_expr(elem);
                 }
             }
-            parser::ExprKind::ArrayRepeat { value, .. } => {
+            parser::ExprKind::ArrayRepeat { value, count } => {
                 self.resolve_expr(value);
+                self.resolve_expr(count);
             }
             parser::ExprKind::Cast { expr, ty } => {
                 self.resolve_expr(expr);
@@ -394,6 +395,11 @@ impl Resolver {
                 for (_, value) in fields {
                     self.resolve_expr(value);
                 }
+            }
+            parser::ExprKind::Conditional { condition, then_expr, else_expr } => {
+                self.resolve_expr(condition);
+                self.resolve_expr(then_expr);
+                self.resolve_expr(else_expr);
             }
         }
     }

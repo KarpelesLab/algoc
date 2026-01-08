@@ -403,6 +403,15 @@ impl<'a> TypeChecker<'a> {
 
         // Handle array repeat syntax with type hint
         if let parser::ExprKind::ArrayRepeat { value, count } = &expr.kind {
+            // Check that count is an integer type
+            let count_ty = self.infer_expr(count);
+            if !count_ty.is_integer() && !count_ty.is_error() {
+                self.error(
+                    format!("array repeat count must be integer, got {}", count_ty),
+                    count.span,
+                );
+            }
+
             if let Some(expected) = hint {
                 if let TypeKind::Array { element: expected_elem, size } = &expected.kind {
                     let elem_ty = self.infer_expr_with_hint(value, Some(expected_elem));
@@ -412,11 +421,14 @@ impl<'a> TypeChecker<'a> {
                             value.span,
                         );
                     }
-                    if *count != *size {
-                        self.error(
-                            format!("array length mismatch: expected {}, got {}", size, count),
-                            expr.span,
-                        );
+                    // Only check size if count is a compile-time constant
+                    if let parser::ExprKind::Integer(n) = &count.kind {
+                        if *n as u64 != *size {
+                            self.error(
+                                format!("array length mismatch: expected {}, got {}", size, n),
+                                expr.span,
+                            );
+                        }
                     }
                     return expected.clone();
                 }
@@ -481,8 +493,26 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             parser::ExprKind::Binary { left, op, right } => {
-                let left_ty = self.infer_expr(left);
-                let right_ty = self.infer_expr(right);
+                // For binary ops, if one side is a literal and the other isn't,
+                // infer the non-literal first and use it as a hint for the literal
+                let left_is_literal = matches!(left.kind, parser::ExprKind::Integer(_));
+                let right_is_literal = matches!(right.kind, parser::ExprKind::Integer(_));
+
+                let (left_ty, right_ty) = if left_is_literal && !right_is_literal {
+                    // Infer right first, use as hint for left
+                    let right_ty = self.infer_expr(right);
+                    let left_ty = self.infer_expr_with_hint(left, Some(&right_ty));
+                    (left_ty, right_ty)
+                } else if right_is_literal && !left_is_literal {
+                    // Infer left first, use as hint for right
+                    let left_ty = self.infer_expr(left);
+                    let right_ty = self.infer_expr_with_hint(right, Some(&left_ty));
+                    (left_ty, right_ty)
+                } else {
+                    // Both literals or neither - infer independently
+                    (self.infer_expr(left), self.infer_expr(right))
+                };
+
                 self.check_binary_op(*op, &left_ty, &right_ty, expr.span)
             }
             parser::ExprKind::Unary { op, operand } => {
@@ -632,7 +662,20 @@ impl<'a> TypeChecker<'a> {
             }
             parser::ExprKind::ArrayRepeat { value, count } => {
                 let elem_ty = self.infer_expr(value);
-                Type::array(elem_ty, *count)
+                let count_ty = self.infer_expr(count);
+                if !count_ty.is_integer() && !count_ty.is_error() {
+                    self.error(
+                        format!("array repeat count must be integer, got {}", count_ty),
+                        count.span,
+                    );
+                }
+                // If count is a constant, use it for the array size; otherwise use 0 (dynamic)
+                let size = if let parser::ExprKind::Integer(n) = &count.kind {
+                    *n as u64
+                } else {
+                    0 // Dynamic size - will be determined at runtime
+                };
+                Type::array(elem_ty, size)
             }
             parser::ExprKind::Cast { expr: inner, ty } => {
                 let from_ty = self.infer_expr(inner);
@@ -710,6 +753,39 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     Type::error()
                 }
+            }
+            parser::ExprKind::Conditional { condition, then_expr, else_expr } => {
+                // Check condition is boolean
+                let cond_ty = self.infer_expr(condition);
+                if !cond_ty.is_bool() && !cond_ty.is_error() {
+                    self.error(
+                        format!("conditional expression requires bool condition, got {}", cond_ty),
+                        condition.span,
+                    );
+                }
+
+                // Check both branches and ensure they have compatible types
+                let then_ty = self.infer_expr(then_expr);
+                let else_ty = self.infer_expr(else_expr);
+
+                if then_ty.is_error() {
+                    return else_ty;
+                }
+                if else_ty.is_error() {
+                    return then_ty;
+                }
+
+                if !then_ty.is_compatible_with(&else_ty) {
+                    self.error(
+                        format!("conditional branches have incompatible types: {} and {}",
+                            then_ty, else_ty),
+                        expr.span,
+                    );
+                    return Type::error();
+                }
+
+                // Return the more specific type (or either if they're the same)
+                then_ty
             }
         }
     }

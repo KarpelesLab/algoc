@@ -407,10 +407,10 @@ pub enum ExprKind {
     },
     /// Array literal: `[1, 2, 3]`
     Array(Vec<Expr>),
-    /// Array repeat: `[value; count]`
+    /// Array repeat: `[value; count]` - count can be a runtime expression
     ArrayRepeat {
         value: Box<Expr>,
-        count: u64,
+        count: Box<Expr>,
     },
     /// Cast: `expr as Type`
     Cast {
@@ -440,6 +440,12 @@ pub enum ExprKind {
     Bytes(String),
     /// Hex literal: `hex("deadbeef")`
     Hex(String),
+    /// Conditional expression: `then_value if condition else else_value`
+    Conditional {
+        condition: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
+    },
 }
 
 /// Binary operators

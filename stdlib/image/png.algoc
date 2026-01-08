@@ -1,0 +1,845 @@
+// PNG encoding and decoding for AlgoC
+//
+// Implements PNG (Portable Network Graphics) format based on:
+// - RFC 2083 (PNG Specification)
+// - RFC 1950 (zlib format)
+//
+// Supports:
+// - Color types: Grayscale (0), RGB (2), RGBA (6)
+// - Bit depth: 8-bit only
+// - Interlacing: None (non-interlaced only)
+// - Filtering: All 5 filter types (None, Sub, Up, Average, Paeth)
+
+use "../runtime.algoc";
+use "../compression/deflate.algoc";
+use "../hash/crc32.algoc";
+use "pixmap.algoc";
+
+// ============================================================================
+// PNG Constants
+// ============================================================================
+
+// PNG file signature (8 bytes)
+const PNG_SIGNATURE: u8[8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+// Color types
+const PNG_COLOR_GRAYSCALE: u8 = 0;
+const PNG_COLOR_RGB: u8 = 2;
+const PNG_COLOR_INDEXED: u8 = 3;
+const PNG_COLOR_GRAYSCALE_ALPHA: u8 = 4;
+const PNG_COLOR_RGBA: u8 = 6;
+
+// Filter types
+const PNG_FILTER_NONE: u8 = 0;
+const PNG_FILTER_SUB: u8 = 1;
+const PNG_FILTER_UP: u8 = 2;
+const PNG_FILTER_AVERAGE: u8 = 3;
+const PNG_FILTER_PAETH: u8 = 4;
+
+// ============================================================================
+// Adler-32 Checksum (used by zlib)
+// ============================================================================
+
+const ADLER_MOD: u32 = 65521;  // Largest prime smaller than 65536
+
+// Compute Adler-32 checksum of data
+fn adler32(data: &[u8]) -> u32 {
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+
+    for i in 0..data.len() {
+        a = (a + (data[i] as u32)) % ADLER_MOD;
+        b = (b + a) % ADLER_MOD;
+    }
+
+    return (b << 16) | a;
+}
+
+// Compute Adler-32 of a range within a mutable buffer
+fn adler32_range_mut(data: &mut [u8], offset: u64, len: u64) -> u32 {
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+
+    for i in 0..len {
+        a = (a + (data[offset + i] as u32)) % ADLER_MOD;
+        b = (b + a) % ADLER_MOD;
+    }
+
+    return (b << 16) | a;
+}
+
+// ============================================================================
+// Zlib Format (RFC 1950)
+// ============================================================================
+
+// Compress data with zlib header/trailer
+// Returns bytes written
+fn zlib_compress(input: &[u8], output: &mut [u8]) -> u64 {
+    // Write zlib header (2 bytes)
+    // CMF: CM=8 (deflate), CINFO=7 (32K window)
+    output[0] = 0x78;  // CMF: 0111 1000 = CINFO=7, CM=8
+    // FLG: FCHECK to make header divisible by 31, no dict, default compression
+    output[1] = 0x9C;  // FLG: makes (0x78 << 8 | 0x9C) % 31 = 0
+
+    // Compress with DEFLATE starting at offset 2
+    let deflate_len = deflate_compress_at(input, output, 2);
+
+    // Compute Adler-32 of original data
+    let adler = adler32(input);
+
+    // Write Adler-32 checksum (big-endian)
+    let out_pos = 2 + deflate_len;
+    output[out_pos] = ((adler >> 24) & 0xFF) as u8;
+    output[out_pos + 1] = ((adler >> 16) & 0xFF) as u8;
+    output[out_pos + 2] = ((adler >> 8) & 0xFF) as u8;
+    output[out_pos + 3] = (adler & 0xFF) as u8;
+
+    return out_pos + 4;
+}
+
+// Decompress zlib data
+// Returns bytes written to output
+fn zlib_decompress(input: &[u8], output: &mut [u8]) -> u64 {
+    // Skip zlib header (2 bytes)
+    // TODO: verify header and handle FDICT flag
+
+    // Decompress DEFLATE data starting at offset 2
+    // The last 4 bytes are Adler-32, but deflate_decompress will stop at end-of-block
+    let result = deflate_decompress_at(input, 2, input.len() - 6, output);
+
+    // TODO: verify Adler-32 checksum
+
+    return result;
+}
+
+// ============================================================================
+// PNG Chunk Handling
+// ============================================================================
+
+// Write a PNG chunk: length (4) + type (4) + data + CRC (4)
+// Returns bytes written
+fn png_write_chunk(output: &mut [u8], offset: u64, chunk_type: &[u8], data: &[u8]) -> u64 {
+    let data_len = data.len();
+
+    // Write length (big-endian)
+    write_u32_be(output, offset, data_len as u32);
+
+    // Write chunk type (4 bytes)
+    output[offset + 4] = chunk_type[0];
+    output[offset + 5] = chunk_type[1];
+    output[offset + 6] = chunk_type[2];
+    output[offset + 7] = chunk_type[3];
+
+    // Write data
+    for i in 0..data_len {
+        output[offset + 8 + i] = data[i];
+    }
+
+    // Compute CRC32 over type + data
+    let crc_len = 4 + data_len;
+    let crc = crc32_range_mut(output, offset + 4, crc_len);
+
+    // Write CRC (big-endian)
+    let crc_offset = offset + 8 + data_len;
+    write_u32_be(output, crc_offset, crc);
+
+    return 12 + data_len;  // 4 + 4 + data_len + 4
+}
+
+// Write PNG chunk with inline data (for small chunks like IHDR)
+fn png_write_chunk_inline(output: &mut [u8], offset: u64, chunk_type: &[u8],
+                          data: &mut [u8], data_len: u64) -> u64 {
+    // Write length (big-endian)
+    write_u32_be(output, offset, data_len as u32);
+
+    // Write chunk type
+    output[offset + 4] = chunk_type[0];
+    output[offset + 5] = chunk_type[1];
+    output[offset + 6] = chunk_type[2];
+    output[offset + 7] = chunk_type[3];
+
+    // Write data
+    for i in 0..data_len {
+        output[offset + 8 + i] = data[i];
+    }
+
+    // Compute CRC32 over type + data
+    let crc_len = 4 + data_len;
+    let crc = crc32_range_mut(output, offset + 4, crc_len);
+
+    // Write CRC
+    let crc_offset = offset + 8 + data_len;
+    write_u32_be(output, crc_offset, crc);
+
+    return 12 + data_len;
+}
+
+// ============================================================================
+// PNG Filtering (for encoding)
+// ============================================================================
+
+// Get bytes per pixel for PNG color type
+fn png_bytes_per_pixel(color_type: u8) -> u8 {
+    if color_type == PNG_COLOR_GRAYSCALE {
+        return 1;
+    } else if color_type == PNG_COLOR_RGB {
+        return 3;
+    } else if color_type == PNG_COLOR_RGBA {
+        return 4;
+    } else if color_type == PNG_COLOR_GRAYSCALE_ALPHA {
+        return 2;
+    }
+    return 3;  // Default to RGB
+}
+
+// Paeth predictor function
+fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
+    let a32: i32 = a as i32;
+    let b32: i32 = b as i32;
+    let c32: i32 = c as i32;
+
+    let p: i32 = a32 + b32 - c32;
+
+    let mut pa: i32 = p - a32;
+    let mut pb: i32 = p - b32;
+    let mut pc: i32 = p - c32;
+
+    // Absolute values
+    if pa < 0 { pa = -pa; }
+    if pb < 0 { pb = -pb; }
+    if pc < 0 { pc = -pc; }
+
+    if pa <= pb && pa <= pc {
+        return a;
+    } else if pb <= pc {
+        return b;
+    } else {
+        return c;
+    }
+}
+
+// Apply Sub filter to a row
+fn filter_sub(filtered: &mut [u8], raw: &[u8], row_offset: u64, width: u32, bpp: u8) {
+    let bpp32 = bpp as u32;
+    let row_bytes = width * bpp32;
+
+    // First bpp bytes are unchanged (no left neighbor)
+    for i in 0..bpp32 {
+        filtered[i] = raw[row_offset + i];
+    }
+
+    // Remaining bytes: subtract left neighbor
+    for i in bpp32..row_bytes {
+        let curr = raw[row_offset + i as u64];
+        let left = raw[row_offset + (i - bpp32) as u64];
+        filtered[i] = curr - left;
+    }
+}
+
+// Apply Up filter to a row
+fn filter_up(filtered: &mut [u8], raw: &[u8], row_offset: u64, prev_offset: u64,
+             width: u32, bpp: u8, has_prev: bool) {
+    let row_bytes = width * (bpp as u32);
+
+    for i in 0..row_bytes {
+        let curr = raw[row_offset + i as u64];
+        let up: u8 = raw[prev_offset + i as u64] if has_prev else 0;
+        filtered[i] = curr - up;
+    }
+}
+
+// Apply Average filter to a row
+fn filter_average(filtered: &mut [u8], raw: &[u8], row_offset: u64, prev_offset: u64,
+                  width: u32, bpp: u8, has_prev: bool) {
+    let bpp32 = bpp as u32;
+    let row_bytes = width * bpp32;
+
+    for i in 0..row_bytes {
+        let curr = raw[row_offset + i as u64];
+        let left: u32 = (raw[row_offset + (i - bpp32) as u64] as u32) if i >= bpp32 else 0;
+        let up: u32 = (raw[prev_offset + i as u64] as u32) if has_prev else 0;
+        let avg: u8 = ((left + up) / 2) as u8;
+        filtered[i] = curr - avg;
+    }
+}
+
+// Apply Paeth filter to a row
+fn filter_paeth(filtered: &mut [u8], raw: &[u8], row_offset: u64, prev_offset: u64,
+                width: u32, bpp: u8, has_prev: bool) {
+    let bpp32 = bpp as u32;
+    let row_bytes = width * bpp32;
+
+    for i in 0..row_bytes {
+        let curr = raw[row_offset + i as u64];
+        let left: u8 = raw[row_offset + (i - bpp32) as u64] if i >= bpp32 else 0;
+        let up: u8 = raw[prev_offset + i as u64] if has_prev else 0;
+        let up_left: u8 = raw[prev_offset + (i - bpp32) as u64] if has_prev && i >= bpp32 else 0;
+        let pred = paeth_predictor(left, up, up_left);
+        filtered[i] = curr - pred;
+    }
+}
+
+// Calculate sum of absolute differences (for filter selection heuristic)
+fn filter_score(data: &mut [u8], len: u32) -> u64 {
+    let mut sum: u64 = 0;
+    for i in 0..len {
+        let v = data[i];
+        // Treat as signed for scoring
+        if v > 127 {
+            sum = sum + (256 - (v as u64));
+        } else {
+            sum = sum + v as u64;
+        }
+    }
+    return sum;
+}
+
+// ============================================================================
+// PNG Unfiltering (for decoding)
+// ============================================================================
+
+// Unfilter a single row in place
+fn unfilter_row(data: &mut [u8], row_offset: u64, prev_offset: u64,
+                filter_type: u8, row_bytes: u32, bpp: u8, has_prev: bool) {
+    let bpp32 = bpp as u32;
+
+    if filter_type == PNG_FILTER_NONE {
+        // No transformation needed
+        return;
+    } else if filter_type == PNG_FILTER_SUB {
+        // Add left neighbor
+        for i in bpp32..row_bytes {
+            let idx = row_offset + i as u64;
+            data[idx] = data[idx] + data[idx - bpp32 as u64];
+        }
+    } else if filter_type == PNG_FILTER_UP {
+        // Add upper neighbor
+        if has_prev {
+            for i in 0..row_bytes {
+                let idx = row_offset + i as u64;
+                data[idx] = data[idx] + data[prev_offset + i as u64];
+            }
+        }
+    } else if filter_type == PNG_FILTER_AVERAGE {
+        // Add average of left and upper
+        for i in 0..row_bytes {
+            let idx = row_offset + i as u64;
+            let left: u32 = (data[idx - bpp32 as u64] as u32) if i >= bpp32 else 0;
+            let up: u32 = (data[prev_offset + i as u64] as u32) if has_prev else 0;
+            data[idx] = data[idx] + ((left + up) / 2) as u8;
+        }
+    } else if filter_type == PNG_FILTER_PAETH {
+        // Add Paeth predictor
+        for i in 0..row_bytes {
+            let idx = row_offset + i as u64;
+            let left: u8 = data[idx - bpp32 as u64] if i >= bpp32 else 0;
+            let up: u8 = data[prev_offset + i as u64] if has_prev else 0;
+            let up_left: u8 = data[prev_offset + (i - bpp32) as u64] if has_prev && i >= bpp32 else 0;
+            data[idx] = data[idx] + paeth_predictor(left, up, up_left);
+        }
+    }
+}
+
+// ============================================================================
+// PNG Encoding
+// ============================================================================
+
+// Encode pixmap to PNG format
+// Returns number of bytes written to output
+fn png_encode(pix: &Pixmap, output: &mut [u8]) -> u64 {
+    let width = pix.width;
+    let height = pix.height;
+
+    // Determine PNG color type from pixmap format
+    let color_type: u8 = PNG_COLOR_GRAYSCALE if pix.format == PIXFMT_GRAY8
+        else (PNG_COLOR_RGB if pix.format == PIXFMT_RGB24 || pix.format == PIXFMT_BGR24
+        else PNG_COLOR_RGBA);
+
+    let bpp = png_bytes_per_pixel(color_type);
+    let row_bytes: u32 = width * (bpp as u32);
+
+    // Write PNG signature
+    for i in 0..8 {
+        output[i] = PNG_SIGNATURE[i];
+    }
+    let mut pos: u64 = 8;
+
+    // Write IHDR chunk
+    let mut ihdr: u8[13] = [0; 13];
+    write_u32_be(&mut ihdr, 0, width);
+    write_u32_be(&mut ihdr, 4, height);
+    ihdr[8] = 8;           // Bit depth
+    ihdr[9] = color_type;  // Color type
+    ihdr[10] = 0;          // Compression method (deflate)
+    ihdr[11] = 0;          // Filter method (adaptive)
+    ihdr[12] = 0;          // Interlace method (none)
+
+    pos = pos + png_write_chunk_inline(output, pos, bytes("IHDR"), &mut ihdr, 13);
+
+    // Prepare filtered image data
+    // Each row has 1 filter byte + row_bytes of data
+    let filtered_row_size: u64 = (1 as u64) + (row_bytes as u64);
+    let filtered_size: u64 = filtered_row_size * height as u64;
+
+    // Allocate buffer for filtered data
+    let mut filtered = [0 as u8; filtered_size];
+
+    // Temporary buffer for testing different filters
+    let mut filter_buf = [0 as u8; row_bytes];
+
+    // Convert pixmap to PNG-ordered RGB/RGBA and apply filtering
+    let is_bgr = pixfmt_is_bgr(pix.format);
+    let has_alpha = pixfmt_has_alpha(pix.format);
+    let src_bpp = pixfmt_bytes_per_pixel(pix.format);
+
+    for y in 0..height {
+        let filtered_row_offset = y as u64 * filtered_row_size;
+        let src_row_offset = y as u64 * pix.stride as u64;
+        let prev_filtered_offset: u64 = ((y - 1) as u64 * filtered_row_size + (1 as u64)) if y > 0 else 0;
+        let has_prev = y > 0;
+
+        // First, copy row data to filtered buffer (after filter byte) with format conversion
+        let data_offset = filtered_row_offset + 1;
+
+        if pix.format == PIXFMT_GRAY8 {
+            // Direct copy for grayscale
+            for x in 0..width {
+                filtered[data_offset + x as u64] = pix.data[src_row_offset + x as u64];
+            }
+        } else if color_type == PNG_COLOR_RGB {
+            // Convert to RGB
+            for x in 0..width {
+                let src_off = src_row_offset + x as u64 * src_bpp as u64;
+                let dst_off = data_offset + x as u64 * 3;
+                if is_bgr {
+                    filtered[dst_off] = pix.data[src_off + 2];      // R
+                    filtered[dst_off + 1] = pix.data[src_off + 1];  // G
+                    filtered[dst_off + 2] = pix.data[src_off];      // B
+                } else {
+                    filtered[dst_off] = pix.data[src_off];          // R
+                    filtered[dst_off + 1] = pix.data[src_off + 1];  // G
+                    filtered[dst_off + 2] = pix.data[src_off + 2];  // B
+                }
+            }
+        } else {
+            // Convert to RGBA
+            for x in 0..width {
+                let src_off = src_row_offset + x as u64 * src_bpp as u64;
+                let dst_off = data_offset + x as u64 * 4;
+                if is_bgr {
+                    filtered[dst_off] = pix.data[src_off + 2];      // R
+                    filtered[dst_off + 1] = pix.data[src_off + 1];  // G
+                    filtered[dst_off + 2] = pix.data[src_off];      // B
+                } else {
+                    filtered[dst_off] = pix.data[src_off];          // R
+                    filtered[dst_off + 1] = pix.data[src_off + 1];  // G
+                    filtered[dst_off + 2] = pix.data[src_off + 2];  // B
+                }
+                if has_alpha {
+                    filtered[dst_off + 3] = pix.data[src_off + 3];  // A
+                } else {
+                    filtered[dst_off + 3] = 255;  // Opaque
+                }
+            }
+        }
+
+        // Try different filters and pick the best one
+        // For simplicity, use Sub filter for first row and Paeth for others
+        // (A more sophisticated encoder would test all filters and pick best)
+
+        let filter_type: u8 = PNG_FILTER_SUB if y == 0 else PNG_FILTER_PAETH;
+
+        // Apply the selected filter
+        if filter_type == PNG_FILTER_NONE {
+            // Data already in place, just set filter byte
+            filtered[filtered_row_offset] = PNG_FILTER_NONE;
+        } else if filter_type == PNG_FILTER_SUB {
+            filtered[filtered_row_offset] = PNG_FILTER_SUB;
+            // Apply Sub filter in place (backwards to not overwrite source)
+            for i in 0..row_bytes {
+                let idx = row_bytes - 1 - i;
+                let curr = filtered[data_offset + idx as u64];
+                let left: u8 = filtered[data_offset + (idx - bpp as u32) as u64] if idx >= bpp as u32 else 0;
+                filtered[data_offset + idx as u64] = curr - left;
+            }
+        } else if filter_type == PNG_FILTER_UP {
+            filtered[filtered_row_offset] = PNG_FILTER_UP;
+            for i in 0..row_bytes {
+                let curr = filtered[data_offset + i as u64];
+                let up: u8 = filtered[prev_filtered_offset + i as u64] if has_prev else 0;
+                filtered[data_offset + i as u64] = curr - up;
+            }
+        } else if filter_type == PNG_FILTER_PAETH {
+            filtered[filtered_row_offset] = PNG_FILTER_PAETH;
+            // Apply Paeth filter (backwards for in-place)
+            for i in 0..row_bytes {
+                let idx = row_bytes - 1 - i;
+                let curr = filtered[data_offset + idx as u64];
+                let left: u8 = filtered[data_offset + (idx - bpp as u32) as u64] if idx >= bpp as u32 else 0;
+                let up: u8 = filtered[prev_filtered_offset + idx as u64] if has_prev else 0;
+                let up_left: u8 = filtered[prev_filtered_offset + (idx - bpp as u32) as u64] if has_prev && idx >= bpp as u32 else 0;
+                filtered[data_offset + idx as u64] = curr - paeth_predictor(left, up, up_left);
+            }
+        }
+    }
+
+    // Compress filtered data with zlib
+    // Estimate compressed size (worst case is slightly larger than input)
+    let max_compressed: u64 = filtered_size + filtered_size / (8 as u64) + (64 as u64);
+    let mut compressed = [0 as u8; max_compressed];
+
+    let compressed_len = zlib_compress(&filtered, &mut compressed);
+
+    // Write IDAT chunk
+    // We need to write the compressed data as chunk data
+    // For simplicity, write it directly
+    write_u32_be(output, pos, compressed_len as u32);
+    output[pos + 4] = 0x49;  // 'I'
+    output[pos + 5] = 0x44;  // 'D'
+    output[pos + 6] = 0x41;  // 'A'
+    output[pos + 7] = 0x54;  // 'T'
+
+    for i in 0..compressed_len {
+        output[pos + 8 + i] = compressed[i];
+    }
+
+    // CRC over type + data
+    let idat_crc = crc32_range_mut(output, pos + 4, 4 + compressed_len);
+    write_u32_be(output, pos + 8 + compressed_len, idat_crc);
+
+    pos = pos + 12 + compressed_len;
+
+    // Write IEND chunk (empty)
+    write_u32_be(output, pos, 0);  // Length = 0
+    output[pos + 4] = 0x49;  // 'I'
+    output[pos + 5] = 0x45;  // 'E'
+    output[pos + 6] = 0x4E;  // 'N'
+    output[pos + 7] = 0x44;  // 'D'
+
+    let iend_crc = crc32_range_mut(output, pos + 4, 4);
+    write_u32_be(output, pos + 8, iend_crc);
+
+    pos = pos + 12;
+
+    return pos;
+}
+
+// ============================================================================
+// PNG Decoding
+// ============================================================================
+
+// PNG decoder state
+struct PngDecoder {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,
+    compression: u8,
+    filter_method: u8,
+    interlace: u8,
+    valid: bool
+}
+
+// Parse PNG IHDR chunk and initialize decoder
+fn png_parse_ihdr(data: &[u8], decoder: &mut PngDecoder) {
+    if data.len() < 13 {
+        decoder.valid = false;
+        return;
+    }
+
+    decoder.width = read_u32_be(data, 0);
+    decoder.height = read_u32_be(data, 4);
+    decoder.bit_depth = data[8];
+    decoder.color_type = data[9];
+    decoder.compression = data[10];
+    decoder.filter_method = data[11];
+    decoder.interlace = data[12];
+
+    // Validate
+    decoder.valid = decoder.width > 0 && decoder.height > 0 &&
+                    decoder.bit_depth == 8 &&
+                    decoder.compression == 0 &&
+                    decoder.filter_method == 0 &&
+                    decoder.interlace == 0 &&
+                    (decoder.color_type == PNG_COLOR_GRAYSCALE ||
+                     decoder.color_type == PNG_COLOR_RGB ||
+                     decoder.color_type == PNG_COLOR_RGBA);
+}
+
+// Decode PNG data into a pixmap
+// Returns true on success
+fn png_decode(input: &[u8], pix: &mut Pixmap) -> bool {
+    let in_len = input.len();
+
+    // Check PNG signature
+    if in_len < 8 {
+        return false;
+    }
+    for i in 0..8 {
+        if input[i] != PNG_SIGNATURE[i] {
+            return false;
+        }
+    }
+
+    let mut decoder: PngDecoder = PngDecoder {
+        width: 0,
+        height: 0,
+        bit_depth: 0,
+        color_type: 0,
+        compression: 0,
+        filter_method: 0,
+        interlace: 0,
+        valid: false
+    };
+
+    // Collect all IDAT data
+    let mut idat_data = [0 as u8; in_len];  // Max possible size
+    let mut idat_len: u64 = 0;
+
+    let mut pos: u64 = 8;  // Skip signature
+    let mut found_ihdr = false;
+    let mut found_iend = false;
+
+    // Parse chunks
+    while pos + 12 <= in_len && !found_iend {
+        let chunk_len: u64 = read_u32_be(input, pos) as u64;
+        let chunk_type_0 = input[pos + 4];
+        let chunk_type_1 = input[pos + 5];
+        let chunk_type_2 = input[pos + 6];
+        let chunk_type_3 = input[pos + 7];
+
+        // Check we have enough data
+        if pos + 12 + chunk_len > in_len {
+            return false;
+        }
+
+        // TODO: verify CRC
+
+        if chunk_type_0 == 0x49 && chunk_type_1 == 0x48 &&
+           chunk_type_2 == 0x44 && chunk_type_3 == 0x52 {
+            // IHDR
+            let mut ihdr_data: u8[13] = [0; 13];
+            for i in 0..13 {
+                ihdr_data[i] = input[pos + 8 + i];
+            }
+            png_parse_ihdr(&ihdr_data, &mut decoder);
+            if !decoder.valid {
+                return false;
+            }
+            found_ihdr = true;
+        } else if chunk_type_0 == 0x49 && chunk_type_1 == 0x44 &&
+                  chunk_type_2 == 0x41 && chunk_type_3 == 0x54 {
+            // IDAT - collect compressed data
+            for i in 0..chunk_len {
+                idat_data[idat_len + i] = input[pos + 8 + i];
+            }
+            idat_len = idat_len + chunk_len;
+        } else if chunk_type_0 == 0x49 && chunk_type_1 == 0x45 &&
+                  chunk_type_2 == 0x4E && chunk_type_3 == 0x44 {
+            // IEND
+            found_iend = true;
+        }
+        // Skip other chunks (PLTE, tEXt, etc.)
+
+        pos = pos + 12 + chunk_len;
+    }
+
+    if !found_ihdr || idat_len == 0 {
+        return false;
+    }
+
+    // Calculate dimensions
+    let bpp = png_bytes_per_pixel(decoder.color_type);
+    let row_bytes: u32 = decoder.width * (bpp as u32);
+    let filtered_row_size: u64 = (1 as u64) + (row_bytes as u64);
+    let filtered_size: u64 = filtered_row_size * decoder.height as u64;
+
+    // Decompress
+    let mut decompressed = [0 as u8; filtered_size];
+    let decompressed_len = zlib_decompress(&idat_data, &mut decompressed);
+
+    if decompressed_len < filtered_size {
+        return false;
+    }
+
+    // Set up pixmap
+    pix.width = decoder.width;
+    pix.height = decoder.height;
+
+    if decoder.color_type == PNG_COLOR_GRAYSCALE {
+        pix.format = PIXFMT_GRAY8;
+        pix.stride = decoder.width;
+    } else if decoder.color_type == PNG_COLOR_RGB {
+        pix.format = PIXFMT_RGB24;
+        pix.stride = decoder.width * 3;
+    } else {
+        pix.format = PIXFMT_RGBA32;
+        pix.stride = decoder.width * 4;
+    }
+
+    // Unfilter and copy to pixmap
+    for y in 0..decoder.height {
+        let filtered_row_offset = y as u64 * filtered_row_size;
+        let filter_type = decompressed[filtered_row_offset];
+        let data_offset = filtered_row_offset + 1;
+        let prev_data_offset: u64 = ((y - 1) as u64 * filtered_row_size + (1 as u64)) if y > 0 else 0;
+        let has_prev = y > 0;
+
+        // Unfilter in place
+        unfilter_row(&mut decompressed, data_offset, prev_data_offset,
+                     filter_type, row_bytes, bpp, has_prev);
+
+        // Copy to pixmap
+        let dst_row_offset = y as u64 * pix.stride as u64;
+        for i in 0..row_bytes {
+            pix.data[dst_row_offset + i as u64] = decompressed[data_offset + i as u64];
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Calculate maximum PNG file size for a given image
+fn png_max_size(width: u32, height: u32, has_alpha: bool) -> u64 {
+    let bpp: u32 = 4 if has_alpha else 3;
+    let row_bytes = width * bpp;
+    let filtered_size = (1 + row_bytes) as u64 * height as u64;
+    // Header + IHDR + IDAT overhead + compressed data (worst case ~1.1x) + IEND
+    return (8 + 25 + 12) as u64 + filtered_size + filtered_size / (8 as u64) + (64 as u64) + (12 as u64);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test adler32_empty() {
+    assert(adler32(bytes("")) == 1);
+}
+
+test adler32_a() {
+    // Adler32("a") = 0x00620062
+    assert(adler32(bytes("a")) == 0x00620062);
+}
+
+test adler32_abc() {
+    // Adler32("abc") = 0x024d0127
+    assert(adler32(bytes("abc")) == 0x024d0127);
+}
+
+test adler32_wikipedia() {
+    // Adler32("Wikipedia") = 0x11e60398
+    assert(adler32(bytes("Wikipedia")) == 0x11e60398);
+}
+
+test png_signature_check() {
+    // Test that PNG signature is correct
+    assert(PNG_SIGNATURE[0] == 0x89);
+    assert(PNG_SIGNATURE[1] == 0x50);  // 'P'
+    assert(PNG_SIGNATURE[2] == 0x4E);  // 'N'
+    assert(PNG_SIGNATURE[3] == 0x47);  // 'G'
+}
+
+test paeth_predictor_basic() {
+    // When all neighbors are 0, predictor returns 0
+    assert(paeth_predictor(0, 0, 0) == 0);
+
+    // When a=10, b=0, c=0, p=10, pa=0, pb=10, pc=10, returns a
+    assert(paeth_predictor(10, 0, 0) == 10);
+
+    // When a=0, b=10, c=0, p=10, pa=10, pb=0, pc=10, returns b
+    assert(paeth_predictor(0, 10, 0) == 10);
+}
+
+test png_encode_decode_small() {
+    // Create a small 2x2 RGB image
+    let mut data: u8[12] = [
+        255, 0, 0,    // Red
+        0, 255, 0,    // Green
+        0, 0, 255,    // Blue
+        255, 255, 0   // Yellow
+    ];
+
+    let mut pix: Pixmap = Pixmap {
+        width: 2,
+        height: 2,
+        format: PIXFMT_RGB24,
+        stride: 6,
+        data: &mut data
+    };
+
+    // Encode
+    let mut png_buf: u8[1024] = [0; 1024];
+    let png_len = png_encode(&pix, &mut png_buf);
+
+    // Check PNG signature
+    assert(png_buf[0] == 0x89);
+    assert(png_buf[1] == 0x50);
+    assert(png_buf[2] == 0x4E);
+    assert(png_buf[3] == 0x47);
+
+    // Decode back
+    let mut decoded_data: u8[12] = [0; 12];
+    let mut decoded_pix: Pixmap = Pixmap {
+        width: 0,
+        height: 0,
+        format: 0,
+        stride: 0,
+        data: &mut decoded_data
+    };
+
+    let success = png_decode(&png_buf, &mut decoded_pix);
+    assert(success);
+    assert(decoded_pix.width == 2);
+    assert(decoded_pix.height == 2);
+    assert(decoded_pix.format == PIXFMT_RGB24);
+
+    // Verify pixel data matches
+    assert(decoded_data[0] == 255);  // Red R
+    assert(decoded_data[1] == 0);    // Red G
+    assert(decoded_data[2] == 0);    // Red B
+    assert(decoded_data[3] == 0);    // Green R
+    assert(decoded_data[4] == 255);  // Green G
+    assert(decoded_data[5] == 0);    // Green B
+}
+
+test png_encode_grayscale() {
+    // Create a small 2x2 grayscale image
+    let mut data: u8[4] = [0, 85, 170, 255];
+
+    let mut pix: Pixmap = Pixmap {
+        width: 2,
+        height: 2,
+        format: PIXFMT_GRAY8,
+        stride: 2,
+        data: &mut data
+    };
+
+    // Encode
+    let mut png_buf: u8[512] = [0; 512];
+    let png_len = png_encode(&pix, &mut png_buf);
+
+    // Check PNG signature
+    assert(png_buf[0] == 0x89);
+
+    // Should be able to decode back
+    let mut decoded_data: u8[4] = [0; 4];
+    let mut decoded_pix: Pixmap = Pixmap {
+        width: 0,
+        height: 0,
+        format: 0,
+        stride: 0,
+        data: &mut decoded_data
+    };
+
+    let success = png_decode(&png_buf, &mut decoded_pix);
+    assert(success);
+    assert(decoded_pix.format == PIXFMT_GRAY8);
+    assert(decoded_data[0] == 0);
+    assert(decoded_data[1] == 85);
+    assert(decoded_data[2] == 170);
+    assert(decoded_data[3] == 255);
+}

@@ -776,7 +776,32 @@ impl<'src> Parser<'src> {
     // ==================== Expressions ====================
 
     fn parse_expr(&mut self) -> AlgocResult<Expr> {
-        self.parse_binary_expr(0)
+        self.parse_conditional_expr()
+    }
+
+    /// Parse conditional expression: `then_value if condition else else_value`
+    /// This has the lowest precedence of all expressions.
+    fn parse_conditional_expr(&mut self) -> AlgocResult<Expr> {
+        let then_expr = self.parse_binary_expr(0)?;
+
+        // Check for `if` keyword (conditional expression)
+        if self.match_keyword(Keyword::If) {
+            let condition = self.parse_binary_expr(0)?;
+            self.expect_keyword(Keyword::Else, "expected 'else' in conditional expression")?;
+            let else_expr = self.parse_conditional_expr()?; // Right-associative
+
+            let span = then_expr.span.merge(else_expr.span);
+            return Ok(Expr {
+                kind: ExprKind::Conditional {
+                    condition: Box::new(condition),
+                    then_expr: Box::new(then_expr),
+                    else_expr: Box::new(else_expr),
+                },
+                span,
+            });
+        }
+
+        Ok(then_expr)
     }
 
     fn parse_binary_expr(&mut self, min_prec: u8) -> AlgocResult<Expr> {
@@ -1088,13 +1113,13 @@ impl<'src> Parser<'src> {
 
                 // Check for repeat syntax: [value; count]
                 if self.match_token(&TokenKind::Semicolon) {
-                    let count = self.parse_integer_literal()?;
+                    let count = self.parse_expr()?;
                     self.expect(&TokenKind::RBracket, "expected ']' after repeat count")?;
                     let span = start.merge(self.previous().span);
                     return Ok(Expr {
                         kind: ExprKind::ArrayRepeat {
                             value: Box::new(first),
-                            count,
+                            count: Box::new(count),
                         },
                         span,
                     });
