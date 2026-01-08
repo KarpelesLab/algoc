@@ -319,6 +319,39 @@ impl PythonGenerator {
                 self.write("\n");
             }
             StmtKind::Assign { target, value } => {
+                // Check for endian cast assignment: buf[0..4] as u32be = value
+                if let ExprKind::Cast { expr: inner, ty } = &target.kind {
+                    if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                        let endian = p.endianness();
+                        if endian != crate::parser::Endianness::Native {
+                            if let ExprKind::Slice { array, start, end, .. } = &inner.kind {
+                                // Generate: array[start:end] = value.to_bytes(N, 'big'/'little')
+                                let byte_order = if endian == crate::parser::Endianness::Big {
+                                    "'big'"
+                                } else {
+                                    "'little'"
+                                };
+                                let byte_count = match p.to_native() {
+                                    crate::parser::PrimitiveType::U16 | crate::parser::PrimitiveType::I16 => 2,
+                                    crate::parser::PrimitiveType::U32 | crate::parser::PrimitiveType::I32 => 4,
+                                    crate::parser::PrimitiveType::U64 | crate::parser::PrimitiveType::I64 => 8,
+                                    crate::parser::PrimitiveType::U128 | crate::parser::PrimitiveType::I128 => 16,
+                                    _ => 4,
+                                };
+                                self.write_indent();
+                                self.generate_expr(array);
+                                self.write("[");
+                                self.generate_expr(start);
+                                self.write(":");
+                                self.generate_expr(end);
+                                self.write("] = list((");
+                                self.generate_expr(value);
+                                self.write(&format!(").to_bytes({}, {}))\n", byte_count, byte_order));
+                                return;
+                            }
+                        }
+                    }
+                }
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");

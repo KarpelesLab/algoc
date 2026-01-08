@@ -269,6 +269,42 @@ impl JavaScriptGenerator {
                 self.write(";\n");
             }
             StmtKind::Assign { target, value } => {
+                // Check for endian cast assignment: buf[0..4] as u32be = value
+                if let ExprKind::Cast { expr: inner, ty } = &target.kind {
+                    if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                        let endian = p.endianness();
+                        if endian != crate::parser::Endianness::Native {
+                            if let ExprKind::Slice { array, start, end, .. } = &inner.kind {
+                                // Generate: new DataView(slice.buffer, slice.byteOffset).setUint32(0, value, littleEndian)
+                                let little_endian = endian == crate::parser::Endianness::Little;
+                                let (setter, byte_count) = match p.to_native() {
+                                    crate::parser::PrimitiveType::U16 | crate::parser::PrimitiveType::I16 => ("setUint16", 2),
+                                    crate::parser::PrimitiveType::U32 | crate::parser::PrimitiveType::I32 => ("setUint32", 4),
+                                    crate::parser::PrimitiveType::U64 | crate::parser::PrimitiveType::I64 => ("setBigUint64", 8),
+                                    _ => ("setUint32", 4),
+                                };
+                                self.write_indent();
+                                self.write("(() => { const __s = ");
+                                self.generate_expr(array);
+                                self.write(".subarray(");
+                                self.generate_expr(start);
+                                self.write(", ");
+                                self.generate_expr(end);
+                                self.write(&format!("); new DataView(__s.buffer, __s.byteOffset, {}).{}(0, ", byte_count, setter));
+                                if byte_count == 8 {
+                                    self.write("BigInt(");
+                                    self.generate_expr(value);
+                                    self.write(")");
+                                } else {
+                                    self.generate_expr(value);
+                                }
+                                self.write(&format!(", {}); }})()", little_endian));
+                                self.write(";\n");
+                                return;
+                            }
+                        }
+                    }
+                }
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
@@ -545,12 +581,28 @@ impl JavaScriptGenerator {
                 }
             }
             ExprKind::ArrayRepeat { value, count } => {
-                // Generate new Array(count).fill(value)
-                self.write("new Array(");
-                self.write(&count.to_string());
-                self.write(").fill(");
-                self.generate_expr(value);
-                self.write(")");
+                // Check if value is a small integer (byte) - use Uint8Array
+                let is_byte = if let ExprKind::Integer(n) = &value.kind {
+                    *n <= 255
+                } else {
+                    false
+                };
+
+                if is_byte {
+                    // Use Uint8Array for byte arrays
+                    self.write("new Uint8Array(");
+                    self.write(&count.to_string());
+                    self.write(").fill(");
+                    self.generate_expr(value);
+                    self.write(")");
+                } else {
+                    // Use regular Array for other types
+                    self.write("new Array(");
+                    self.write(&count.to_string());
+                    self.write(").fill(");
+                    self.generate_expr(value);
+                    self.write(")");
+                }
             }
             ExprKind::Cast { expr: inner, ty } => {
                 self.generate_cast(inner, ty);

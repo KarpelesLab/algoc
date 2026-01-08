@@ -349,6 +349,25 @@ impl<'a> TypeChecker<'a> {
                     self.error("cannot assign through immutable reference", expr.span);
                 }
             }
+            parser::ExprKind::Cast { expr: inner, ty } => {
+                // Cast is assignable if it's a slice-to-endian-int cast and inner is assignable
+                // e.g., buf[0..4] as u32be = value;
+                if let parser::TypeKind::Primitive(p) = &ty.kind {
+                    let endian = p.endianness();
+                    if endian != parser::Endianness::Native {
+                        // Endian cast - check that inner is a slice expression
+                        if let parser::ExprKind::Slice { array, .. } = &inner.kind {
+                            self.check_assignable(array);
+                            return;
+                        }
+                    }
+                }
+                self.error("cast expression is not assignable", expr.span);
+            }
+            parser::ExprKind::Slice { array, .. } => {
+                // Slice is assignable if the underlying array is mutable
+                self.check_assignable(array);
+            }
             _ => {
                 self.error("expression is not assignable", expr.span);
             }

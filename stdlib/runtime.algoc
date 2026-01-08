@@ -15,54 +15,32 @@ fn rotl(x: u32, n: u32) -> u32 {
 
 // Read u32 big-endian from byte buffer
 fn read_u32_be(buf: &[u8], offset: u64) -> u32 {
-    return (buf[offset] as u32 << 24)
-         | (buf[offset + 1] as u32 << 16)
-         | (buf[offset + 2] as u32 << 8)
-         | (buf[offset + 3] as u32);
+    return buf[offset..offset+4] as u32be;
 }
 
 // Read u32 little-endian from byte buffer
 fn read_u32_le(buf: &[u8], offset: u64) -> u32 {
-    return (buf[offset] as u32)
-         | (buf[offset + 1] as u32 << 8)
-         | (buf[offset + 2] as u32 << 16)
-         | (buf[offset + 3] as u32 << 24);
+    return buf[offset..offset+4] as u32le;
 }
 
 // Write u32 big-endian to byte buffer
 fn write_u32_be(buf: &mut [u8], offset: u64, value: u32) {
-    buf[offset] = (value >> 24) as u8;
-    buf[offset + 1] = (value >> 16) as u8;
-    buf[offset + 2] = (value >> 8) as u8;
-    buf[offset + 3] = value as u8;
+    buf[offset..offset+4] as u32be = value;
 }
 
 // Write u32 little-endian to byte buffer
 fn write_u32_le(buf: &mut [u8], offset: u64, value: u32) {
-    buf[offset] = value as u8;
-    buf[offset + 1] = (value >> 8) as u8;
-    buf[offset + 2] = (value >> 16) as u8;
-    buf[offset + 3] = (value >> 24) as u8;
+    buf[offset..offset+4] as u32le = value;
 }
 
 // Write u64 big-endian to byte buffer
-// Split into high/low 32-bit parts to avoid JavaScript 32-bit limitation
 fn write_u64_be(buf: &mut [u8], offset: u64, value: u64) {
-    // Extract high and low 32-bit parts using division (works in JS)
-    let high: u32 = (value / 0x100000000) as u32;
-    let low: u32 = value as u32;
-    write_u32_be(buf, offset, high);
-    write_u32_be(buf, offset + 4, low);
+    buf[offset..offset+8] as u64be = value;
 }
 
 // Write u64 little-endian to byte buffer
-// Split into high/low 32-bit parts to avoid JavaScript 32-bit limitation
 fn write_u64_le(buf: &mut [u8], offset: u64, value: u64) {
-    // Extract high and low 32-bit parts using division (works in JS)
-    let high: u32 = (value / 0x100000000) as u32;
-    let low: u32 = value as u32;
-    write_u32_le(buf, offset, low);
-    write_u32_le(buf, offset + 4, high);
+    buf[offset..offset+8] as u64le = value;
 }
 
 // Constant-time equality comparison for byte buffers
