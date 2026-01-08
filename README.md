@@ -180,6 +180,7 @@ if condition {
 The `stdlib/` directory contains reference implementations:
 
 ### Cryptographic
+- **AES** (`stdlib/crypto/aes.algoc`) - FIPS 197 (AES-128, AES-192, AES-256)
 - **SHA-256** (`stdlib/crypto/sha256.algoc`) - FIPS 180-4 compliant
 - **MD5** (`stdlib/crypto/md5.algoc`) - RFC 1321 implementation
 
