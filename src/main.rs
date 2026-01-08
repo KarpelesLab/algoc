@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use algoc::{Parser, analyze, errors::print_error, CodeGenerator, JavaScriptGenerator, PythonGenerator};
 use algoc::parser::{Ast, Item, ItemKind};
@@ -78,10 +78,12 @@ fn main() -> ExitCode {
         println!("Commands:");
         println!("  check <file>           Type-check a source file");
         println!("  parse <file>           Parse and dump AST (no type checking)");
-        println!("  compile <file> -t <target> [-o <output>]");
+        println!("  compile <file> -t <target> [-o <output>] [--test]");
         println!("                         Compile to target language");
+        println!("  test <file> [-t <target>]");
+        println!("                         Run tests directly (streams to interpreter)");
         println!();
-        println!("Targets: javascript (js), python (py)");
+        println!("Targets: javascript (js, default), python (py)");
         println!();
         return ExitCode::SUCCESS;
     }
@@ -302,6 +304,116 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("Error writing '{}': {}", output_path, e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "test" => {
+            if args.len() < 3 {
+                eprintln!("Error: missing file argument");
+                return ExitCode::FAILURE;
+            }
+
+            let filename = &args[2];
+
+            // Parse arguments
+            let mut target = String::from("js");  // Default to JavaScript
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-t" | "--target" => {
+                        if i + 1 < args.len() {
+                            target = args[i + 1].clone();
+                            i += 2;
+                        } else {
+                            eprintln!("Error: -t requires a target");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    _ => {
+                        eprintln!("Unknown option: {}", args[i]);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            // Load file with imports
+            let (ast, source) = match load_file(filename) {
+                Ok((ast, source)) => (ast, source),
+                Err((file, msg)) => {
+                    eprintln!("Error in '{}': {}", file, msg);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            // Analyze
+            let analyzed = match analyze(ast) {
+                Ok(a) => a,
+                Err(e) => {
+                    print_error(&source, filename, &e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            // Generate code with tests enabled
+            let (code, interpreter) = match target.as_str() {
+                "javascript" | "js" => {
+                    let mut generator = JavaScriptGenerator::new().with_tests(true);
+                    match generator.generate(&analyzed) {
+                        Ok(code) => (code, "node"),
+                        Err(e) => {
+                            print_error(&source, filename, &e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                "python" | "py" => {
+                    let mut generator = PythonGenerator::new().with_tests(true);
+                    match generator.generate(&analyzed) {
+                        Ok(code) => (code, "python3"),
+                        Err(e) => {
+                            print_error(&source, filename, &e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown target: {}", target);
+                    eprintln!("Available targets: javascript (js), python (py)");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            // Append direct test execution (needed when running via -e/-c)
+            let code_with_runner = if interpreter == "node" {
+                format!("{}\nprocess.exit(run_tests() ? 0 : 1);", code)
+            } else {
+                format!("{}\nimport sys; sys.exit(0 if run_tests() else 1)", code)
+            };
+
+            // Spawn interpreter with code via -e flag (node) or -c flag (python)
+            let status = if interpreter == "node" {
+                Command::new(interpreter)
+                    .arg("-e")
+                    .arg(&code_with_runner)
+                    .status()
+            } else {
+                Command::new(interpreter)
+                    .arg("-c")
+                    .arg(&code_with_runner)
+                    .status()
+            };
+
+            match status {
+                Ok(status) => {
+                    if status.success() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error running {}: {}", interpreter, e);
                     ExitCode::FAILURE
                 }
             }
