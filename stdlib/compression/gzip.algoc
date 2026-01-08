@@ -6,7 +6,7 @@
 // - Basic compression (using DEFLATE stored blocks for simplicity)
 
 use "../runtime.algoc";
-use "crc32.algoc";
+use "../hash/crc32.algoc";
 use "deflate.algoc";
 
 // ============================================================================

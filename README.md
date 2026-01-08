@@ -149,7 +149,7 @@ let le_value = data[offset..offset + 8] as u64le;
 ```algoc
 // Import functions and types from another file
 use "stdlib/runtime.algoc"
-use "stdlib/compression/crc32.algoc"
+use "stdlib/hash/crc32.algoc"
 ```
 
 ### Control Flow
@@ -186,7 +186,9 @@ The `stdlib/` directory contains reference implementations:
 ### Compression
 - **DEFLATE** (`stdlib/compression/deflate.algoc`) - RFC 1951 decompression with Huffman decoding
 - **Gzip** (`stdlib/compression/gzip.algoc`) - RFC 1952 container format
-- **CRC32** (`stdlib/compression/crc32.algoc`) - Checksum computation
+
+### Hash
+- **CRC32** (`stdlib/hash/crc32.algoc`) - Checksum computation
 
 ### Runtime
 - **runtime.algoc** (`stdlib/runtime.algoc`) - Bit manipulation utilities, endian helpers
