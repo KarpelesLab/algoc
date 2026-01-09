@@ -13,6 +13,8 @@ pub struct Scope {
     symbols: HashMap<String, Symbol>,
     /// Struct definitions
     structs: HashMap<String, StructDef>,
+    /// Enum definitions
+    enums: HashMap<String, EnumDef>,
     /// Child scopes (for functions, blocks, etc.)
     children: Vec<Scope>,
 }
@@ -23,6 +25,7 @@ impl Scope {
         Self {
             symbols: HashMap::new(),
             structs: HashMap::new(),
+            enums: HashMap::new(),
             children: Vec::new(),
         }
     }
@@ -53,6 +56,20 @@ impl Scope {
     /// Look up a struct by name
     pub fn get_struct(&self, name: &str) -> Option<&StructDef> {
         self.structs.get(name)
+    }
+
+    /// Define an enum in this scope
+    pub fn define_enum(&mut self, name: String, def: EnumDef) -> Result<(), String> {
+        if self.enums.contains_key(&name) {
+            return Err(format!("enum '{}' is already defined", name));
+        }
+        self.enums.insert(name, def);
+        Ok(())
+    }
+
+    /// Look up an enum by name
+    pub fn get_enum(&self, name: &str) -> Option<&EnumDef> {
+        self.enums.get(name)
     }
 
     /// Get all symbols in this scope
@@ -204,6 +221,55 @@ impl StructField {
     }
 }
 
+/// An enum definition
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    /// The name of the enum
+    pub name: String,
+    /// Variants of the enum
+    pub variants: Vec<EnumVariantDef>,
+    /// Source location
+    pub span: SourceSpan,
+}
+
+impl EnumDef {
+    /// Create a new enum definition
+    pub fn new(name: String, span: SourceSpan) -> Self {
+        Self {
+            name,
+            variants: Vec::new(),
+            span,
+        }
+    }
+
+    /// Add a variant to the enum
+    pub fn add_variant(&mut self, variant: EnumVariantDef) {
+        self.variants.push(variant);
+    }
+
+    /// Get a variant by name
+    pub fn get_variant(&self, name: &str) -> Option<&EnumVariantDef> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+}
+
+/// A variant in an enum
+#[derive(Debug, Clone)]
+pub struct EnumVariantDef {
+    /// Variant name
+    pub name: String,
+    /// Types of the variant's data (empty for unit variants)
+    pub data_types: Vec<Type>,
+    /// Source location
+    pub span: SourceSpan,
+}
+
+impl EnumVariantDef {
+    pub fn new(name: String, data_types: Vec<Type>, span: SourceSpan) -> Self {
+        Self { name, data_types, span }
+    }
+}
+
 /// A scope stack for tracking nested scopes during resolution
 #[derive(Debug)]
 pub struct ScopeStack {
@@ -266,6 +332,11 @@ impl ScopeStack {
     /// Look up a struct by name (only in global scope)
     pub fn lookup_struct(&self, name: &str) -> Option<&StructDef> {
         self.global().get_struct(name)
+    }
+
+    /// Look up an enum by name (only in global scope)
+    pub fn lookup_enum(&self, name: &str) -> Option<&EnumDef> {
+        self.global().get_enum(name)
     }
 
     /// Consume the stack and return the global scope with all nested scopes

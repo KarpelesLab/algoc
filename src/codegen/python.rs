@@ -159,6 +159,7 @@ impl PythonGenerator {
                     self.generate_test(test);
                 }
             }
+            ItemKind::Enum(e) => self.generate_enum(e),
             ItemKind::Use(_) => {
                 // Use statements are handled during loading
             }
@@ -231,6 +232,71 @@ impl PythonGenerator {
         self.writeln(&format!("def create_{}():", l.name.name));
         self.indent();
         self.writeln(&format!("return {}()", l.name.name));
+        self.dedent();
+        self.writeln("");
+    }
+
+    fn generate_enum(&mut self, e: &crate::parser::EnumDef) {
+        // Generate enum as a class with variant constructors
+        // enum Color { Red, Green, Rgb(u8, u8, u8) }
+        // becomes:
+        // class Color:
+        //     class Red:
+        //         tag = "Red"
+        //     class Rgb:
+        //         def __init__(self, v0, v1, v2):
+        //             self.tag = "Rgb"
+        //             self.v0 = v0
+        //             ...
+        self.writeln(&format!("class {}:", e.name.name));
+        self.indent();
+
+        if e.variants.is_empty() {
+            self.writeln("pass");
+        } else {
+            for variant in &e.variants {
+                match &variant.data {
+                    crate::parser::EnumVariantData::Unit => {
+                        // Unit variant becomes a singleton instance
+                        self.writeln(&format!("class _{}:", variant.name.name));
+                        self.indent();
+                        self.writeln(&format!("tag = \"{}\"", variant.name.name));
+                        self.dedent();
+                        self.writeln(&format!("{} = _{}()", variant.name.name, variant.name.name));
+                    }
+                    crate::parser::EnumVariantData::Tuple(types) => {
+                        // Tuple variant becomes a class with positional args
+                        self.writeln(&format!("class {}:", variant.name.name));
+                        self.indent();
+                        let params: Vec<String> = (0..types.len()).map(|i| format!("v{}", i)).collect();
+                        let params_str = params.join(", ");
+                        self.writeln(&format!("def __init__(self, {}):", params_str));
+                        self.indent();
+                        self.writeln(&format!("self.tag = \"{}\"", variant.name.name));
+                        for (i, _) in types.iter().enumerate() {
+                            self.writeln(&format!("self.v{} = v{}", i, i));
+                        }
+                        self.dedent();
+                        self.dedent();
+                    }
+                    crate::parser::EnumVariantData::Struct(fields) => {
+                        // Struct variant becomes a class with named args
+                        self.writeln(&format!("class {}:", variant.name.name));
+                        self.indent();
+                        let params: Vec<&str> = fields.iter().map(|f| f.name.name.as_str()).collect();
+                        let params_str = params.join(", ");
+                        self.writeln(&format!("def __init__(self, {}):", params_str));
+                        self.indent();
+                        self.writeln(&format!("self.tag = \"{}\"", variant.name.name));
+                        for field in fields {
+                            self.writeln(&format!("self.{} = {}", field.name.name, field.name.name));
+                        }
+                        self.dedent();
+                        self.dedent();
+                    }
+                }
+            }
+        }
         self.dedent();
         self.writeln("");
     }
@@ -668,6 +734,74 @@ impl PythonGenerator {
                 self.generate_expr(condition);
                 self.write(" else ");
                 self.generate_expr(else_expr);
+                self.write(")");
+            }
+            ExprKind::EnumVariant { enum_name, variant_name, args } => {
+                // Generate: EnumName.VariantName or EnumName.VariantName(args...)
+                if args.is_empty() {
+                    self.write(&format!("{}.{}", enum_name.name, variant_name.name));
+                } else {
+                    self.write(&format!("{}.{}(", enum_name.name, variant_name.name));
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expr(arg);
+                    }
+                    self.write(")");
+                }
+            }
+            ExprKind::Match { expr, arms } => {
+                // Python doesn't have match expressions (until 3.10), so use nested conditionals
+                // match x { A => 1, B => 2, _ => 3 } becomes:
+                // (1 if x.tag == "A" else (2 if x.tag == "B" else 3))
+                // For now, generate a helper lambda
+                self.write("(lambda __match: ");
+                self.generate_match_arms(arms, 0);
+                self.write(")(");
+                self.generate_expr(expr);
+                self.write(")");
+            }
+        }
+    }
+
+    fn generate_match_arms(&mut self, arms: &[crate::parser::MatchArm], index: usize) {
+        if index >= arms.len() {
+            self.write("None");  // No arm matched, shouldn't happen with exhaustive matching
+            return;
+        }
+
+        let arm = &arms[index];
+        self.write("(");
+        self.generate_expr(&arm.body);
+        self.write(" if ");
+        self.generate_pattern_condition(&arm.pattern, "__match");
+        self.write(" else ");
+        self.generate_match_arms(arms, index + 1);
+        self.write(")");
+    }
+
+    fn generate_pattern_condition(&mut self, pattern: &crate::parser::Pattern, scrutinee: &str) {
+        use crate::parser::PatternKind;
+        match &pattern.kind {
+            PatternKind::Wildcard => self.write("True"),
+            PatternKind::Literal(lit_expr) => {
+                self.write(&format!("{} == ", scrutinee));
+                self.generate_expr(lit_expr);
+            }
+            PatternKind::Ident(_) => self.write("True"),
+            PatternKind::EnumVariant { variant_name, .. } => {
+                self.write(&format!("{}.tag == \"{}\"", scrutinee, variant_name.name));
+            }
+            PatternKind::Tuple(_) => self.write("True"),
+            PatternKind::Or(patterns) => {
+                self.write("(");
+                for (i, p) in patterns.iter().enumerate() {
+                    if i > 0 {
+                        self.write(" or ");
+                    }
+                    self.generate_pattern_condition(p, scrutinee);
+                }
                 self.write(")");
             }
         }

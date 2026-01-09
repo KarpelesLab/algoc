@@ -267,6 +267,8 @@ pub enum TypeKind {
     Ref { inner: Box<Type>, mutable: bool },
     /// Struct type (identified by name)
     Struct { name: String },
+    /// Enum type (identified by name)
+    Enum { name: String },
     /// Function type
     Function {
         params: Vec<Type>,
@@ -307,6 +309,7 @@ impl fmt::Display for Type {
                 }
             }
             TypeKind::Struct { name } => write!(f, "{}", name),
+            TypeKind::Enum { name } => write!(f, "{}", name),
             TypeKind::Function { params, return_type } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {

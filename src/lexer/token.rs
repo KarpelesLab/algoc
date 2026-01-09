@@ -28,10 +28,12 @@ pub enum Keyword {
     Fn,
     Struct,
     Layout,
+    Enum,
     Const,
     Let,
     Mut,
     Test,
+    Match,
 
     // Types
     U8,
@@ -106,10 +108,12 @@ impl Keyword {
             "fn" => Some(Keyword::Fn),
             "struct" => Some(Keyword::Struct),
             "layout" => Some(Keyword::Layout),
+            "enum" => Some(Keyword::Enum),
             "const" => Some(Keyword::Const),
             "let" => Some(Keyword::Let),
             "mut" => Some(Keyword::Mut),
             "test" => Some(Keyword::Test),
+            "match" => Some(Keyword::Match),
 
             // Types
             "u8" => Some(Keyword::U8),
@@ -186,10 +190,12 @@ impl fmt::Display for Keyword {
             Keyword::Fn => "fn",
             Keyword::Struct => "struct",
             Keyword::Layout => "layout",
+            Keyword::Enum => "enum",
             Keyword::Const => "const",
             Keyword::Let => "let",
             Keyword::Mut => "mut",
             Keyword::Test => "test",
+            Keyword::Match => "match",
             Keyword::U8 => "u8",
             Keyword::U16 => "u16",
             Keyword::U32 => "u32",
@@ -272,6 +278,8 @@ pub enum TokenKind {
     Semicolon,
     /// `:`
     Colon,
+    /// `::`
+    ColonColon,
     /// `,`
     Comma,
     /// `.`
@@ -346,6 +354,8 @@ pub enum TokenKind {
     GtGtEq,
     /// `->`
     Arrow,
+    /// `=>`
+    FatArrow,
     /// `..`
     DotDot,
     /// `..=`
@@ -384,6 +394,7 @@ impl TokenKind {
             TokenKind::RBracket => "']'",
             TokenKind::Semicolon => "';'",
             TokenKind::Colon => "':'",
+            TokenKind::ColonColon => "'::'",
             TokenKind::Comma => "','",
             TokenKind::Dot => "'.'",
             TokenKind::At => "'@'",
@@ -419,6 +430,7 @@ impl TokenKind {
             TokenKind::LtLtEq => "'<<='",
             TokenKind::GtGtEq => "'>>='",
             TokenKind::Arrow => "'->'",
+            TokenKind::FatArrow => "'=>'",
             TokenKind::DotDot => "'..'",
             TokenKind::DotDotEq => "'..='",
             TokenKind::Eof => "end of file",

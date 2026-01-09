@@ -155,8 +155,8 @@ impl<'a> TypeChecker<'a> {
                 self.scopes.pop();
                 self.current_return_type = None;
             }
-            ItemKind::Struct(_) | ItemKind::Layout(_) => {
-                // Type definitions don't need checking
+            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) => {
+                // Type definitions don't need checking beyond parsing
             }
             ItemKind::Use(_) => {
                 // Use statements are handled during loading
@@ -786,6 +786,36 @@ impl<'a> TypeChecker<'a> {
 
                 // Return the more specific type (or either if they're the same)
                 then_ty
+            }
+            parser::ExprKind::EnumVariant { enum_name, variant_name: _, args: _ } => {
+                // For now, return the enum type
+                // TODO: Validate variant exists and args match
+                Type::new(TypeKind::Enum { name: enum_name.name.clone() })
+            }
+            parser::ExprKind::Match { expr: match_expr, arms } => {
+                // Infer the type of the matched expression
+                let _match_ty = self.infer_expr(match_expr);
+
+                // Infer types of all arm bodies and ensure they're compatible
+                let mut result_ty: Option<Type> = None;
+                for arm in arms {
+                    // TODO: Check pattern against match_ty
+                    let arm_ty = self.infer_expr(&arm.body);
+                    if arm_ty.is_error() {
+                        continue;
+                    }
+                    if let Some(ref expected) = result_ty {
+                        if !arm_ty.is_compatible_with(expected) {
+                            self.error(
+                                format!("match arm has incompatible type: expected {}, got {}", expected, arm_ty),
+                                arm.span,
+                            );
+                        }
+                    } else {
+                        result_ty = Some(arm_ty);
+                    }
+                }
+                result_ty.unwrap_or_else(Type::error)
             }
         }
     }

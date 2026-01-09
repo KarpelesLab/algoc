@@ -30,6 +30,8 @@ pub enum ItemKind {
     Layout(LayoutDef),
     /// Constant definition: `const NAME: Type = value;`
     Const(ConstDef),
+    /// Enum definition: `enum Name { Variant1, Variant2(T), ... }`
+    Enum(EnumDef),
     /// Test definition: `test name { input: ..., expect: ... }`
     Test(TestDef),
 }
@@ -97,6 +99,32 @@ pub struct ConstDef {
     pub name: Ident,
     pub ty: Type,
     pub value: Expr,
+}
+
+/// An enum definition
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: Ident,
+    pub variants: Vec<EnumVariant>,
+}
+
+/// An enum variant
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: Ident,
+    pub data: EnumVariantData,
+    pub span: SourceSpan,
+}
+
+/// Data associated with an enum variant
+#[derive(Debug, Clone)]
+pub enum EnumVariantData {
+    /// Unit variant: `Red`
+    Unit,
+    /// Tuple variant: `Rgb(u8, u8, u8)`
+    Tuple(Vec<Type>),
+    /// Struct variant: `Point { x: i32, y: i32 }`
+    Struct(Vec<Field>),
 }
 
 /// A test definition (function-like)
@@ -446,6 +474,52 @@ pub enum ExprKind {
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
     },
+    /// Enum variant construction: `Color::Red` or `Color::Rgb(1, 2, 3)`
+    EnumVariant {
+        enum_name: Ident,
+        variant_name: Ident,
+        args: Vec<Expr>,
+    },
+    /// Match expression: `match expr { pattern => result, ... }`
+    Match {
+        expr: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+}
+
+/// A match arm: `pattern => expression`
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Expr,
+    pub span: SourceSpan,
+}
+
+/// A pattern for matching
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub enum PatternKind {
+    /// Wildcard pattern: `_`
+    Wildcard,
+    /// Literal pattern: `42`, `true`
+    Literal(Expr),
+    /// Identifier binding: `x`
+    Ident(Ident),
+    /// Enum variant pattern: `Color::Red` or `Color::Rgb(r, g, b)`
+    EnumVariant {
+        enum_name: Ident,
+        variant_name: Ident,
+        bindings: Vec<Pattern>,
+    },
+    /// Tuple pattern: `(a, b, c)`
+    Tuple(Vec<Pattern>),
+    /// Or pattern: `A | B`
+    Or(Vec<Pattern>),
 }
 
 /// Binary operators

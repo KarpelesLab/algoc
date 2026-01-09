@@ -4,7 +4,7 @@
 
 use crate::errors::{AlgocError, AlgocResult, SourceSpan};
 use crate::parser::{self, Ast, Item, ItemKind, PrimitiveType as AstPrimitive};
-use super::scope::{Scope, ScopeStack, Symbol, StructDef, StructField};
+use super::scope::{Scope, ScopeStack, Symbol, StructDef, StructField, EnumDef, EnumVariantDef};
 use super::types::{Type, TypeKind, Endianness};
 
 /// Name resolver that builds symbol tables
@@ -76,6 +76,9 @@ impl Resolver {
                 // Check if it's a known struct
                 if self.scopes.lookup_struct(&ident.name).is_some() {
                     Type::struct_type(ident.name.clone())
+                // Check if it's a known enum
+                } else if self.scopes.lookup_enum(&ident.name).is_some() {
+                    Type::new(TypeKind::Enum { name: ident.name.clone() })
                 } else {
                     self.error(format!("unknown type '{}'", ident.name), ident.span);
                     Type::error()
@@ -184,6 +187,36 @@ impl Resolver {
             ItemKind::Use(_) => {
                 // Use statements are handled during loading, not here
             }
+            ItemKind::Enum(e) => {
+                // Register enum definition
+                let mut def = EnumDef::new(e.name.name.clone(), e.name.span);
+                for variant in &e.variants {
+                    let data_types: Vec<Type> = match &variant.data {
+                        parser::EnumVariantData::Unit => Vec::new(),
+                        parser::EnumVariantData::Tuple(types) => {
+                            types.iter().map(|t| self.resolve_type(t)).collect()
+                        }
+                        parser::EnumVariantData::Struct(fields) => {
+                            fields.iter().map(|f| self.resolve_type(&f.ty)).collect()
+                        }
+                    };
+                    def.add_variant(EnumVariantDef::new(
+                        variant.name.name.clone(),
+                        data_types,
+                        variant.span,
+                    ));
+                }
+                if let Err(err) = self.scopes.global_mut().define_enum(e.name.name.clone(), def) {
+                    self.error(err, e.name.span);
+                }
+
+                // Also define the enum as a symbol for use in expressions
+                let enum_type = Type::new(TypeKind::Enum { name: e.name.name.clone() });
+                let symbol = Symbol::constant(enum_type, e.name.span);
+                if let Err(err) = self.scopes.global_mut().define(e.name.name.clone(), symbol) {
+                    self.error(err, e.name.span);
+                }
+            }
         }
     }
 
@@ -219,7 +252,7 @@ impl Resolver {
                 self.resolve_block(&t.body);
                 self.scopes.pop();
             }
-            ItemKind::Struct(_) | ItemKind::Layout(_) => {
+            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) => {
                 // Already handled in declare_item
             }
             ItemKind::Use(_) => {
@@ -400,6 +433,64 @@ impl Resolver {
                 self.resolve_expr(condition);
                 self.resolve_expr(then_expr);
                 self.resolve_expr(else_expr);
+            }
+            parser::ExprKind::EnumVariant { enum_name, variant_name: _, args } => {
+                // Check enum exists - for now just check if the name is defined
+                if self.scopes.lookup(&enum_name.name).is_none() {
+                    self.error(format!("unknown enum '{}'", enum_name.name), enum_name.span);
+                }
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+            }
+            parser::ExprKind::Match { expr, arms } => {
+                self.resolve_expr(expr);
+                for arm in arms {
+                    // Resolve pattern bindings and arm body
+                    self.scopes.push();
+                    self.resolve_pattern(&arm.pattern);
+                    self.resolve_expr(&arm.body);
+                    self.scopes.pop();
+                }
+            }
+        }
+    }
+
+    /// Resolve a pattern (for match arms)
+    fn resolve_pattern(&mut self, pattern: &parser::Pattern) {
+        match &pattern.kind {
+            parser::PatternKind::Wildcard => {}
+            parser::PatternKind::Literal(expr) => {
+                self.resolve_expr(expr);
+            }
+            parser::PatternKind::Ident(ident) => {
+                // Pattern identifiers introduce new bindings
+                // Type will be inferred during type checking
+                let symbol = Symbol::variable(Type::new(TypeKind::Error), ident.span, false);
+                if let Err(e) = self.scopes.current_mut().define(ident.name.clone(), symbol) {
+                    self.error(e, ident.span);
+                }
+            }
+            parser::PatternKind::EnumVariant { enum_name, variant_name: _, bindings } => {
+                // Check enum exists
+                if self.scopes.lookup(&enum_name.name).is_none() {
+                    self.error(format!("unknown enum '{}'", enum_name.name), enum_name.span);
+                }
+                for binding in bindings {
+                    self.resolve_pattern(binding);
+                }
+            }
+            parser::PatternKind::Tuple(patterns) => {
+                for p in patterns {
+                    self.resolve_pattern(p);
+                }
+            }
+            parser::PatternKind::Or(patterns) => {
+                // All patterns in an Or should bind the same variables
+                // For now just resolve each
+                for p in patterns {
+                    self.resolve_pattern(p);
+                }
             }
         }
     }

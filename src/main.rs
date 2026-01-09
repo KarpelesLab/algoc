@@ -130,6 +130,9 @@ fn main() -> ExitCode {
                             algoc::parser::ItemKind::Use(u) => {
                                 println!("  use \"{}\"", u.path);
                             }
+                            algoc::parser::ItemKind::Enum(e) => {
+                                println!("  enum {} ({} variants)", e.name.name, e.variants.len());
+                            }
                         }
                     }
                     ExitCode::SUCCESS

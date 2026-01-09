@@ -50,7 +50,7 @@ impl Validator {
                 // Validate test body like a function
                 self.validate_block(&test.body);
             }
-            ItemKind::Struct(_) | ItemKind::Layout(_) => {
+            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) => {
                 // Type definitions don't need validation
             }
             ItemKind::Use(_) => {

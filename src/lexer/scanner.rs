@@ -314,7 +314,13 @@ impl<'src> Lexer<'src> {
             '[' => self.make_token(TokenKind::LBracket),
             ']' => self.make_token(TokenKind::RBracket),
             ';' => self.make_token(TokenKind::Semicolon),
-            ':' => self.make_token(TokenKind::Colon),
+            ':' => {
+                if self.match_char(':') {
+                    self.make_token(TokenKind::ColonColon)
+                } else {
+                    self.make_token(TokenKind::Colon)
+                }
+            }
             ',' => self.make_token(TokenKind::Comma),
             '@' => self.make_token(TokenKind::At),
             '~' => self.make_token(TokenKind::Tilde),
@@ -412,6 +418,8 @@ impl<'src> Lexer<'src> {
             '=' => {
                 if self.match_char('=') {
                     self.make_token(TokenKind::EqEq)
+                } else if self.match_char('>') {
+                    self.make_token(TokenKind::FatArrow)
                 } else {
                     self.make_token(TokenKind::Eq)
                 }

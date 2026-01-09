@@ -163,13 +163,15 @@ impl<'src> Parser<'src> {
             ItemKind::Struct(self.parse_struct()?)
         } else if self.check_keyword(Keyword::Layout) {
             ItemKind::Layout(self.parse_layout()?)
+        } else if self.check_keyword(Keyword::Enum) {
+            ItemKind::Enum(self.parse_enum()?)
         } else if self.check_keyword(Keyword::Const) {
             ItemKind::Const(self.parse_const()?)
         } else if self.check_keyword(Keyword::Test) {
             ItemKind::Test(self.parse_test()?)
         } else {
             return Err(AlgocError::parser(
-                format!("expected item (use, fn, struct, const, test), found {}", self.peek().kind),
+                format!("expected item (use, fn, struct, enum, const, test), found {}", self.peek().kind),
                 self.current_span(),
             ));
         };
@@ -257,6 +259,60 @@ impl<'src> Parser<'src> {
         self.expect(&TokenKind::RBrace, "expected '}' after struct fields")?;
 
         Ok(StructDef { name, fields })
+    }
+
+    fn parse_enum(&mut self) -> AlgocResult<EnumDef> {
+        self.expect_keyword(Keyword::Enum, "expected 'enum'")?;
+        let name = self.parse_ident()?;
+
+        self.expect(&TokenKind::LBrace, "expected '{' after enum name")?;
+        let variants = self.parse_enum_variants()?;
+        self.expect(&TokenKind::RBrace, "expected '}' after enum variants")?;
+
+        Ok(EnumDef { name, variants })
+    }
+
+    fn parse_enum_variants(&mut self) -> AlgocResult<Vec<EnumVariant>> {
+        let mut variants = Vec::new();
+
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            let start = self.current_span();
+            let name = self.parse_ident()?;
+
+            // Check for variant data
+            let data = if self.match_token(&TokenKind::LParen) {
+                // Tuple variant: Red(u8, u8, u8)
+                let mut types = Vec::new();
+                if !self.check(&TokenKind::RParen) {
+                    loop {
+                        types.push(self.parse_type()?);
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RParen, "expected ')' after variant types")?;
+                EnumVariantData::Tuple(types)
+            } else if self.match_token(&TokenKind::LBrace) {
+                // Struct variant: Point { x: i32, y: i32 }
+                let fields = self.parse_fields()?;
+                self.expect(&TokenKind::RBrace, "expected '}' after variant fields")?;
+                EnumVariantData::Struct(fields)
+            } else {
+                // Unit variant
+                EnumVariantData::Unit
+            };
+
+            let span = start.merge(self.previous().span);
+            variants.push(EnumVariant { name, data, span });
+
+            // Comma is optional before closing brace
+            if !self.check(&TokenKind::RBrace) {
+                self.match_token(&TokenKind::Comma);
+            }
+        }
+
+        Ok(variants)
     }
 
     fn parse_fields(&mut self) -> AlgocResult<Vec<Field>> {
@@ -1145,9 +1201,38 @@ impl<'src> Parser<'src> {
             });
         }
 
-        // Identifier (possibly struct literal)
+        // Match expression
+        if self.check_keyword(Keyword::Match) {
+            return self.parse_match_expr();
+        }
+
+        // Identifier (possibly struct literal or enum variant)
         if let TokenKind::Ident(_) = &self.peek().kind {
             let name = self.parse_ident()?;
+
+            // Check for enum variant: Name::Variant or Name::Variant(args)
+            if self.match_token(&TokenKind::ColonColon) {
+                let variant_name = self.parse_ident()?;
+
+                // Check for arguments
+                let args = if self.match_token(&TokenKind::LParen) {
+                    let args = self.parse_args()?;
+                    self.expect(&TokenKind::RParen, "expected ')' after enum variant arguments")?;
+                    args
+                } else {
+                    Vec::new()
+                };
+
+                let span = start.merge(self.previous().span);
+                return Ok(Expr {
+                    kind: ExprKind::EnumVariant {
+                        enum_name: name,
+                        variant_name,
+                        args,
+                    },
+                    span,
+                });
+            }
 
             // Check for struct literal: Name { field: value, ... }
             // We need to look ahead to distinguish from a block: Name { stmt; }
@@ -1220,6 +1305,147 @@ impl<'src> Parser<'src> {
                 span,
             })
         })())
+    }
+
+    fn parse_match_expr(&mut self) -> AlgocResult<Expr> {
+        let start = self.current_span();
+        self.expect_keyword(Keyword::Match, "expected 'match'")?;
+
+        let scrutinee = self.parse_expr()?;
+
+        self.expect(&TokenKind::LBrace, "expected '{' after match expression")?;
+
+        let mut arms = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            let arm = self.parse_match_arm()?;
+            arms.push(arm);
+
+            // Comma is optional before closing brace
+            if !self.check(&TokenKind::RBrace) {
+                self.match_token(&TokenKind::Comma);
+            }
+        }
+
+        self.expect(&TokenKind::RBrace, "expected '}' after match arms")?;
+
+        let span = start.merge(self.previous().span);
+        Ok(Expr {
+            kind: ExprKind::Match {
+                expr: Box::new(scrutinee),
+                arms,
+            },
+            span,
+        })
+    }
+
+    fn parse_match_arm(&mut self) -> AlgocResult<MatchArm> {
+        let start = self.current_span();
+        let pattern = self.parse_pattern()?;
+
+        self.expect(&TokenKind::FatArrow, "expected '=>' after pattern")?;
+
+        let body = self.parse_expr()?;
+
+        let span = start.merge(self.previous().span);
+        Ok(MatchArm { pattern, body, span })
+    }
+
+    fn parse_pattern(&mut self) -> AlgocResult<Pattern> {
+        let start = self.current_span();
+
+        // Wildcard pattern: _
+        if let TokenKind::Ident(name) = &self.peek().kind {
+            if name == "_" {
+                self.advance();
+                return Ok(Pattern {
+                    kind: PatternKind::Wildcard,
+                    span: self.previous().span,
+                });
+            }
+        }
+
+        // Integer literal pattern
+        if let TokenKind::Integer(n) = &self.peek().kind {
+            let n = *n;
+            self.advance();
+            return Ok(Pattern {
+                kind: PatternKind::Literal(Expr {
+                    kind: ExprKind::Integer(n),
+                    span: self.previous().span,
+                }),
+                span: self.previous().span,
+            });
+        }
+
+        // Boolean literal pattern
+        if self.check_keyword(Keyword::True) {
+            self.advance();
+            return Ok(Pattern {
+                kind: PatternKind::Literal(Expr {
+                    kind: ExprKind::Bool(true),
+                    span: self.previous().span,
+                }),
+                span: self.previous().span,
+            });
+        }
+        if self.check_keyword(Keyword::False) {
+            self.advance();
+            return Ok(Pattern {
+                kind: PatternKind::Literal(Expr {
+                    kind: ExprKind::Bool(false),
+                    span: self.previous().span,
+                }),
+                span: self.previous().span,
+            });
+        }
+
+        // Identifier pattern (could be enum variant or binding)
+        if let TokenKind::Ident(_) = &self.peek().kind {
+            let name = self.parse_ident()?;
+
+            // Check for enum variant pattern: Name::Variant or Name::Variant(bindings)
+            if self.match_token(&TokenKind::ColonColon) {
+                let variant_name = self.parse_ident()?;
+
+                // Check for bindings
+                let bindings = if self.match_token(&TokenKind::LParen) {
+                    let mut bindings = Vec::new();
+                    if !self.check(&TokenKind::RParen) {
+                        loop {
+                            bindings.push(self.parse_pattern()?);
+                            if !self.match_token(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&TokenKind::RParen, "expected ')' after pattern bindings")?;
+                    bindings
+                } else {
+                    Vec::new()
+                };
+
+                let span = start.merge(self.previous().span);
+                return Ok(Pattern {
+                    kind: PatternKind::EnumVariant {
+                        enum_name: name,
+                        variant_name,
+                        bindings,
+                    },
+                    span,
+                });
+            }
+
+            // Just an identifier - could be a binding
+            return Ok(Pattern {
+                kind: PatternKind::Ident(name.clone()),
+                span: name.span,
+            });
+        }
+
+        Err(AlgocError::parser(
+            format!("expected pattern, found {}", self.peek().kind),
+            self.current_span(),
+        ))
     }
 }
 
