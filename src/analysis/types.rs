@@ -86,6 +86,16 @@ impl Type {
         Self::new(TypeKind::Error)
     }
 
+    /// Create a Reader type
+    pub fn reader() -> Self {
+        Self::new(TypeKind::Reader)
+    }
+
+    /// Create a Writer type
+    pub fn writer() -> Self {
+        Self::new(TypeKind::Writer)
+    }
+
     /// Check if this is an integer type
     pub fn is_integer(&self) -> bool {
         matches!(self.kind, TypeKind::Int { .. })
@@ -119,6 +129,16 @@ impl Type {
     /// Check if this is an error type
     pub fn is_error(&self) -> bool {
         matches!(self.kind, TypeKind::Error)
+    }
+
+    /// Check if this is a Reader type
+    pub fn is_reader(&self) -> bool {
+        matches!(self.kind, TypeKind::Reader)
+    }
+
+    /// Check if this is a Writer type
+    pub fn is_writer(&self) -> bool {
+        matches!(self.kind, TypeKind::Writer)
     }
 
     /// Get the element type if this is an array, slice, or reference to array/slice
@@ -269,6 +289,10 @@ pub enum TypeKind {
     Struct { name: String },
     /// Enum type (identified by name)
     Enum { name: String },
+    /// Reader type (byte stream for reading)
+    Reader,
+    /// Writer type (byte stream for writing)
+    Writer,
     /// Function type
     Function {
         params: Vec<Type>,
@@ -310,6 +334,8 @@ impl fmt::Display for Type {
             }
             TypeKind::Struct { name } => write!(f, "{}", name),
             TypeKind::Enum { name } => write!(f, "{}", name),
+            TypeKind::Reader => write!(f, "Reader"),
+            TypeKind::Writer => write!(f, "Writer"),
             TypeKind::Function { params, return_type } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {

@@ -104,6 +104,187 @@ impl PythonGenerator {
         self.writeln("return x & 0xFF");
         self.dedent();
         self.writeln("");
+
+        // Reader class for streaming byte input
+        self.writeln("class Reader:");
+        self.indent();
+        self.writeln("def __init__(self, data):");
+        self.indent();
+        self.writeln("self.data = bytes(data) if not isinstance(data, (bytes, bytearray)) else data");
+        self.writeln("self.pos = 0");
+        self.dedent();
+        self.writeln("");
+
+        // read_u8
+        self.writeln("def read_u8(self):");
+        self.indent();
+        self.writeln("if self.pos >= len(self.data): raise EOFError('EOF')");
+        self.writeln("v = self.data[self.pos]");
+        self.writeln("self.pos += 1");
+        self.writeln("return v");
+        self.dedent();
+        self.writeln("");
+
+        // read_u16 variants
+        self.writeln("def read_u16(self): return self.read_u16be()");
+        self.writeln("def read_u16be(self):");
+        self.indent();
+        self.writeln("if self.pos + 2 > len(self.data): raise EOFError('EOF')");
+        self.writeln("v = int.from_bytes(self.data[self.pos:self.pos+2], 'big')");
+        self.writeln("self.pos += 2");
+        self.writeln("return v");
+        self.dedent();
+        self.writeln("def read_u16le(self):");
+        self.indent();
+        self.writeln("if self.pos + 2 > len(self.data): raise EOFError('EOF')");
+        self.writeln("v = int.from_bytes(self.data[self.pos:self.pos+2], 'little')");
+        self.writeln("self.pos += 2");
+        self.writeln("return v");
+        self.dedent();
+        self.writeln("");
+
+        // read_u32 variants
+        self.writeln("def read_u32(self): return self.read_u32be()");
+        self.writeln("def read_u32be(self):");
+        self.indent();
+        self.writeln("if self.pos + 4 > len(self.data): raise EOFError('EOF')");
+        self.writeln("v = int.from_bytes(self.data[self.pos:self.pos+4], 'big')");
+        self.writeln("self.pos += 4");
+        self.writeln("return v");
+        self.dedent();
+        self.writeln("def read_u32le(self):");
+        self.indent();
+        self.writeln("if self.pos + 4 > len(self.data): raise EOFError('EOF')");
+        self.writeln("v = int.from_bytes(self.data[self.pos:self.pos+4], 'little')");
+        self.writeln("self.pos += 4");
+        self.writeln("return v");
+        self.dedent();
+        self.writeln("");
+
+        // read_u64 variants
+        self.writeln("def read_u64(self): return self.read_u64be()");
+        self.writeln("def read_u64be(self):");
+        self.indent();
+        self.writeln("if self.pos + 8 > len(self.data): raise EOFError('EOF')");
+        self.writeln("v = int.from_bytes(self.data[self.pos:self.pos+8], 'big')");
+        self.writeln("self.pos += 8");
+        self.writeln("return v");
+        self.dedent();
+        self.writeln("def read_u64le(self):");
+        self.indent();
+        self.writeln("if self.pos + 8 > len(self.data): raise EOFError('EOF')");
+        self.writeln("v = int.from_bytes(self.data[self.pos:self.pos+8], 'little')");
+        self.writeln("self.pos += 8");
+        self.writeln("return v");
+        self.dedent();
+        self.writeln("");
+
+        // read_bytes - exact count, throws if not enough
+        self.writeln("def read_bytes(self, count):");
+        self.indent();
+        self.writeln("count = int(count)");
+        self.writeln("if self.pos + count > len(self.data): raise EOFError('EOF')");
+        self.writeln("result = self.data[self.pos:self.pos+count]");
+        self.writeln("self.pos += count");
+        self.writeln("return result");
+        self.dedent();
+        self.writeln("");
+
+        // read_chunk - up to max bytes, empty at EOF
+        self.writeln("def read_chunk(self, max_size):");
+        self.indent();
+        self.writeln("max_size = int(max_size)");
+        self.writeln("remaining = len(self.data) - self.pos");
+        self.writeln("count = min(max_size, remaining)");
+        self.writeln("result = self.data[self.pos:self.pos+count]");
+        self.writeln("self.pos += count");
+        self.writeln("return result");
+        self.dedent();
+        self.writeln("");
+
+        // eof check
+        self.writeln("def eof(self): return self.pos >= len(self.data)");
+
+        self.dedent();
+        self.writeln("");
+
+        // Writer class for streaming byte output
+        self.writeln("class Writer:");
+        self.indent();
+        self.writeln("def __init__(self, data):");
+        self.indent();
+        self.writeln("self.data = data if isinstance(data, bytearray) else bytearray(data)");
+        self.writeln("self.pos = 0");
+        self.dedent();
+        self.writeln("");
+
+        // write_u8
+        self.writeln("def write_u8(self, v):");
+        self.indent();
+        self.writeln("if self.pos >= len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln("self.data[self.pos] = v & 0xFF");
+        self.writeln("self.pos += 1");
+        self.dedent();
+        self.writeln("");
+
+        // write_u16 variants
+        self.writeln("def write_u16(self, v): self.write_u16be(v)");
+        self.writeln("def write_u16be(self, v):");
+        self.indent();
+        self.writeln("if self.pos + 2 > len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln("self.data[self.pos:self.pos+2] = (v & 0xFFFF).to_bytes(2, 'big')");
+        self.writeln("self.pos += 2");
+        self.dedent();
+        self.writeln("def write_u16le(self, v):");
+        self.indent();
+        self.writeln("if self.pos + 2 > len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln("self.data[self.pos:self.pos+2] = (v & 0xFFFF).to_bytes(2, 'little')");
+        self.writeln("self.pos += 2");
+        self.dedent();
+        self.writeln("");
+
+        // write_u32 variants
+        self.writeln("def write_u32(self, v): self.write_u32be(v)");
+        self.writeln("def write_u32be(self, v):");
+        self.indent();
+        self.writeln("if self.pos + 4 > len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln("self.data[self.pos:self.pos+4] = (v & 0xFFFFFFFF).to_bytes(4, 'big')");
+        self.writeln("self.pos += 4");
+        self.dedent();
+        self.writeln("def write_u32le(self, v):");
+        self.indent();
+        self.writeln("if self.pos + 4 > len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln("self.data[self.pos:self.pos+4] = (v & 0xFFFFFFFF).to_bytes(4, 'little')");
+        self.writeln("self.pos += 4");
+        self.dedent();
+        self.writeln("");
+
+        // write_u64 variants
+        self.writeln("def write_u64(self, v): self.write_u64be(v)");
+        self.writeln("def write_u64be(self, v):");
+        self.indent();
+        self.writeln("if self.pos + 8 > len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln("self.data[self.pos:self.pos+8] = (v & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'big')");
+        self.writeln("self.pos += 8");
+        self.dedent();
+        self.writeln("def write_u64le(self, v):");
+        self.indent();
+        self.writeln("if self.pos + 8 > len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln("self.data[self.pos:self.pos+8] = (v & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')");
+        self.writeln("self.pos += 8");
+        self.dedent();
+        self.writeln("");
+
+        // write_bytes - copy byte slice/array
+        self.writeln("def write_bytes(self, data):");
+        self.indent();
+        self.writeln("if self.pos + len(data) > len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln("self.data[self.pos:self.pos+len(data)] = data");
+        self.writeln("self.pos += len(data)");
+        self.dedent();
+
+        self.dedent();
+        self.writeln("");
     }
 
     /// Generate test runtime helpers
@@ -655,12 +836,31 @@ impl PythonGenerator {
                 self.write(&format!(".{}", field.name));
             }
             ExprKind::Call { func, args } => {
-                // Check for method calls like slice.len()
+                // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
                         // Convert .len() to len()
                         self.write("len(");
                         self.generate_expr(object);
+                        self.write(")");
+                        return;
+                    }
+                    // Reader/Writer method calls - pass through directly
+                    let reader_methods = ["read_u8", "read_u16", "read_u16be", "read_u16le",
+                        "read_u32", "read_u32be", "read_u32le", "read_u64", "read_u64be", "read_u64le",
+                        "read_bytes", "read_chunk", "eof"];
+                    let writer_methods = ["write_u8", "write_u16", "write_u16be", "write_u16le",
+                        "write_u32", "write_u32be", "write_u32le", "write_u64", "write_u64be", "write_u64le",
+                        "write_bytes"];
+                    if reader_methods.contains(&field.name.as_str()) || writer_methods.contains(&field.name.as_str()) {
+                        self.generate_expr(object);
+                        self.write(&format!(".{}(", field.name));
+                        for (i, arg) in args.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_expr(arg);
+                        }
                         self.write(")");
                         return;
                     }

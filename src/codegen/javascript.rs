@@ -111,6 +111,195 @@ impl JavaScriptGenerator {
         // Only generate minimal helpers needed by the compiler
         self.writeln("// AlgoC Runtime Helpers");
         self.writeln("");
+
+        // Reader class for streaming byte input
+        self.writeln("class Reader {");
+        self.indent();
+        self.writeln("constructor(data) {");
+        self.indent();
+        self.writeln("this.data = data instanceof Uint8Array ? data : new Uint8Array(data);");
+        self.writeln("this.pos = 0;");
+        self.writeln("this.view = new DataView(this.data.buffer, this.data.byteOffset, this.data.byteLength);");
+        self.dedent();
+        self.writeln("}");
+
+        // read_u8
+        self.writeln("read_u8() {");
+        self.indent();
+        self.writeln("if (this.pos >= this.data.length) throw new Error('EOF');");
+        self.writeln("return this.data[this.pos++];");
+        self.dedent();
+        self.writeln("}");
+
+        // read_u16 variants
+        self.writeln("read_u16() { return this.read_u16be(); }");
+        self.writeln("read_u16be() {");
+        self.indent();
+        self.writeln("if (this.pos + 2 > this.data.length) throw new Error('EOF');");
+        self.writeln("const v = this.view.getUint16(this.pos, false);");
+        self.writeln("this.pos += 2;");
+        self.writeln("return v;");
+        self.dedent();
+        self.writeln("}");
+        self.writeln("read_u16le() {");
+        self.indent();
+        self.writeln("if (this.pos + 2 > this.data.length) throw new Error('EOF');");
+        self.writeln("const v = this.view.getUint16(this.pos, true);");
+        self.writeln("this.pos += 2;");
+        self.writeln("return v;");
+        self.dedent();
+        self.writeln("}");
+
+        // read_u32 variants
+        self.writeln("read_u32() { return this.read_u32be(); }");
+        self.writeln("read_u32be() {");
+        self.indent();
+        self.writeln("if (this.pos + 4 > this.data.length) throw new Error('EOF');");
+        self.writeln("const v = this.view.getUint32(this.pos, false);");
+        self.writeln("this.pos += 4;");
+        self.writeln("return v;");
+        self.dedent();
+        self.writeln("}");
+        self.writeln("read_u32le() {");
+        self.indent();
+        self.writeln("if (this.pos + 4 > this.data.length) throw new Error('EOF');");
+        self.writeln("const v = this.view.getUint32(this.pos, true);");
+        self.writeln("this.pos += 4;");
+        self.writeln("return v;");
+        self.dedent();
+        self.writeln("}");
+
+        // read_u64 variants
+        self.writeln("read_u64() { return this.read_u64be(); }");
+        self.writeln("read_u64be() {");
+        self.indent();
+        self.writeln("if (this.pos + 8 > this.data.length) throw new Error('EOF');");
+        self.writeln("const v = this.view.getBigUint64(this.pos, false);");
+        self.writeln("this.pos += 8;");
+        self.writeln("return v;");
+        self.dedent();
+        self.writeln("}");
+        self.writeln("read_u64le() {");
+        self.indent();
+        self.writeln("if (this.pos + 8 > this.data.length) throw new Error('EOF');");
+        self.writeln("const v = this.view.getBigUint64(this.pos, true);");
+        self.writeln("this.pos += 8;");
+        self.writeln("return v;");
+        self.dedent();
+        self.writeln("}");
+
+        // read_bytes - exact count, throws if not enough
+        self.writeln("read_bytes(count) {");
+        self.indent();
+        self.writeln("count = Number(count);");
+        self.writeln("if (this.pos + count > this.data.length) throw new Error('EOF');");
+        self.writeln("const result = this.data.subarray(this.pos, this.pos + count);");
+        self.writeln("this.pos += count;");
+        self.writeln("return result;");
+        self.dedent();
+        self.writeln("}");
+
+        // read_chunk - up to max bytes, empty at EOF
+        self.writeln("read_chunk(max_size) {");
+        self.indent();
+        self.writeln("max_size = Number(max_size);");
+        self.writeln("const remaining = this.data.length - this.pos;");
+        self.writeln("const count = Math.min(max_size, remaining);");
+        self.writeln("const result = this.data.subarray(this.pos, this.pos + count);");
+        self.writeln("this.pos += count;");
+        self.writeln("return result;");
+        self.dedent();
+        self.writeln("}");
+
+        // eof check
+        self.writeln("eof() { return this.pos >= this.data.length; }");
+
+        self.dedent();
+        self.writeln("}");
+        self.writeln("");
+
+        // Writer class for streaming byte output
+        self.writeln("class Writer {");
+        self.indent();
+        self.writeln("constructor(data) {");
+        self.indent();
+        self.writeln("this.data = data instanceof Uint8Array ? data : new Uint8Array(data);");
+        self.writeln("this.pos = 0;");
+        self.writeln("this.view = new DataView(this.data.buffer, this.data.byteOffset, this.data.byteLength);");
+        self.dedent();
+        self.writeln("}");
+
+        // write_u8
+        self.writeln("write_u8(v) {");
+        self.indent();
+        self.writeln("if (this.pos >= this.data.length) throw new Error('Buffer overflow');");
+        self.writeln("this.data[this.pos++] = v & 0xFF;");
+        self.dedent();
+        self.writeln("}");
+
+        // write_u16 variants
+        self.writeln("write_u16(v) { this.write_u16be(v); }");
+        self.writeln("write_u16be(v) {");
+        self.indent();
+        self.writeln("if (this.pos + 2 > this.data.length) throw new Error('Buffer overflow');");
+        self.writeln("this.view.setUint16(this.pos, v, false);");
+        self.writeln("this.pos += 2;");
+        self.dedent();
+        self.writeln("}");
+        self.writeln("write_u16le(v) {");
+        self.indent();
+        self.writeln("if (this.pos + 2 > this.data.length) throw new Error('Buffer overflow');");
+        self.writeln("this.view.setUint16(this.pos, v, true);");
+        self.writeln("this.pos += 2;");
+        self.dedent();
+        self.writeln("}");
+
+        // write_u32 variants
+        self.writeln("write_u32(v) { this.write_u32be(v); }");
+        self.writeln("write_u32be(v) {");
+        self.indent();
+        self.writeln("if (this.pos + 4 > this.data.length) throw new Error('Buffer overflow');");
+        self.writeln("this.view.setUint32(this.pos, v, false);");
+        self.writeln("this.pos += 4;");
+        self.dedent();
+        self.writeln("}");
+        self.writeln("write_u32le(v) {");
+        self.indent();
+        self.writeln("if (this.pos + 4 > this.data.length) throw new Error('Buffer overflow');");
+        self.writeln("this.view.setUint32(this.pos, v, true);");
+        self.writeln("this.pos += 4;");
+        self.dedent();
+        self.writeln("}");
+
+        // write_u64 variants
+        self.writeln("write_u64(v) { this.write_u64be(v); }");
+        self.writeln("write_u64be(v) {");
+        self.indent();
+        self.writeln("if (this.pos + 8 > this.data.length) throw new Error('Buffer overflow');");
+        self.writeln("this.view.setBigUint64(this.pos, BigInt(v), false);");
+        self.writeln("this.pos += 8;");
+        self.dedent();
+        self.writeln("}");
+        self.writeln("write_u64le(v) {");
+        self.indent();
+        self.writeln("if (this.pos + 8 > this.data.length) throw new Error('Buffer overflow');");
+        self.writeln("this.view.setBigUint64(this.pos, BigInt(v), true);");
+        self.writeln("this.pos += 8;");
+        self.dedent();
+        self.writeln("}");
+
+        // write_bytes - copy byte slice/array
+        self.writeln("write_bytes(data) {");
+        self.indent();
+        self.writeln("if (this.pos + data.length > this.data.length) throw new Error('Buffer overflow');");
+        self.writeln("this.data.set(data, this.pos);");
+        self.writeln("this.pos += data.length;");
+        self.dedent();
+        self.writeln("}");
+
+        self.dedent();
+        self.writeln("}");
+        self.writeln("");
     }
 
     /// Generate test runtime helpers (only when include_tests is true)
@@ -737,12 +926,31 @@ impl JavaScriptGenerator {
                 self.write(&format!(".{}", field.name));
             }
             ExprKind::Call { func, args } => {
-                // Check for method calls like slice.len()
+                // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
                         // Convert .len() to .length
                         self.generate_expr(object);
                         self.write(".length");
+                        return;
+                    }
+                    // Reader/Writer method calls - pass through directly
+                    let reader_methods = ["read_u8", "read_u16", "read_u16be", "read_u16le",
+                        "read_u32", "read_u32be", "read_u32le", "read_u64", "read_u64be", "read_u64le",
+                        "read_bytes", "read_chunk", "eof"];
+                    let writer_methods = ["write_u8", "write_u16", "write_u16be", "write_u16le",
+                        "write_u32", "write_u32be", "write_u32le", "write_u64", "write_u64be", "write_u64le",
+                        "write_bytes"];
+                    if reader_methods.contains(&field.name.as_str()) || writer_methods.contains(&field.name.as_str()) {
+                        self.generate_expr(object);
+                        self.write(&format!(".{}(", field.name));
+                        for (i, arg) in args.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_expr(arg);
+                        }
+                        self.write(")");
                         return;
                     }
                 }

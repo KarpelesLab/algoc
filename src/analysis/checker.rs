@@ -73,7 +73,11 @@ impl<'a> TypeChecker<'a> {
                 Type::reference(self.ast_to_type(inner), false)
             }
             parser::TypeKind::Named(ident) => {
-                Type::struct_type(ident.name.clone())
+                match ident.name.as_str() {
+                    "Reader" => Type::reader(),
+                    "Writer" => Type::writer(),
+                    _ => Type::struct_type(ident.name.clone()),
+                }
             }
         }
     }
@@ -991,6 +995,16 @@ impl<'a> TypeChecker<'a> {
             object_ty
         };
 
+        // Check for Reader methods
+        if base_ty.is_reader() {
+            return self.check_reader_method(method, args, span);
+        }
+
+        // Check for Writer methods
+        if base_ty.is_writer() {
+            return self.check_writer_method(method, args, span);
+        }
+
         match method {
             "len" => {
                 // .len() is valid on arrays and slices
@@ -1005,6 +1019,198 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             _ => None, // Not a known method
+        }
+    }
+
+    /// Check Reader method calls
+    fn check_reader_method(&mut self, method: &str, args: &[parser::Expr], span: SourceSpan) -> Option<Type> {
+        match method {
+            // Single-byte read (no endianness)
+            "read_u8" => {
+                if !args.is_empty() {
+                    self.error("read_u8() takes no arguments", span);
+                }
+                Some(Type::int(8, false))
+            }
+            // Native endian reads (default to big-endian behavior)
+            "read_u16" | "read_u16be" => {
+                if !args.is_empty() {
+                    self.error(format!("{}() takes no arguments", method), span);
+                }
+                Some(Type::int(16, false))
+            }
+            "read_u16le" => {
+                if !args.is_empty() {
+                    self.error("read_u16le() takes no arguments", span);
+                }
+                Some(Type::int(16, false))
+            }
+            "read_u32" | "read_u32be" => {
+                if !args.is_empty() {
+                    self.error(format!("{}() takes no arguments", method), span);
+                }
+                Some(Type::int(32, false))
+            }
+            "read_u32le" => {
+                if !args.is_empty() {
+                    self.error("read_u32le() takes no arguments", span);
+                }
+                Some(Type::int(32, false))
+            }
+            "read_u64" | "read_u64be" => {
+                if !args.is_empty() {
+                    self.error(format!("{}() takes no arguments", method), span);
+                }
+                Some(Type::int(64, false))
+            }
+            "read_u64le" => {
+                if !args.is_empty() {
+                    self.error("read_u64le() takes no arguments", span);
+                }
+                Some(Type::int(64, false))
+            }
+            // Exact-count byte read (fails if not enough bytes)
+            "read_bytes" => {
+                if args.len() != 1 {
+                    self.error("read_bytes() requires exactly 1 argument (count)", span);
+                } else {
+                    let count_ty = self.infer_expr(&args[0]);
+                    if !count_ty.is_integer() && !count_ty.is_error() {
+                        self.error(format!("read_bytes() count must be integer, got {}", count_ty), args[0].span);
+                    }
+                }
+                Some(Type::slice(Type::int(8, false))) // &[u8]
+            }
+            // Chunk read (returns up to max bytes, empty at EOF)
+            "read_chunk" => {
+                if args.len() != 1 {
+                    self.error("read_chunk() requires exactly 1 argument (max_size)", span);
+                } else {
+                    let max_ty = self.infer_expr(&args[0]);
+                    if !max_ty.is_integer() && !max_ty.is_error() {
+                        self.error(format!("read_chunk() max_size must be integer, got {}", max_ty), args[0].span);
+                    }
+                }
+                Some(Type::slice(Type::int(8, false))) // &[u8]
+            }
+            // EOF check
+            "eof" => {
+                if !args.is_empty() {
+                    self.error("eof() takes no arguments", span);
+                }
+                Some(Type::bool())
+            }
+            _ => {
+                self.error(format!("Reader has no method '{}'", method), span);
+                Some(Type::error())
+            }
+        }
+    }
+
+    /// Check Writer method calls
+    fn check_writer_method(&mut self, method: &str, args: &[parser::Expr], span: SourceSpan) -> Option<Type> {
+        match method {
+            // Single-byte write
+            "write_u8" => {
+                if args.len() != 1 {
+                    self.error("write_u8() requires exactly 1 argument", span);
+                } else {
+                    let val_ty = self.infer_expr(&args[0]);
+                    if !val_ty.is_integer() && !val_ty.is_error() {
+                        self.error(format!("write_u8() value must be integer, got {}", val_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            // Native endian writes (default to big-endian behavior)
+            "write_u16" | "write_u16be" => {
+                if args.len() != 1 {
+                    self.error(format!("{}() requires exactly 1 argument", method), span);
+                } else {
+                    let val_ty = self.infer_expr(&args[0]);
+                    if !val_ty.is_integer() && !val_ty.is_error() {
+                        self.error(format!("{}() value must be integer, got {}", method, val_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            "write_u16le" => {
+                if args.len() != 1 {
+                    self.error("write_u16le() requires exactly 1 argument", span);
+                } else {
+                    let val_ty = self.infer_expr(&args[0]);
+                    if !val_ty.is_integer() && !val_ty.is_error() {
+                        self.error(format!("write_u16le() value must be integer, got {}", val_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            "write_u32" | "write_u32be" => {
+                if args.len() != 1 {
+                    self.error(format!("{}() requires exactly 1 argument", method), span);
+                } else {
+                    let val_ty = self.infer_expr(&args[0]);
+                    if !val_ty.is_integer() && !val_ty.is_error() {
+                        self.error(format!("{}() value must be integer, got {}", method, val_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            "write_u32le" => {
+                if args.len() != 1 {
+                    self.error("write_u32le() requires exactly 1 argument", span);
+                } else {
+                    let val_ty = self.infer_expr(&args[0]);
+                    if !val_ty.is_integer() && !val_ty.is_error() {
+                        self.error(format!("write_u32le() value must be integer, got {}", val_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            "write_u64" | "write_u64be" => {
+                if args.len() != 1 {
+                    self.error(format!("{}() requires exactly 1 argument", method), span);
+                } else {
+                    let val_ty = self.infer_expr(&args[0]);
+                    if !val_ty.is_integer() && !val_ty.is_error() {
+                        self.error(format!("{}() value must be integer, got {}", method, val_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            "write_u64le" => {
+                if args.len() != 1 {
+                    self.error("write_u64le() requires exactly 1 argument", span);
+                } else {
+                    let val_ty = self.infer_expr(&args[0]);
+                    if !val_ty.is_integer() && !val_ty.is_error() {
+                        self.error(format!("write_u64le() value must be integer, got {}", val_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            // Byte slice write
+            "write_bytes" => {
+                if args.len() != 1 {
+                    self.error("write_bytes() requires exactly 1 argument (data)", span);
+                } else {
+                    let data_ty = self.infer_expr(&args[0]);
+                    // Check it's a byte slice or array
+                    let elem_ty = self.get_element_type(&data_ty);
+                    if let Some(elem) = elem_ty {
+                        if !matches!(&elem.kind, TypeKind::Int { bits: 8, signed: false, .. }) {
+                            self.error(format!("write_bytes() data must be byte slice/array, got {}", data_ty), args[0].span);
+                        }
+                    } else if !data_ty.is_error() {
+                        self.error(format!("write_bytes() data must be byte slice/array, got {}", data_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            _ => {
+                self.error(format!("Writer has no method '{}'", method), span);
+                Some(Type::error())
+            }
         }
     }
 

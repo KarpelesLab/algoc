@@ -73,15 +73,22 @@ impl Resolver {
                 Type::reference(inner_ty, false)
             }
             parser::TypeKind::Named(ident) => {
-                // Check if it's a known struct
-                if self.scopes.lookup_struct(&ident.name).is_some() {
-                    Type::struct_type(ident.name.clone())
-                // Check if it's a known enum
-                } else if self.scopes.lookup_enum(&ident.name).is_some() {
-                    Type::new(TypeKind::Enum { name: ident.name.clone() })
-                } else {
-                    self.error(format!("unknown type '{}'", ident.name), ident.span);
-                    Type::error()
+                // Check for built-in Reader/Writer types
+                match ident.name.as_str() {
+                    "Reader" => Type::reader(),
+                    "Writer" => Type::writer(),
+                    _ => {
+                        // Check if it's a known struct
+                        if self.scopes.lookup_struct(&ident.name).is_some() {
+                            Type::struct_type(ident.name.clone())
+                        // Check if it's a known enum
+                        } else if self.scopes.lookup_enum(&ident.name).is_some() {
+                            Type::new(TypeKind::Enum { name: ident.name.clone() })
+                        } else {
+                            self.error(format!("unknown type '{}'", ident.name), ident.span);
+                            Type::error()
+                        }
+                    }
                 }
             }
         }
