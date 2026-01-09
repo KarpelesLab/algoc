@@ -186,6 +186,22 @@ fn sha256(message: &[u8], digest: &mut [u8; 32]) {
     sha256_final(&mut state, digest);
 }
 
+// Update SHA-256 state by reading from a Reader until EOF
+fn sha256_update_from_reader(state: &mut Sha256State, reader: Reader) {
+    while !reader.eof() {
+        let chunk: &[u8] = reader.read_chunk(4096);
+        sha256_update(state, chunk);
+    }
+}
+
+// Convenience function: hash data from a Reader
+fn sha256_reader(reader: Reader, digest: &mut [u8; 32]) {
+    let mut state: Sha256State;
+    sha256_init(&mut state);
+    sha256_update_from_reader(&mut state, reader);
+    sha256_final(&mut state, digest);
+}
+
 // Test vectors from FIPS 180-4
 test sha256_empty() {
     let mut digest: [u8; 32];
@@ -203,4 +219,38 @@ test sha256_long() {
     let mut digest: [u8; 32];
     sha256(bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), &mut digest);
     assert(digest == hex("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+}
+
+// Test streaming from Reader
+test sha256_reader_abc() {
+    let data: &[u8] = bytes("abc");
+    let reader: Reader = Reader(data);
+    let mut digest: [u8; 32];
+    sha256_reader(reader, &mut digest);
+    // Should match sha256("abc")
+    assert(digest == hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+}
+
+test sha256_reader_long() {
+    let data: &[u8] = bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+    let reader: Reader = Reader(data);
+    let mut digest: [u8; 32];
+    sha256_reader(reader, &mut digest);
+    // Should match sha256 of the same string
+    assert(digest == hex("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+}
+
+test sha256_reader_chunked() {
+    // Test that streaming in small chunks produces the same result
+    let data: &[u8] = bytes("The quick brown fox jumps over the lazy dog");
+    let reader: Reader = Reader(data);
+    let mut digest_reader: [u8; 32];
+    sha256_reader(reader, &mut digest_reader);
+
+    // Compare with direct hash
+    let mut digest_direct: [u8; 32];
+    sha256(data, &mut digest_direct);
+
+    // Use slicing to ensure array comparison (not reference comparison)
+    assert(digest_reader[0..32] == digest_direct[0..32]);
 }

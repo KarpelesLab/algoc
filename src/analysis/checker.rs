@@ -604,6 +604,42 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             parser::ExprKind::Call { func, args } => {
+                // Check for Reader/Writer constructor calls
+                if let parser::ExprKind::Ident(ident) = &func.kind {
+                    if ident.name == "Reader" {
+                        if args.len() != 1 {
+                            self.error("Reader() requires exactly 1 argument (data)", expr.span);
+                        } else {
+                            let data_ty = self.infer_expr(&args[0]);
+                            // Accept byte slices/arrays
+                            if let Some(elem) = self.get_element_type(&data_ty) {
+                                if !matches!(&elem.kind, TypeKind::Int { bits: 8, signed: false, .. }) {
+                                    self.error(format!("Reader() data must be byte slice/array, got {}", data_ty), args[0].span);
+                                }
+                            } else if !data_ty.is_error() {
+                                self.error(format!("Reader() data must be byte slice/array, got {}", data_ty), args[0].span);
+                            }
+                        }
+                        return Type::reader();
+                    }
+                    if ident.name == "Writer" {
+                        if args.len() != 1 {
+                            self.error("Writer() requires exactly 1 argument (data)", expr.span);
+                        } else {
+                            let data_ty = self.infer_expr(&args[0]);
+                            // Accept mutable byte slices/arrays
+                            if let Some(elem) = self.get_element_type(&data_ty) {
+                                if !matches!(&elem.kind, TypeKind::Int { bits: 8, signed: false, .. }) {
+                                    self.error(format!("Writer() data must be byte slice/array, got {}", data_ty), args[0].span);
+                                }
+                            } else if !data_ty.is_error() {
+                                self.error(format!("Writer() data must be byte slice/array, got {}", data_ty), args[0].span);
+                            }
+                        }
+                        return Type::writer();
+                    }
+                }
+
                 // Check for method calls (e.g., slice.len())
                 if let parser::ExprKind::Field { object, field } = &func.kind {
                     let object_ty = self.infer_expr(object);

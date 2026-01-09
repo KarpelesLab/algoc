@@ -368,8 +368,11 @@ impl Resolver {
                 // Literals don't need resolution
             }
             parser::ExprKind::Ident(ident) => {
-                if self.scopes.lookup(&ident.name).is_none() {
-                    self.error(format!("undefined variable '{}'", ident.name), ident.span);
+                // Reader and Writer are built-in type constructors, not variables
+                if ident.name != "Reader" && ident.name != "Writer" {
+                    if self.scopes.lookup(&ident.name).is_none() {
+                        self.error(format!("undefined variable '{}'", ident.name), ident.span);
+                    }
                 }
             }
             parser::ExprKind::Binary { left, right, .. } => {

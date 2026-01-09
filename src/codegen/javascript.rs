@@ -926,6 +926,21 @@ impl JavaScriptGenerator {
                 self.write(&format!(".{}", field.name));
             }
             ExprKind::Call { func, args } => {
+                // Check for Reader/Writer constructor calls
+                if let ExprKind::Ident(ident) = &func.kind {
+                    if ident.name == "Reader" || ident.name == "Writer" {
+                        self.write(&format!("new {}(", ident.name));
+                        for (i, arg) in args.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_expr(arg);
+                        }
+                        self.write(")");
+                        return;
+                    }
+                }
+
                 // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
