@@ -3,13 +3,21 @@
 //! Generates Python code from the analyzed AST.
 //! Uses bytearray for mutable byte buffers and handles bitwise operations.
 
+use std::collections::HashMap;
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
     Ast, Item, ItemKind, Function, Stmt, StmtKind, Expr, ExprKind,
-    BinaryOp, UnaryOp, BuiltinFunc, Block,
+    BinaryOp, UnaryOp, BuiltinFunc, Block, Type as ParserType,
 };
 use super::CodeGenerator;
+
+/// Struct field info for read/write generation
+#[derive(Clone)]
+struct StructFieldInfo {
+    name: String,
+    ty: ParserType,
+}
 
 /// Python code generator
 pub struct PythonGenerator {
@@ -19,6 +27,10 @@ pub struct PythonGenerator {
     output: String,
     /// Whether to include test functions and runner
     include_tests: bool,
+    /// Struct definitions for read/write generation
+    struct_defs: HashMap<String, Vec<StructFieldInfo>>,
+    /// Variable types (for struct read/write generation)
+    var_types: HashMap<String, String>,
 }
 
 impl PythonGenerator {
@@ -27,6 +39,8 @@ impl PythonGenerator {
             indent: 0,
             output: String::new(),
             include_tests: false,
+            struct_defs: HashMap::new(),
+            var_types: HashMap::new(),
         }
     }
 
@@ -209,11 +223,12 @@ impl PythonGenerator {
         self.writeln("");
 
         // Writer class for streaming byte output
+        // Uses byte-by-byte writes to work with both lists and bytearrays
         self.writeln("class Writer:");
         self.indent();
         self.writeln("def __init__(self, data):");
         self.indent();
-        self.writeln("self.data = data if isinstance(data, bytearray) else bytearray(data)");
+        self.writeln("self.data = data");
         self.writeln("self.pos = 0");
         self.dedent();
         self.writeln("");
@@ -227,59 +242,67 @@ impl PythonGenerator {
         self.dedent();
         self.writeln("");
 
-        // write_u16 variants
+        // write_u16 variants - byte-by-byte for list compatibility
         self.writeln("def write_u16(self, v): self.write_u16be(v)");
         self.writeln("def write_u16be(self, v):");
         self.indent();
         self.writeln("if self.pos + 2 > len(self.data): raise BufferError('Buffer overflow')");
-        self.writeln("self.data[self.pos:self.pos+2] = (v & 0xFFFF).to_bytes(2, 'big')");
+        self.writeln("self.data[self.pos] = (v >> 8) & 0xFF");
+        self.writeln("self.data[self.pos + 1] = v & 0xFF");
         self.writeln("self.pos += 2");
         self.dedent();
         self.writeln("def write_u16le(self, v):");
         self.indent();
         self.writeln("if self.pos + 2 > len(self.data): raise BufferError('Buffer overflow')");
-        self.writeln("self.data[self.pos:self.pos+2] = (v & 0xFFFF).to_bytes(2, 'little')");
+        self.writeln("self.data[self.pos] = v & 0xFF");
+        self.writeln("self.data[self.pos + 1] = (v >> 8) & 0xFF");
         self.writeln("self.pos += 2");
         self.dedent();
         self.writeln("");
 
-        // write_u32 variants
+        // write_u32 variants - byte-by-byte for list compatibility
         self.writeln("def write_u32(self, v): self.write_u32be(v)");
         self.writeln("def write_u32be(self, v):");
         self.indent();
         self.writeln("if self.pos + 4 > len(self.data): raise BufferError('Buffer overflow')");
-        self.writeln("self.data[self.pos:self.pos+4] = (v & 0xFFFFFFFF).to_bytes(4, 'big')");
+        self.writeln("self.data[self.pos] = (v >> 24) & 0xFF");
+        self.writeln("self.data[self.pos + 1] = (v >> 16) & 0xFF");
+        self.writeln("self.data[self.pos + 2] = (v >> 8) & 0xFF");
+        self.writeln("self.data[self.pos + 3] = v & 0xFF");
         self.writeln("self.pos += 4");
         self.dedent();
         self.writeln("def write_u32le(self, v):");
         self.indent();
         self.writeln("if self.pos + 4 > len(self.data): raise BufferError('Buffer overflow')");
-        self.writeln("self.data[self.pos:self.pos+4] = (v & 0xFFFFFFFF).to_bytes(4, 'little')");
+        self.writeln("self.data[self.pos] = v & 0xFF");
+        self.writeln("self.data[self.pos + 1] = (v >> 8) & 0xFF");
+        self.writeln("self.data[self.pos + 2] = (v >> 16) & 0xFF");
+        self.writeln("self.data[self.pos + 3] = (v >> 24) & 0xFF");
         self.writeln("self.pos += 4");
         self.dedent();
         self.writeln("");
 
-        // write_u64 variants
+        // write_u64 variants - byte-by-byte for list compatibility
         self.writeln("def write_u64(self, v): self.write_u64be(v)");
         self.writeln("def write_u64be(self, v):");
         self.indent();
         self.writeln("if self.pos + 8 > len(self.data): raise BufferError('Buffer overflow')");
-        self.writeln("self.data[self.pos:self.pos+8] = (v & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'big')");
+        self.writeln("for i in range(8): self.data[self.pos + i] = (v >> (56 - i * 8)) & 0xFF");
         self.writeln("self.pos += 8");
         self.dedent();
         self.writeln("def write_u64le(self, v):");
         self.indent();
         self.writeln("if self.pos + 8 > len(self.data): raise BufferError('Buffer overflow')");
-        self.writeln("self.data[self.pos:self.pos+8] = (v & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')");
+        self.writeln("for i in range(8): self.data[self.pos + i] = (v >> (i * 8)) & 0xFF");
         self.writeln("self.pos += 8");
         self.dedent();
         self.writeln("");
 
-        // write_bytes - copy byte slice/array
+        // write_bytes - copy byte slice/array byte-by-byte for list compatibility
         self.writeln("def write_bytes(self, data):");
         self.indent();
         self.writeln("if self.pos + len(data) > len(self.data): raise BufferError('Buffer overflow')");
-        self.writeln("self.data[self.pos:self.pos+len(data)] = data");
+        self.writeln("for i, b in enumerate(data): self.data[self.pos + i] = b");
         self.writeln("self.pos += len(data)");
         self.dedent();
 
@@ -537,6 +560,13 @@ impl PythonGenerator {
     fn generate_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Let { name, ty, init, .. } => {
+                // Track variable type for struct read/write generation
+                if let Some(ty) = ty {
+                    if let crate::parser::TypeKind::Named(type_ident) = &ty.kind {
+                        self.var_types.insert(name.name.clone(), type_ident.name.clone());
+                    }
+                }
+
                 self.write_indent();
                 self.write(&format!("{} = ", name.name));
                 if let Some(init) = init {
@@ -860,6 +890,66 @@ impl PythonGenerator {
                         self.write(")");
                         return;
                     }
+
+                    // Handle reader.read(&mut struct) - expand to field reads
+                    if field.name == "read" && args.len() == 1 {
+                        if let ExprKind::MutRef(inner) = &args[0].kind {
+                            if let ExprKind::Ident(var_ident) = &inner.kind {
+                                if let Some(struct_name) = self.var_types.get(&var_ident.name).cloned() {
+                                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
+                                        // Generate: [setattr(obj, 'f1', reader.m1()), setattr(obj, 'f2', reader.m2()), ...]
+                                        self.write("[");
+                                        let mut first = true;
+                                        for field_info in &fields {
+                                            if let Some(read_method) = self.get_read_method_for_type(&field_info.ty) {
+                                                if !first {
+                                                    self.write(", ");
+                                                }
+                                                first = false;
+                                                self.write(&format!("setattr({}, '{}', ", var_ident.name, field_info.name));
+                                                self.generate_expr(object);
+                                                self.write(&format!(".{}())", read_method));
+                                            }
+                                        }
+                                        self.write("]");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Handle writer.write(&struct) - expand to field writes
+                    if field.name == "write" && args.len() == 1 {
+                        let inner_expr = match &args[0].kind {
+                            ExprKind::Ref(inner) | ExprKind::MutRef(inner) => Some(inner.as_ref()),
+                            _ => None,
+                        };
+                        if let Some(inner) = inner_expr {
+                            if let ExprKind::Ident(var_ident) = &inner.kind {
+                                if let Some(struct_name) = self.var_types.get(&var_ident.name).cloned() {
+                                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
+                                        // Generate: [writer.m1(obj.f1), writer.m2(obj.f2), ...]
+                                        self.write("[");
+                                        let mut first = true;
+                                        for field_info in &fields {
+                                            if let Some(write_method) = self.get_write_method_for_type(&field_info.ty) {
+                                                if !first {
+                                                    self.write(", ");
+                                                }
+                                                first = false;
+                                                self.generate_expr(object);
+                                                self.write(&format!(".{}({}.{})", write_method, var_ident.name, field_info.name));
+                                            }
+                                        }
+                                        self.write("]");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Reader/Writer method calls - pass through directly
                     let reader_methods = ["read_u8", "read_u16", "read_u16be", "read_u16le",
                         "read_u32", "read_u32be", "read_u32le", "read_u64", "read_u64be", "read_u64le",
@@ -1191,6 +1281,56 @@ impl PythonGenerator {
         // Default to little endian (most common)
         "'little'"
     }
+
+    /// Get the Reader method name for reading a field type
+    fn get_read_method_for_type(&self, ty: &ParserType) -> Option<String> {
+        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+
+        match &ty.kind {
+            TypeKind::Primitive(p) => {
+                let endian = p.endianness();
+                let native = p.to_native();
+                let suffix = match endian {
+                    Endianness::Big => "be",
+                    Endianness::Little => "le",
+                    Endianness::Native => "be", // Default to big-endian
+                };
+                match native {
+                    PrimitiveType::U8 | PrimitiveType::I8 => Some("read_u8".to_string()),
+                    PrimitiveType::U16 | PrimitiveType::I16 => Some(format!("read_u16{}", suffix)),
+                    PrimitiveType::U32 | PrimitiveType::I32 => Some(format!("read_u32{}", suffix)),
+                    PrimitiveType::U64 | PrimitiveType::I64 => Some(format!("read_u64{}", suffix)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the Writer method name for writing a field type
+    fn get_write_method_for_type(&self, ty: &ParserType) -> Option<String> {
+        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+
+        match &ty.kind {
+            TypeKind::Primitive(p) => {
+                let endian = p.endianness();
+                let native = p.to_native();
+                let suffix = match endian {
+                    Endianness::Big => "be",
+                    Endianness::Little => "le",
+                    Endianness::Native => "be", // Default to big-endian
+                };
+                match native {
+                    PrimitiveType::U8 | PrimitiveType::I8 => Some("write_u8".to_string()),
+                    PrimitiveType::U16 | PrimitiveType::I16 => Some(format!("write_u16{}", suffix)),
+                    PrimitiveType::U32 | PrimitiveType::I32 => Some(format!("write_u32{}", suffix)),
+                    PrimitiveType::U64 | PrimitiveType::I64 => Some(format!("write_u64{}", suffix)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for PythonGenerator {
@@ -1202,6 +1342,28 @@ impl Default for PythonGenerator {
 impl CodeGenerator for PythonGenerator {
     fn generate(&mut self, ast: &AnalyzedAst) -> AlgocResult<String> {
         self.output.clear();
+        self.struct_defs.clear();
+
+        // Pre-pass: collect struct field info for read/write generation
+        for item in &ast.ast.items {
+            match &item.kind {
+                ItemKind::Struct(s) => {
+                    let fields: Vec<StructFieldInfo> = s.fields.iter().map(|f| StructFieldInfo {
+                        name: f.name.name.clone(),
+                        ty: f.ty.clone(),
+                    }).collect();
+                    self.struct_defs.insert(s.name.name.clone(), fields);
+                }
+                ItemKind::Layout(l) => {
+                    let fields: Vec<StructFieldInfo> = l.fields.iter().map(|f| StructFieldInfo {
+                        name: f.name.name.clone(),
+                        ty: f.ty.clone(),
+                    }).collect();
+                    self.struct_defs.insert(l.name.name.clone(), fields);
+                }
+                _ => {}
+            }
+        }
 
         self.writeln("# Generated by AlgoC");
         self.writeln("# DO NOT EDIT - This file is auto-generated");

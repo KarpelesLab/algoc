@@ -3,14 +3,21 @@
 //! Generates JavaScript code from the analyzed AST.
 //! Uses TypedArrays for byte buffers and handles bitwise operations.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
     Ast, Item, ItemKind, Function, Stmt, StmtKind, Expr, ExprKind,
-    BinaryOp, UnaryOp, BuiltinFunc, Block,
+    BinaryOp, UnaryOp, BuiltinFunc, Block, Type as ParserType,
 };
 use super::CodeGenerator;
+
+/// Struct field info for code generation
+#[derive(Clone)]
+struct StructFieldInfo {
+    name: String,
+    ty: ParserType,
+}
 
 /// JavaScript code generator
 pub struct JavaScriptGenerator {
@@ -28,6 +35,10 @@ pub struct JavaScriptGenerator {
     bigint_fields: HashSet<String>,
     /// Whether the current function returns a BigInt type
     current_func_returns_bigint: bool,
+    /// Struct definitions for read/write generation
+    struct_defs: HashMap<String, Vec<StructFieldInfo>>,
+    /// Variable types (for struct read/write generation)
+    var_types: HashMap<String, String>,
 }
 
 impl JavaScriptGenerator {
@@ -40,6 +51,8 @@ impl JavaScriptGenerator {
             bigint_funcs: HashSet::new(),
             bigint_fields: HashSet::new(),
             current_func_returns_bigint: false,
+            struct_defs: HashMap::new(),
+            var_types: HashMap::new(),
         }
     }
 
@@ -544,6 +557,13 @@ impl JavaScriptGenerator {
                     self.bigint_vars.insert(name.name.clone());
                 }
 
+                // Track struct types for read/write generation
+                if let Some(ty) = ty {
+                    if let crate::parser::TypeKind::Named(type_ident) = &ty.kind {
+                        self.var_types.insert(name.name.clone(), type_ident.name.clone());
+                    }
+                }
+
                 self.write_indent();
                 self.write(&format!("let {} = ", name.name));
                 if let Some(init) = init {
@@ -949,6 +969,55 @@ impl JavaScriptGenerator {
                         self.write(".length");
                         return;
                     }
+
+                    // Handle reader.read(&mut struct) - expand to field reads
+                    if field.name == "read" && args.len() == 1 {
+                        if let ExprKind::MutRef(inner) = &args[0].kind {
+                            if let ExprKind::Ident(var_ident) = &inner.kind {
+                                if let Some(struct_name) = self.var_types.get(&var_ident.name).cloned() {
+                                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
+                                        self.write("(() => { ");
+                                        for field_info in &fields {
+                                            if let Some(read_method) = self.get_read_method_for_type(&field_info.ty) {
+                                                self.write(&format!("{}.{} = ", var_ident.name, field_info.name));
+                                                self.generate_expr(object);
+                                                self.write(&format!(".{}(); ", read_method));
+                                            }
+                                        }
+                                        self.write("})()");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Handle writer.write(&struct) - expand to field writes
+                    if field.name == "write" && args.len() == 1 {
+                        // Handle both &struct and &mut struct
+                        let inner_expr = match &args[0].kind {
+                            ExprKind::Ref(inner) | ExprKind::MutRef(inner) => Some(inner.as_ref()),
+                            _ => None,
+                        };
+                        if let Some(inner) = inner_expr {
+                            if let ExprKind::Ident(var_ident) = &inner.kind {
+                                if let Some(struct_name) = self.var_types.get(&var_ident.name).cloned() {
+                                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
+                                        self.write("(() => { ");
+                                        for field_info in &fields {
+                                            if let Some(write_method) = self.get_write_method_for_type(&field_info.ty) {
+                                                self.generate_expr(object);
+                                                self.write(&format!(".{}({}.{}); ", write_method, var_ident.name, field_info.name));
+                                            }
+                                        }
+                                        self.write("})()");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Reader/Writer method calls - pass through directly
                     let reader_methods = ["read_u8", "read_u16", "read_u16be", "read_u16le",
                         "read_u32", "read_u32be", "read_u32le", "read_u64", "read_u64be", "read_u64le",
@@ -1207,6 +1276,88 @@ impl JavaScriptGenerator {
                     self.generate_pattern_condition(p, scrutinee);
                     self.write(")");
                 }
+            }
+        }
+    }
+
+    /// Get the Reader method name for reading a field type
+    fn get_read_method_for_type(&self, ty: &ParserType) -> Option<String> {
+        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+
+        match &ty.kind {
+            TypeKind::Primitive(p) => {
+                let endian = p.endianness();
+                let native = p.to_native();
+                let suffix = match endian {
+                    Endianness::Big => "be",
+                    Endianness::Little => "le",
+                    Endianness::Native => "be", // Default to big-endian
+                };
+                match native {
+                    PrimitiveType::U8 | PrimitiveType::I8 => Some("read_u8".to_string()),
+                    PrimitiveType::U16 | PrimitiveType::I16 => Some(format!("read_u16{}", suffix)),
+                    PrimitiveType::U32 | PrimitiveType::I32 => Some(format!("read_u32{}", suffix)),
+                    PrimitiveType::U64 | PrimitiveType::I64 => Some(format!("read_u64{}", suffix)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the Writer method name for writing a field type
+    fn get_write_method_for_type(&self, ty: &ParserType) -> Option<String> {
+        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+
+        match &ty.kind {
+            TypeKind::Primitive(p) => {
+                let endian = p.endianness();
+                let native = p.to_native();
+                let suffix = match endian {
+                    Endianness::Big => "be",
+                    Endianness::Little => "le",
+                    Endianness::Native => "be", // Default to big-endian
+                };
+                match native {
+                    PrimitiveType::U8 | PrimitiveType::I8 => Some("write_u8".to_string()),
+                    PrimitiveType::U16 | PrimitiveType::I16 => Some(format!("write_u16{}", suffix)),
+                    PrimitiveType::U32 | PrimitiveType::I32 => Some(format!("write_u32{}", suffix)),
+                    PrimitiveType::U64 | PrimitiveType::I64 => Some(format!("write_u64{}", suffix)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Generate code to read a struct from a Reader
+    fn generate_struct_read(&mut self, reader_expr: &Expr, struct_expr: &Expr, struct_name: &str) {
+        if let Some(fields) = self.struct_defs.get(struct_name).cloned() {
+            for field in &fields {
+                if let Some(read_method) = self.get_read_method_for_type(&field.ty) {
+                    self.write_indent();
+                    self.generate_expr(struct_expr);
+                    self.write(&format!(".{} = ", field.name));
+                    self.generate_expr(reader_expr);
+                    self.write(&format!(".{}();\n", read_method));
+                }
+                // TODO: Handle nested structs, arrays, etc.
+            }
+        }
+    }
+
+    /// Generate code to write a struct to a Writer
+    fn generate_struct_write(&mut self, writer_expr: &Expr, struct_expr: &Expr, struct_name: &str) {
+        if let Some(fields) = self.struct_defs.get(struct_name).cloned() {
+            for field in &fields {
+                if let Some(write_method) = self.get_write_method_for_type(&field.ty) {
+                    self.write_indent();
+                    self.generate_expr(writer_expr);
+                    self.write(&format!(".{}(", write_method));
+                    self.generate_expr(struct_expr);
+                    self.write(&format!(".{});\n", field.name));
+                }
+                // TODO: Handle nested structs, arrays, etc.
             }
         }
     }
@@ -1564,6 +1715,7 @@ impl CodeGenerator for JavaScriptGenerator {
         self.output.clear();
         self.bigint_funcs.clear();
         self.bigint_fields.clear();
+        self.struct_defs.clear();
 
         // Pre-pass: collect functions that return BigInt types and struct fields that are BigInt
         for item in &ast.ast.items {
@@ -1576,6 +1728,13 @@ impl CodeGenerator for JavaScriptGenerator {
                     }
                 }
                 ItemKind::Struct(s) => {
+                    // Collect struct field info for read/write generation
+                    let fields: Vec<StructFieldInfo> = s.fields.iter().map(|f| StructFieldInfo {
+                        name: f.name.name.clone(),
+                        ty: f.ty.clone(),
+                    }).collect();
+                    self.struct_defs.insert(s.name.name.clone(), fields);
+
                     for field in &s.fields {
                         if self.is_bigint_type(Some(&field.ty)) {
                             // Use just the field name since we don't track struct types at access points
@@ -1584,6 +1743,13 @@ impl CodeGenerator for JavaScriptGenerator {
                     }
                 }
                 ItemKind::Layout(l) => {
+                    // Also collect layout field info
+                    let fields: Vec<StructFieldInfo> = l.fields.iter().map(|f| StructFieldInfo {
+                        name: f.name.name.clone(),
+                        ty: f.ty.clone(),
+                    }).collect();
+                    self.struct_defs.insert(l.name.name.clone(), fields);
+
                     for field in &l.fields {
                         if self.is_bigint_type(Some(&field.ty)) {
                             self.bigint_fields.insert(field.name.name.clone());

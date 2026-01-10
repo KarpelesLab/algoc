@@ -1136,6 +1136,31 @@ impl<'a> TypeChecker<'a> {
                 }
                 Some(Type::bool())
             }
+            // Read into a struct
+            "read" => {
+                if args.len() != 1 {
+                    self.error("read() requires exactly 1 argument (mutable reference to struct)", span);
+                } else {
+                    let arg_ty = self.infer_expr(&args[0]);
+                    // Check it's a mutable reference to a struct
+                    if let TypeKind::Ref { inner, mutable } = &arg_ty.kind {
+                        if !mutable {
+                            self.error("read() requires a mutable reference (&mut)", args[0].span);
+                        }
+                        if let TypeKind::Struct { name } = &inner.kind {
+                            // Validate struct exists
+                            if self.global_scope.get_struct(name).is_none() {
+                                self.error(format!("unknown struct '{}'", name), args[0].span);
+                            }
+                        } else {
+                            self.error(format!("read() requires a struct reference, got {}", arg_ty), args[0].span);
+                        }
+                    } else if !arg_ty.is_error() {
+                        self.error(format!("read() requires a mutable reference to struct, got {}", arg_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
             _ => {
                 self.error(format!("Reader has no method '{}'", method), span);
                 Some(Type::error())
@@ -1239,6 +1264,28 @@ impl<'a> TypeChecker<'a> {
                         }
                     } else if !data_ty.is_error() {
                         self.error(format!("write_bytes() data must be byte slice/array, got {}", data_ty), args[0].span);
+                    }
+                }
+                Some(Type::unit())
+            }
+            // Write a struct
+            "write" => {
+                if args.len() != 1 {
+                    self.error("write() requires exactly 1 argument (reference to struct)", span);
+                } else {
+                    let arg_ty = self.infer_expr(&args[0]);
+                    // Check it's a reference to a struct (mutable or not)
+                    if let TypeKind::Ref { inner, .. } = &arg_ty.kind {
+                        if let TypeKind::Struct { name } = &inner.kind {
+                            // Validate struct exists
+                            if self.global_scope.get_struct(name).is_none() {
+                                self.error(format!("unknown struct '{}'", name), args[0].span);
+                            }
+                        } else {
+                            self.error(format!("write() requires a struct reference, got {}", arg_ty), args[0].span);
+                        }
+                    } else if !arg_ty.is_error() {
+                        self.error(format!("write() requires a reference to struct, got {}", arg_ty), args[0].span);
                     }
                 }
                 Some(Type::unit())
