@@ -378,6 +378,89 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Check a pattern against an expected type and add bindings to scope
+    fn check_pattern(&mut self, pattern: &parser::Pattern, expected_ty: &Type) {
+        match &pattern.kind {
+            parser::PatternKind::Wildcard => {
+                // Wildcard matches anything, no bindings
+            }
+            parser::PatternKind::Literal(lit_expr) => {
+                // Check that the literal type matches expected
+                let lit_ty = self.infer_expr(lit_expr);
+                if !lit_ty.is_compatible_with(expected_ty) && !lit_ty.is_error() && !expected_ty.is_error() {
+                    self.error(
+                        format!("pattern type mismatch: expected {}, got {}", expected_ty, lit_ty),
+                        pattern.span,
+                    );
+                }
+            }
+            parser::PatternKind::Ident(ident) => {
+                // Identifier pattern: bind the matched value to this name
+                let symbol = Symbol::variable(expected_ty.clone(), ident.span, false);
+                let _ = self.scopes.define(ident.name.clone(), symbol);
+            }
+            parser::PatternKind::EnumVariant { enum_name, variant_name, bindings } => {
+                // Check that we're matching an enum type
+                if let TypeKind::Enum { name } = &expected_ty.kind {
+                    if name != &enum_name.name {
+                        self.error(
+                            format!("pattern matches enum '{}', but expected '{}'", enum_name.name, name),
+                            pattern.span,
+                        );
+                        return;
+                    }
+
+                    // Look up the enum and variant
+                    if let Some(enum_def) = self.global_scope.get_enum(&enum_name.name) {
+                        if let Some(variant_def) = enum_def.get_variant(&variant_name.name) {
+                            // Check binding count matches
+                            if bindings.len() != variant_def.data_types.len() {
+                                self.error(
+                                    format!("pattern for '{}::{}' has {} bindings, expected {}",
+                                        enum_name.name, variant_name.name,
+                                        bindings.len(), variant_def.data_types.len()),
+                                    pattern.span,
+                                );
+                            } else {
+                                // Recursively check each binding pattern with the appropriate type
+                                for (binding, data_ty) in bindings.iter().zip(variant_def.data_types.iter()) {
+                                    self.check_pattern(binding, data_ty);
+                                }
+                            }
+                        } else {
+                            self.error(
+                                format!("enum '{}' has no variant '{}'", enum_name.name, variant_name.name),
+                                variant_name.span,
+                            );
+                        }
+                    } else {
+                        self.error(
+                            format!("unknown enum '{}'", enum_name.name),
+                            enum_name.span,
+                        );
+                    }
+                } else if !expected_ty.is_error() {
+                    self.error(
+                        format!("cannot match enum pattern against non-enum type {}", expected_ty),
+                        pattern.span,
+                    );
+                }
+            }
+            parser::PatternKind::Tuple(patterns) => {
+                // For now, tuples aren't fully supported, but we can check sub-patterns
+                for p in patterns {
+                    self.check_pattern(p, &Type::error());
+                }
+            }
+            parser::PatternKind::Or(patterns) => {
+                // Each alternative must be compatible with expected type
+                for p in patterns {
+                    self.check_pattern(p, expected_ty);
+                }
+            }
+        }
+    }
+
     /// Infer the type of an expression with an optional expected type hint
     fn infer_expr_with_hint(&mut self, expr: &parser::Expr, hint: Option<&Type>) -> Type {
         // Handle array literals specially when we have a type hint
@@ -827,20 +910,66 @@ impl<'a> TypeChecker<'a> {
                 // Return the more specific type (or either if they're the same)
                 then_ty
             }
-            parser::ExprKind::EnumVariant { enum_name, variant_name: _, args: _ } => {
-                // For now, return the enum type
-                // TODO: Validate variant exists and args match
+            parser::ExprKind::EnumVariant { enum_name, variant_name, args } => {
+                // Look up the enum definition
+                if let Some(enum_def) = self.global_scope.get_enum(&enum_name.name) {
+                    // Check that the variant exists
+                    if let Some(variant_def) = enum_def.get_variant(&variant_name.name) {
+                        // Check that the args match the variant's data types
+                        let expected_count = variant_def.data_types.len();
+                        let actual_count = args.len();
+
+                        if expected_count != actual_count {
+                            self.error(
+                                format!("enum variant '{}::{}' expects {} arguments, got {}",
+                                    enum_name.name, variant_name.name, expected_count, actual_count),
+                                expr.span,
+                            );
+                        } else {
+                            // Check each argument type
+                            for (arg, expected_ty) in args.iter().zip(variant_def.data_types.iter()) {
+                                let arg_ty = self.infer_expr(arg);
+                                if !arg_ty.is_compatible_with(expected_ty) {
+                                    self.error(
+                                        format!("enum variant argument type mismatch: expected {}, got {}",
+                                            expected_ty, arg_ty),
+                                        arg.span,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        self.error(
+                            format!("enum '{}' has no variant '{}'", enum_name.name, variant_name.name),
+                            variant_name.span,
+                        );
+                    }
+                } else {
+                    self.error(
+                        format!("unknown enum '{}'", enum_name.name),
+                        enum_name.span,
+                    );
+                }
                 Type::new(TypeKind::Enum { name: enum_name.name.clone() })
             }
             parser::ExprKind::Match { expr: match_expr, arms } => {
                 // Infer the type of the matched expression
-                let _match_ty = self.infer_expr(match_expr);
+                let match_ty = self.infer_expr(match_expr);
 
-                // Infer types of all arm bodies and ensure they're compatible
+                // Check each arm's pattern and body
                 let mut result_ty: Option<Type> = None;
                 for arm in arms {
-                    // TODO: Check pattern against match_ty
+                    // Create new scope for pattern bindings
+                    self.scopes.push();
+
+                    // Check pattern against match type and add bindings to scope
+                    self.check_pattern(&arm.pattern, &match_ty);
+
+                    // Infer arm body type
                     let arm_ty = self.infer_expr(&arm.body);
+
+                    self.scopes.pop();
+
                     if arm_ty.is_error() {
                         continue;
                     }
