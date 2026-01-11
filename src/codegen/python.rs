@@ -823,8 +823,15 @@ impl PythonGenerator {
                     BinaryOp::Shl | BinaryOp::Shr
                 );
 
+                // Check if either operand uses 64-bit types
+                let uses_u64 = self.expr_uses_u64(left) || self.expr_uses_u64(right);
+
                 if needs_mask {
-                    self.write("_u32(");
+                    if uses_u64 {
+                        self.write("_u64(");
+                    } else {
+                        self.write("_u32(");
+                    }
                 }
                 self.write("(");
                 self.generate_expr(left);
@@ -1319,6 +1326,39 @@ impl PythonGenerator {
                 true
             }
             ExprKind::Field { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Check if an expression involves 64-bit or larger types
+    fn expr_uses_u64(&self, expr: &Expr) -> bool {
+        use crate::parser::{TypeKind, PrimitiveType};
+
+        match &expr.kind {
+            // Cast determines the output type
+            ExprKind::Cast { ty, .. } => {
+                if let TypeKind::Primitive(p) = &ty.kind {
+                    let native = p.to_native();
+                    matches!(native,
+                        PrimitiveType::U64 | PrimitiveType::I64 |
+                        PrimitiveType::U128 | PrimitiveType::I128
+                    )
+                } else {
+                    false
+                }
+            }
+            // Binary operations propagate u64
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_uses_u64(left) || self.expr_uses_u64(right)
+            }
+            // Unary operations propagate u64
+            ExprKind::Unary { operand, .. } => {
+                self.expr_uses_u64(operand)
+            }
+            // Parentheses propagate u64
+            ExprKind::Paren(inner) => self.expr_uses_u64(inner),
+            // Large integer literals need u64
+            ExprKind::Integer(n) => *n > 0xFFFFFFFF,
             _ => false,
         }
     }
