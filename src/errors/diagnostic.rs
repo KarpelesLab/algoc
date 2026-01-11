@@ -2,8 +2,8 @@
 //!
 //! Provides colorful, user-friendly error messages with source context.
 
-use ariadne::{Color, Label, Report, ReportKind, Source};
 use crate::errors::AlgocError;
+use ariadne::{Color, Label, Report, ReportKind, Source};
 
 /// Print an error with source context
 pub fn print_error(source: &str, filename: &str, error: &AlgocError) {
@@ -21,8 +21,13 @@ pub fn print_error(source: &str, filename: &str, error: &AlgocError) {
 
     let span_range = span.map(|s| s.start..s.end).unwrap_or(0..0);
 
-    let mut report = Report::build(ReportKind::Error, span_range.clone())
-        .with_message(kind);
+    let header = if filename.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{} in {}", kind, filename)
+    };
+
+    let mut report = Report::build(ReportKind::Error, span_range.clone()).with_message(header);
 
     if let Some(s) = span {
         report = report.with_label(
@@ -39,14 +44,14 @@ pub fn print_error(source: &str, filename: &str, error: &AlgocError) {
 }
 
 /// Print multiple errors
-pub fn print_errors(source: &str, _filename: &str, errors: &[AlgocError]) {
+pub fn print_errors(source: &str, filename: &str, errors: &[AlgocError]) {
     for error in errors {
-        print_error(source, "", error);
+        print_error(source, filename, error);
     }
 }
 
 /// Format an error as a string (for testing)
-pub fn format_error(source: &str, _filename: &str, error: &AlgocError) -> String {
+pub fn format_error(source: &str, filename: &str, error: &AlgocError) -> String {
     let (message, span, kind) = match error {
         AlgocError::Lexer { message, span } => (message.as_str(), Some(*span), "Lexer error"),
         AlgocError::Parser { message, span } => (message.as_str(), Some(*span), "Parser error"),
@@ -59,8 +64,13 @@ pub fn format_error(source: &str, _filename: &str, error: &AlgocError) -> String
     let mut output = Vec::new();
     let span_range = span.map(|s| s.start..s.end).unwrap_or(0..0);
 
-    let mut report = Report::build(ReportKind::Error, span_range.clone())
-        .with_message(kind);
+    let header = if filename.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{} in {}", kind, filename)
+    };
+
+    let mut report = Report::build(ReportKind::Error, span_range.clone()).with_message(header);
 
     if let Some(s) = span {
         report = report.with_label(
@@ -76,39 +86,4 @@ pub fn format_error(source: &str, _filename: &str, error: &AlgocError) -> String
         .expect("failed to write error report");
 
     String::from_utf8(output).expect("error report should be valid UTF-8")
-}
-
-/// Get the line and column for a byte offset
-pub fn offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 1;
-
-    for (i, c) in source.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-
-    (line, col)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_offset_to_line_col() {
-        let source = "line1\nline2\nline3";
-
-        assert_eq!(offset_to_line_col(source, 0), (1, 1));
-        assert_eq!(offset_to_line_col(source, 5), (1, 6));
-        assert_eq!(offset_to_line_col(source, 6), (2, 1));
-        assert_eq!(offset_to_line_col(source, 12), (3, 1));
-    }
 }

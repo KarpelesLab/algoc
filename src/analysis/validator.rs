@@ -3,7 +3,7 @@
 //! Checks semantic rules that aren't covered by type checking.
 
 use crate::errors::{AlgocError, AlgocResult, SourceSpan};
-use crate::parser::{Ast, Item, ItemKind, Stmt, StmtKind, Block};
+use crate::parser::{Ast, Block, Item, ItemKind, Stmt, StmtKind};
 
 /// Semantic validator
 pub struct Validator {
@@ -98,7 +98,11 @@ impl Validator {
                 self.validate_block(body);
                 self.loop_depth -= 1;
             }
-            StmtKind::If { then_block, else_block, .. } => {
+            StmtKind::If {
+                then_block,
+                else_block,
+                ..
+            } => {
                 self.validate_block(then_block);
                 if let Some(else_block) = else_block {
                     self.validate_block(else_block);
@@ -107,11 +111,11 @@ impl Validator {
             StmtKind::Block(block) => {
                 self.validate_block(block);
             }
-            StmtKind::Let { .. } |
-            StmtKind::Expr(_) |
-            StmtKind::Assign { .. } |
-            StmtKind::CompoundAssign { .. } |
-            StmtKind::Return(_) => {
+            StmtKind::Let { .. }
+            | StmtKind::Expr(_)
+            | StmtKind::Assign { .. }
+            | StmtKind::CompoundAssign { .. }
+            | StmtKind::Return(_) => {
                 // These don't need special validation
             }
         }

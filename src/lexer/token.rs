@@ -102,7 +102,7 @@ pub enum Keyword {
 
 impl Keyword {
     /// Try to parse a string as a keyword
-    pub fn from_str(s: &str) -> Option<Keyword> {
+    pub fn parse(s: &str) -> Option<Keyword> {
         match s {
             // Declarations
             "use" => Some(Keyword::Use),

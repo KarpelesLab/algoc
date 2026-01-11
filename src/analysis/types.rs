@@ -35,12 +35,20 @@ impl Type {
 
     /// Create an integer type with native endianness
     pub fn int(bits: u32, signed: bool) -> Self {
-        Self::new(TypeKind::Int { bits, signed, endian: Endianness::Native })
+        Self::new(TypeKind::Int {
+            bits,
+            signed,
+            endian: Endianness::Native,
+        })
     }
 
     /// Create an integer type with specific endianness
     pub fn int_endian(bits: u32, signed: bool, endian: Endianness) -> Self {
-        Self::new(TypeKind::Int { bits, signed, endian })
+        Self::new(TypeKind::Int {
+            bits,
+            signed,
+            endian,
+        })
     }
 
     /// Create a boolean type
@@ -205,8 +213,18 @@ impl Type {
         // Also allow unsigned to unsigned and signed to signed regardless of size for literals
         // Different endianness is allowed (implicit conversion will be generated)
         match (&self.kind, &other.kind) {
-            (TypeKind::Int { bits: from_bits, signed: from_signed, .. },
-             TypeKind::Int { bits: to_bits, signed: to_signed, .. }) => {
+            (
+                TypeKind::Int {
+                    bits: from_bits,
+                    signed: from_signed,
+                    ..
+                },
+                TypeKind::Int {
+                    bits: to_bits,
+                    signed: to_signed,
+                    ..
+                },
+            ) => {
                 // Same size and signedness with different endianness is ok
                 if from_bits == to_bits && from_signed == to_signed {
                     return true;
@@ -223,43 +241,75 @@ impl Type {
             }
             // Allow slice to be assigned where reference to fixed-size array is expected
             // (runtime bounds checking will be done in generated code)
-            (TypeKind::Slice { element: from_elem },
-             TypeKind::Ref { inner, mutable: false }) => {
-                if let TypeKind::Array { element: to_elem, .. } = &inner.kind {
+            (
+                TypeKind::Slice { element: from_elem },
+                TypeKind::Ref {
+                    inner,
+                    mutable: false,
+                },
+            ) => {
+                if let TypeKind::Array {
+                    element: to_elem, ..
+                } = &inner.kind
+                {
                     from_elem.is_assignable_to(to_elem)
                 } else {
                     false
                 }
             }
             // Allow &[T; N] to be passed where &[T] (slice) is expected
-            (TypeKind::Ref { inner, mutable: _ },
-             TypeKind::Slice { element: to_elem }) => {
-                if let TypeKind::Array { element: from_elem, .. } = &inner.kind {
+            (TypeKind::Ref { inner, mutable: _ }, TypeKind::Slice { element: to_elem }) => {
+                if let TypeKind::Array {
+                    element: from_elem, ..
+                } = &inner.kind
+                {
                     from_elem.is_assignable_to(to_elem)
                 } else {
                     false
                 }
             }
             // Allow &[T] (reference to slice) to be passed as &[T; N]
-            (TypeKind::Ref { inner: from_inner, mutable: from_mut },
-             TypeKind::Ref { inner: to_inner, mutable: to_mut }) => {
+            (
+                TypeKind::Ref {
+                    inner: from_inner,
+                    mutable: from_mut,
+                },
+                TypeKind::Ref {
+                    inner: to_inner,
+                    mutable: to_mut,
+                },
+            ) => {
                 // Mutability: &T can become &T, &mut T can become &T or &mut T
                 if *to_mut && !from_mut {
                     return false; // Can't convert immutable to mutable
                 }
                 // Check if from is slice and to is array with compatible element types
-                if let TypeKind::Slice { element: from_elem } = &from_inner.kind {
-                    if let TypeKind::Array { element: to_elem, .. } = &to_inner.kind {
-                        return from_elem.is_assignable_to(to_elem);
-                    }
+                if let TypeKind::Slice { element: from_elem } = &from_inner.kind
+                    && let TypeKind::Array {
+                        element: to_elem, ..
+                    } = &to_inner.kind
+                {
+                    return from_elem.is_assignable_to(to_elem);
                 }
                 from_inner.is_assignable_to(to_inner)
             }
             // Allow arrays and slices with compatible element types to be compared
-            (TypeKind::Array { element: arr_elem, .. }, TypeKind::Slice { element: slice_elem }) |
-            (TypeKind::Slice { element: slice_elem }, TypeKind::Array { element: arr_elem, .. }) => {
-                arr_elem.is_assignable_to(slice_elem) || slice_elem.is_assignable_to(arr_elem)
-            }
+            (
+                TypeKind::Array {
+                    element: arr_elem, ..
+                },
+                TypeKind::Slice {
+                    element: slice_elem,
+                },
+            )
+            | (
+                TypeKind::Slice {
+                    element: slice_elem,
+                },
+                TypeKind::Array {
+                    element: arr_elem, ..
+                },
+            ) => arr_elem.is_assignable_to(slice_elem) || slice_elem.is_assignable_to(arr_elem),
             _ => false,
         }
     }
@@ -274,7 +324,11 @@ impl Type {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
     /// Integer type with bit width, signedness, and endianness
-    Int { bits: u32, signed: bool, endian: Endianness },
+    Int {
+        bits: u32,
+        signed: bool,
+        endian: Endianness,
+    },
     /// Boolean type
     Bool,
     /// Unit type (void, no value)
@@ -305,7 +359,11 @@ pub enum TypeKind {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            TypeKind::Int { bits, signed, endian } => {
+            TypeKind::Int {
+                bits,
+                signed,
+                endian,
+            } => {
                 let prefix = if *signed { "i" } else { "u" };
                 let suffix = match endian {
                     Endianness::Native => "",
@@ -336,7 +394,10 @@ impl fmt::Display for Type {
             TypeKind::Enum { name } => write!(f, "{}", name),
             TypeKind::Reader => write!(f, "Reader"),
             TypeKind::Writer => write!(f, "Writer"),
-            TypeKind::Function { params, return_type } => {
+            TypeKind::Function {
+                params,
+                return_type,
+            } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {
@@ -390,44 +451,5 @@ impl TypeError {
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.message)
-    }
-}
-
-/// Predefined types for convenience
-pub mod primitives {
-    use super::*;
-
-    pub fn u8() -> Type {
-        Type::int(8, false)
-    }
-    pub fn u16() -> Type {
-        Type::int(16, false)
-    }
-    pub fn u32() -> Type {
-        Type::int(32, false)
-    }
-    pub fn u64() -> Type {
-        Type::int(64, false)
-    }
-    pub fn u128() -> Type {
-        Type::int(128, false)
-    }
-    pub fn i8() -> Type {
-        Type::int(8, true)
-    }
-    pub fn i16() -> Type {
-        Type::int(16, true)
-    }
-    pub fn i32() -> Type {
-        Type::int(32, true)
-    }
-    pub fn i64() -> Type {
-        Type::int(64, true)
-    }
-    pub fn i128() -> Type {
-        Type::int(128, true)
-    }
-    pub fn bool() -> Type {
-        Type::bool()
     }
 }

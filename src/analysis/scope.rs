@@ -2,9 +2,9 @@
 //!
 //! Manages the mapping from names to their definitions.
 
-use std::collections::HashMap;
-use crate::errors::SourceSpan;
 use super::types::Type;
+use crate::errors::SourceSpan;
+use std::collections::HashMap;
 
 /// A scope containing symbol definitions
 #[derive(Debug, Clone)]
@@ -33,7 +33,10 @@ impl Scope {
     /// Define a symbol in this scope
     pub fn define(&mut self, name: String, symbol: Symbol) -> Result<(), String> {
         if self.symbols.contains_key(&name) {
-            return Err(format!("symbol '{}' is already defined in this scope", name));
+            return Err(format!(
+                "symbol '{}' is already defined in this scope",
+                name
+            ));
         }
         self.symbols.insert(name, symbol);
         Ok(())
@@ -284,7 +287,11 @@ pub struct EnumVariantDef {
 
 impl EnumVariantDef {
     pub fn new(name: String, data_types: Vec<Type>, span: SourceSpan) -> Self {
-        Self { name, data_types, span }
+        Self {
+            name,
+            data_types,
+            span,
+        }
     }
 }
 
@@ -319,17 +326,23 @@ impl ScopeStack {
 
     /// Get the current (innermost) scope mutably
     pub fn current_mut(&mut self) -> &mut Scope {
-        self.scopes.last_mut().expect("scope stack should never be empty")
+        self.scopes
+            .last_mut()
+            .expect("scope stack should never be empty")
     }
 
     /// Get the global (outermost) scope
     pub fn global(&self) -> &Scope {
-        self.scopes.first().expect("scope stack should never be empty")
+        self.scopes
+            .first()
+            .expect("scope stack should never be empty")
     }
 
     /// Get the global scope mutably
     pub fn global_mut(&mut self) -> &mut Scope {
-        self.scopes.first_mut().expect("scope stack should never be empty")
+        self.scopes
+            .first_mut()
+            .expect("scope stack should never be empty")
     }
 
     /// Define a symbol in the current scope

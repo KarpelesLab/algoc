@@ -2,8 +2,8 @@
 //!
 //! Converts source code into a stream of tokens.
 
+use super::token::{Keyword, Token, TokenKind};
 use crate::errors::SourceSpan;
-use super::token::{Token, TokenKind, Keyword};
 
 /// The lexer/scanner for AlgoC source code
 pub struct Lexer<'src> {
@@ -150,7 +150,10 @@ impl<'src> Lexer<'src> {
     }
 
     fn scan_hex_number(&mut self) -> Token {
-        while self.peek().is_some_and(|c| c.is_ascii_hexdigit() || c == '_') {
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_hexdigit() || c == '_')
+        {
             self.advance();
         }
 
@@ -163,7 +166,10 @@ impl<'src> Lexer<'src> {
     }
 
     fn scan_binary_number(&mut self) -> Token {
-        while self.peek().is_some_and(|c| c == '0' || c == '1' || c == '_') {
+        while self
+            .peek()
+            .is_some_and(|c| c == '0' || c == '1' || c == '_')
+        {
             self.advance();
         }
 
@@ -232,23 +238,22 @@ impl<'src> Lexer<'src> {
                         // Hex escape: \xNN
                         let mut hex = String::new();
                         for _ in 0..2 {
-                            if let Some(h) = self.peek() {
-                                if h.is_ascii_hexdigit() {
-                                    hex.push(h);
-                                    self.advance();
-                                }
+                            if let Some(h) = self.peek()
+                                && h.is_ascii_hexdigit()
+                            {
+                                hex.push(h);
+                                self.advance();
                             }
                         }
-                        if hex.len() == 2 {
-                            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                                value.push(byte as char);
-                            }
+                        if hex.len() == 2
+                            && let Ok(byte) = u8::from_str_radix(&hex, 16)
+                        {
+                            value.push(byte as char);
                         }
                     }
                     _ => {
-                        return self.make_token(TokenKind::Error(
-                            "invalid escape sequence".to_string(),
-                        ));
+                        return self
+                            .make_token(TokenKind::Error("invalid escape sequence".to_string()));
                     }
                 }
             } else if c == '\n' {
@@ -265,14 +270,17 @@ impl<'src> Lexer<'src> {
 
     /// Scan an identifier or keyword
     fn scan_identifier(&mut self) -> Token {
-        while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             self.advance();
         }
 
         let text = self.current_lexeme();
 
         // Check if it's a keyword
-        if let Some(kw) = Keyword::from_str(text) {
+        if let Some(kw) = Keyword::parse(text) {
             self.make_token(TokenKind::Keyword(kw))
         } else {
             self.make_token(TokenKind::Ident(text.to_string()))
@@ -666,16 +674,14 @@ mod tests {
 
     #[test]
     fn test_sample_code() {
-        let tokens = lex(
-            r#"
+        let tokens = lex(r#"
             fn compress(state: &mut State, block: &[u8; 64]) {
                 let w: u32[64];
                 for i in 0..16 {
                     w[i] = read_u32_be(block, i * 4);
                 }
             }
-            "#,
-        );
+            "#);
 
         // Just verify it doesn't crash and produces expected structure
         assert!(tokens.len() > 20);

@@ -3,14 +3,14 @@
 //! Generates JavaScript code from the analyzed AST.
 //! Uses TypedArrays for byte buffers and handles bitwise operations.
 
-use std::collections::{HashSet, HashMap};
+use super::CodeGenerator;
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
-    Ast, Item, ItemKind, Function, Stmt, StmtKind, Expr, ExprKind,
-    BinaryOp, UnaryOp, BuiltinFunc, Block, Type as ParserType,
+    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
+    Type as ParserType, UnaryOp,
 };
-use super::CodeGenerator;
+use std::collections::{HashMap, HashSet};
 
 /// Struct field info for code generation
 #[derive(Clone)]
@@ -90,38 +90,6 @@ impl JavaScriptGenerator {
 
     fn dedent(&mut self) {
         self.indent = self.indent.saturating_sub(1);
-    }
-
-    /// Check if an expression is likely an array type (used for comparison)
-    fn is_array_like_expr(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            // These builtin expressions produce arrays
-            ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
-            // Array literals
-            ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
-            // Slice expressions produce array views
-            ExprKind::Slice { .. } => true,
-            // References to arrays are still arrays
-            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
-                self.is_array_like_expr(inner)
-            }
-            // Parenthesized expressions
-            ExprKind::Paren(inner) => self.is_array_like_expr(inner),
-            // Builtins - only Assert remains and it doesn't return an array
-            ExprKind::Builtin { .. } => false,
-            // Index into array returns element, not array
-            ExprKind::Index { .. } => false,
-            // Field access - we don't have type info, so assume primitive (not array)
-            // For array field comparisons, users should use constant_time_eq explicitly
-            ExprKind::Field { .. } => false,
-            // Identifiers - we don't have type info, but commonly arrays are compared
-            // We'll assume identifiers being compared are arrays if the other side is
-            ExprKind::Ident(_) => false, // Will be caught if other side is array-like
-            // Function calls could return arrays
-            ExprKind::Call { .. } => false, // Can't know without type info
-            // Other expressions
-            _ => false,
-        }
     }
 
     /// Generate the runtime helper functions
@@ -310,7 +278,9 @@ impl JavaScriptGenerator {
         // write_bytes - copy byte slice/array
         self.writeln("write_bytes(data) {");
         self.indent();
-        self.writeln("if (this.pos + data.length > this.data.length) throw new Error('Buffer overflow');");
+        self.writeln(
+            "if (this.pos + data.length > this.data.length) throw new Error('Buffer overflow');",
+        );
         self.writeln("this.data.set(data, this.pos);");
         self.writeln("this.pos += data.length;");
         self.dedent();
@@ -379,9 +349,7 @@ impl JavaScriptGenerator {
         self.bigint_vars.clear();
 
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
-        let params: Vec<String> = func.params.iter()
-            .map(|p| p.name.name.clone())
-            .collect();
+        let params: Vec<String> = func.params.iter().map(|p| p.name.name.clone()).collect();
 
         // Track BigInt parameters
         for param in &func.params {
@@ -390,7 +358,11 @@ impl JavaScriptGenerator {
             }
         }
 
-        self.writeln(&format!("function {}({}) {{", mangled_name, params.join(", ")));
+        self.writeln(&format!(
+            "function {}({}) {{",
+            mangled_name,
+            params.join(", ")
+        ));
         self.indent();
         self.generate_block(&func.body);
         self.dedent();
@@ -468,26 +440,31 @@ impl JavaScriptGenerator {
             let comma = if i < e.variants.len() - 1 { "," } else { "" };
             match &variant.data {
                 crate::parser::EnumVariantData::Unit => {
-                    self.writeln(&format!("{}: {{ tag: \"{}\" }}{}",
-                        variant.name.name, variant.name.name, comma));
+                    self.writeln(&format!(
+                        "{}: {{ tag: \"{}\" }}{}",
+                        variant.name.name, variant.name.name, comma
+                    ));
                 }
                 crate::parser::EnumVariantData::Tuple(types) => {
                     // Generate a factory function: Rgb: (v0, v1, v2) => ({ tag: "Rgb", v0, v1, v2 })
                     let params: Vec<String> = (0..types.len()).map(|i| format!("v{}", i)).collect();
                     let params_str = params.join(", ");
-                    self.writeln(&format!("{}: ({}) => ({{ tag: \"{}\", {} }}){}",
-                        variant.name.name, params_str, variant.name.name, params_str, comma));
+                    self.writeln(&format!(
+                        "{}: ({}) => ({{ tag: \"{}\", {} }}){}",
+                        variant.name.name, params_str, variant.name.name, params_str, comma
+                    ));
                 }
                 crate::parser::EnumVariantData::Struct(fields) => {
                     // Generate a factory function with named fields
                     let params: Vec<&str> = fields.iter().map(|f| f.name.name.as_str()).collect();
                     let params_str = params.join(", ");
-                    let fields_str: Vec<String> = fields.iter()
-                        .map(|f| f.name.name.clone())
-                        .collect();
+                    let fields_str: Vec<String> =
+                        fields.iter().map(|f| f.name.name.clone()).collect();
                     let fields_obj = fields_str.join(", ");
-                    self.writeln(&format!("{}: ({{ {} }}) => ({{ tag: \"{}\", {} }}){}",
-                        variant.name.name, params_str, variant.name.name, fields_obj, comma));
+                    self.writeln(&format!(
+                        "{}: ({{ {} }}) => ({{ tag: \"{}\", {} }}){}",
+                        variant.name.name, params_str, variant.name.name, fields_obj, comma
+                    ));
                 }
             }
         }
@@ -500,28 +477,27 @@ impl JavaScriptGenerator {
         match &ty.kind {
             crate::parser::TypeKind::Primitive(p) => {
                 let native = p.to_native();
-                if matches!(native,
-                    crate::parser::PrimitiveType::U64 | crate::parser::PrimitiveType::I64 |
-                    crate::parser::PrimitiveType::U128 | crate::parser::PrimitiveType::I128
+                if matches!(
+                    native,
+                    crate::parser::PrimitiveType::U64
+                        | crate::parser::PrimitiveType::I64
+                        | crate::parser::PrimitiveType::U128
+                        | crate::parser::PrimitiveType::I128
                 ) {
                     "BigInt(0)".to_string()
                 } else {
                     "0".to_string()
                 }
             }
-            crate::parser::TypeKind::Array { element, size } => {
-                match &element.kind {
-                    crate::parser::TypeKind::Primitive(p) => {
-                        match p {
-                            crate::parser::PrimitiveType::U8 => format!("new Uint8Array({})", size),
-                            crate::parser::PrimitiveType::U16 => format!("new Uint16Array({})", size),
-                            crate::parser::PrimitiveType::U32 => format!("new Uint32Array({})", size),
-                            _ => format!("new Array({}).fill(0)", size),
-                        }
-                    }
+            crate::parser::TypeKind::Array { element, size } => match &element.kind {
+                crate::parser::TypeKind::Primitive(p) => match p {
+                    crate::parser::PrimitiveType::U8 => format!("new Uint8Array({})", size),
+                    crate::parser::PrimitiveType::U16 => format!("new Uint16Array({})", size),
+                    crate::parser::PrimitiveType::U32 => format!("new Uint32Array({})", size),
                     _ => format!("new Array({}).fill(0)", size),
-                }
-            }
+                },
+                _ => format!("new Array({}).fill(0)", size),
+            },
             crate::parser::TypeKind::Named(ident) => {
                 // Struct type - call factory function
                 format!("create_{}()", ident.name)
@@ -587,17 +563,21 @@ impl JavaScriptGenerator {
             StmtKind::Let { name, ty, init, .. } => {
                 // Track if this variable holds a BigInt type
                 let type_is_bigint = self.is_bigint_type(ty.as_ref());
-                let init_is_bigint = init.as_ref().map(|e| self.expr_uses_bigint(e)).unwrap_or(false);
+                let init_is_bigint = init
+                    .as_ref()
+                    .map(|e| self.expr_uses_bigint(e))
+                    .unwrap_or(false);
                 let is_bigint_type = type_is_bigint || init_is_bigint;
                 if is_bigint_type {
                     self.bigint_vars.insert(name.name.clone());
                 }
 
                 // Track struct types for read/write generation
-                if let Some(ty) = ty {
-                    if let crate::parser::TypeKind::Named(type_ident) = &ty.kind {
-                        self.var_types.insert(name.name.clone(), type_ident.name.clone());
-                    }
+                if let Some(ty) = ty
+                    && let crate::parser::TypeKind::Named(type_ident) = &ty.kind
+                {
+                    self.var_types
+                        .insert(name.name.clone(), type_ident.name.clone());
                 }
 
                 self.write_indent();
@@ -630,52 +610,60 @@ impl JavaScriptGenerator {
             }
             StmtKind::Assign { target, value } => {
                 // Check for endian cast assignment: buf[0..4] as u32be = value
-                if let ExprKind::Cast { expr: inner, ty } = &target.kind {
-                    if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
-                        let endian = p.endianness();
-                        if endian != crate::parser::Endianness::Native {
-                            if let ExprKind::Slice { array, start, end, .. } = &inner.kind {
-                                // Generate: new DataView(slice.buffer, slice.byteOffset).setUint32(0, value, littleEndian)
-                                let little_endian = endian == crate::parser::Endianness::Little;
-                                let (setter, byte_count) = match p.to_native() {
-                                    crate::parser::PrimitiveType::U16 | crate::parser::PrimitiveType::I16 => ("setUint16", 2),
-                                    crate::parser::PrimitiveType::U32 | crate::parser::PrimitiveType::I32 => ("setUint32", 4),
-                                    crate::parser::PrimitiveType::U64 | crate::parser::PrimitiveType::I64 => ("setBigUint64", 8),
-                                    _ => ("setUint32", 4),
-                                };
-                                self.write_indent();
-                                self.write("(() => { const __s = ");
-                                self.generate_expr(array);
-                                self.write(".subarray(");
-                                // Array indices must be Numbers, not BigInt
-                                if self.expr_uses_bigint(start) {
-                                    self.write("Number(");
-                                    self.generate_expr(start);
-                                    self.write(")");
-                                } else {
-                                    self.generate_expr(start);
-                                }
-                                self.write(", ");
-                                if self.expr_uses_bigint(end) {
-                                    self.write("Number(");
-                                    self.generate_expr(end);
-                                    self.write(")");
-                                } else {
-                                    self.generate_expr(end);
-                                }
-                                self.write(&format!("); new DataView(__s.buffer, __s.byteOffset, {}).{}(0, ", byte_count, setter));
-                                if byte_count == 8 {
-                                    self.write("BigInt(");
-                                    self.generate_expr(value);
-                                    self.write(")");
-                                } else {
-                                    self.generate_expr(value);
-                                }
-                                self.write(&format!(", {}); }})()", little_endian));
-                                self.write(";\n");
-                                return;
-                            }
+                if let ExprKind::Cast { expr: inner, ty } = &target.kind
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    let endian = p.endianness();
+                    if endian != crate::parser::Endianness::Native
+                        && let ExprKind::Slice {
+                            array, start, end, ..
+                        } = &inner.kind
+                    {
+                        // Generate: new DataView(slice.buffer, slice.byteOffset).setUint32(0, value, littleEndian)
+                        let little_endian = endian == crate::parser::Endianness::Little;
+                        let (setter, byte_count) = match p.to_native() {
+                            crate::parser::PrimitiveType::U16
+                            | crate::parser::PrimitiveType::I16 => ("setUint16", 2),
+                            crate::parser::PrimitiveType::U32
+                            | crate::parser::PrimitiveType::I32 => ("setUint32", 4),
+                            crate::parser::PrimitiveType::U64
+                            | crate::parser::PrimitiveType::I64 => ("setBigUint64", 8),
+                            _ => ("setUint32", 4),
+                        };
+                        self.write_indent();
+                        self.write("(() => { const __s = ");
+                        self.generate_expr(array);
+                        self.write(".subarray(");
+                        // Array indices must be Numbers, not BigInt
+                        if self.expr_uses_bigint(start) {
+                            self.write("Number(");
+                            self.generate_expr(start);
+                            self.write(")");
+                        } else {
+                            self.generate_expr(start);
                         }
+                        self.write(", ");
+                        if self.expr_uses_bigint(end) {
+                            self.write("Number(");
+                            self.generate_expr(end);
+                            self.write(")");
+                        } else {
+                            self.generate_expr(end);
+                        }
+                        self.write(&format!(
+                            "); new DataView(__s.buffer, __s.byteOffset, {}).{}(0, ",
+                            byte_count, setter
+                        ));
+                        if byte_count == 8 {
+                            self.write("BigInt(");
+                            self.generate_expr(value);
+                            self.write(")");
+                        } else {
+                            self.generate_expr(value);
+                        }
+                        self.write(&format!(", {}); }})()", little_endian));
+                        self.write(";\n");
+                        return;
                     }
                 }
                 // Check if target is a BigInt field or variable
@@ -718,7 +706,11 @@ impl JavaScriptGenerator {
                 self.generate_expr(value);
                 self.write(";\n");
             }
-            StmtKind::If { condition, then_block, else_block } => {
+            StmtKind::If {
+                condition,
+                then_block,
+                else_block,
+            } => {
                 self.write_indent();
                 self.write("if (");
                 self.generate_expr(condition);
@@ -734,7 +726,13 @@ impl JavaScriptGenerator {
                 }
                 self.writeln("}");
             }
-            StmtKind::For { var, start, end, inclusive, body } => {
+            StmtKind::For {
+                var,
+                start,
+                end,
+                inclusive,
+                body,
+            } => {
                 // Check if bounds use BigInt - if so, convert to Number for the loop
                 let start_is_bigint = self.expr_uses_bigint(start);
                 let end_is_bigint = self.expr_uses_bigint(end);
@@ -748,7 +746,11 @@ impl JavaScriptGenerator {
                 } else {
                     self.generate_expr(start);
                 }
-                self.write(&format!("; {} {} ", var.name, if *inclusive { "<=" } else { "<" }));
+                self.write(&format!(
+                    "; {} {} ",
+                    var.name,
+                    if *inclusive { "<=" } else { "<" }
+                ));
                 if end_is_bigint {
                     self.write("Number(");
                     self.generate_expr(end);
@@ -828,14 +830,23 @@ impl JavaScriptGenerator {
             }
             ExprKind::String(s) => {
                 // Convert string to Uint8Array
-                self.write(&format!("new TextEncoder().encode(\"{}\")", escape_js_string(s)));
+                self.write(&format!(
+                    "new TextEncoder().encode(\"{}\")",
+                    escape_js_string(s)
+                ));
             }
             ExprKind::Bytes(s) => {
-                self.write(&format!("new TextEncoder().encode(\"{}\")", escape_js_string(s)));
+                self.write(&format!(
+                    "new TextEncoder().encode(\"{}\")",
+                    escape_js_string(s)
+                ));
             }
             ExprKind::Hex(h) => {
                 // Convert hex string to Uint8Array
-                self.write(&format!("Uint8Array.from('{}'.match(/.{{2}}/g).map(b => parseInt(b, 16)))", h));
+                self.write(&format!(
+                    "Uint8Array.from('{}'.match(/.{{2}}/g).map(b => parseInt(b, 16)))",
+                    h
+                ));
             }
             ExprKind::Ident(ident) => {
                 self.write(&ident.name);
@@ -843,8 +854,8 @@ impl JavaScriptGenerator {
             ExprKind::Binary { left, op, right } => {
                 // For array comparisons, use constant_time_eq instead of ===
                 if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
-                    let left_is_array = self.is_array_like_expr(left);
-                    let right_is_array = self.is_array_like_expr(right);
+                    let left_is_array = is_array_like_expr(left);
+                    let right_is_array = is_array_like_expr(right);
 
                     if left_is_array || right_is_array {
                         if matches!(op, BinaryOp::Ne) {
@@ -866,11 +877,18 @@ impl JavaScriptGenerator {
 
                 // For bitwise operations on 32-bit values, we need >>> 0 to ensure unsigned
                 // But not for BigInt operations (they don't support >>> with regular numbers)
-                let needs_unsigned = !uses_bigint && matches!(op,
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul |
-                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor |
-                    BinaryOp::Shl | BinaryOp::Shr
-                );
+                let needs_unsigned = !uses_bigint
+                    && matches!(
+                        op,
+                        BinaryOp::Add
+                            | BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::Shl
+                            | BinaryOp::Shr
+                    );
 
                 if needs_unsigned {
                     self.write("(");
@@ -880,11 +898,24 @@ impl JavaScriptGenerator {
                 // for arithmetic, bitwise, and comparison operations
                 // (Note: comparison operators like < > work across BigInt and Number,
                 // but === and !== require same types)
-                let needs_bigint_wrap = matches!(op,
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem |
-                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor |
-                    BinaryOp::Shl | BinaryOp::Shr |
-                    BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                let needs_bigint_wrap = matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Rem
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                        | BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
                 );
                 if uses_bigint && !left_uses_bigint && needs_bigint_wrap {
                     self.write("BigInt(");
@@ -956,7 +987,9 @@ impl JavaScriptGenerator {
                 }
                 self.write("]");
             }
-            ExprKind::Slice { array, start, end, .. } => {
+            ExprKind::Slice {
+                array, start, end, ..
+            } => {
                 self.generate_expr(array);
                 self.write(".subarray(");
                 // Array indices must be Numbers, not BigInt
@@ -983,18 +1016,18 @@ impl JavaScriptGenerator {
             }
             ExprKind::Call { func, args } => {
                 // Check for Reader/Writer constructor calls
-                if let ExprKind::Ident(ident) = &func.kind {
-                    if ident.name == "Reader" || ident.name == "Writer" {
-                        self.write(&format!("new {}(", ident.name));
-                        for (i, arg) in args.iter().enumerate() {
-                            if i > 0 {
-                                self.write(", ");
-                            }
-                            self.generate_expr(arg);
+                if let ExprKind::Ident(ident) = &func.kind
+                    && (ident.name == "Reader" || ident.name == "Writer")
+                {
+                    self.write(&format!("new {}(", ident.name));
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
                         }
-                        self.write(")");
-                        return;
+                        self.generate_expr(arg);
                     }
+                    self.write(")");
+                    return;
                 }
 
                 // Check for method calls like slice.len() or reader.read_u32()
@@ -1007,25 +1040,24 @@ impl JavaScriptGenerator {
                     }
 
                     // Handle reader.read(&mut struct) - expand to field reads
-                    if field.name == "read" && args.len() == 1 {
-                        if let ExprKind::MutRef(inner) = &args[0].kind {
-                            if let ExprKind::Ident(var_ident) = &inner.kind {
-                                if let Some(struct_name) = self.var_types.get(&var_ident.name).cloned() {
-                                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
-                                        self.write("(() => { ");
-                                        for field_info in &fields {
-                                            if let Some(read_method) = self.get_read_method_for_type(&field_info.ty) {
-                                                self.write(&format!("{}.{} = ", var_ident.name, field_info.name));
-                                                self.generate_expr(object);
-                                                self.write(&format!(".{}(); ", read_method));
-                                            }
-                                        }
-                                        self.write("})()");
-                                        return;
-                                    }
-                                }
+                    if field.name == "read"
+                        && args.len() == 1
+                        && let ExprKind::MutRef(inner) = &args[0].kind
+                        && let ExprKind::Ident(var_ident) = &inner.kind
+                        && let Some(struct_name) = self.var_types.get(&var_ident.name).cloned()
+                        && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
+                    {
+                        self.write("(() => { ");
+                        for field_info in &fields {
+                            if let Some(read_method) = self.get_read_method_for_type(&field_info.ty)
+                            {
+                                self.write(&format!("{}.{} = ", var_ident.name, field_info.name));
+                                self.generate_expr(object);
+                                self.write(&format!(".{}(); ", read_method));
                             }
                         }
+                        self.write("})()");
+                        return;
                     }
 
                     // Handle writer.write(&struct) - expand to field writes
@@ -1035,33 +1067,60 @@ impl JavaScriptGenerator {
                             ExprKind::Ref(inner) | ExprKind::MutRef(inner) => Some(inner.as_ref()),
                             _ => None,
                         };
-                        if let Some(inner) = inner_expr {
-                            if let ExprKind::Ident(var_ident) = &inner.kind {
-                                if let Some(struct_name) = self.var_types.get(&var_ident.name).cloned() {
-                                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
-                                        self.write("(() => { ");
-                                        for field_info in &fields {
-                                            if let Some(write_method) = self.get_write_method_for_type(&field_info.ty) {
-                                                self.generate_expr(object);
-                                                self.write(&format!(".{}({}.{}); ", write_method, var_ident.name, field_info.name));
-                                            }
-                                        }
-                                        self.write("})()");
-                                        return;
-                                    }
+                        if let Some(inner) = inner_expr
+                            && let ExprKind::Ident(var_ident) = &inner.kind
+                            && let Some(struct_name) = self.var_types.get(&var_ident.name).cloned()
+                            && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
+                        {
+                            self.write("(() => { ");
+                            for field_info in &fields {
+                                if let Some(write_method) =
+                                    self.get_write_method_for_type(&field_info.ty)
+                                {
+                                    self.generate_expr(object);
+                                    self.write(&format!(
+                                        ".{}({}.{}); ",
+                                        write_method, var_ident.name, field_info.name
+                                    ));
                                 }
                             }
+                            self.write("})()");
+                            return;
                         }
                     }
 
                     // Reader/Writer method calls - pass through directly
-                    let reader_methods = ["read_u8", "read_u16", "read_u16be", "read_u16le",
-                        "read_u32", "read_u32be", "read_u32le", "read_u64", "read_u64be", "read_u64le",
-                        "read_bytes", "read_chunk", "eof"];
-                    let writer_methods = ["write_u8", "write_u16", "write_u16be", "write_u16le",
-                        "write_u32", "write_u32be", "write_u32le", "write_u64", "write_u64be", "write_u64le",
-                        "write_bytes"];
-                    if reader_methods.contains(&field.name.as_str()) || writer_methods.contains(&field.name.as_str()) {
+                    let reader_methods = [
+                        "read_u8",
+                        "read_u16",
+                        "read_u16be",
+                        "read_u16le",
+                        "read_u32",
+                        "read_u32be",
+                        "read_u32le",
+                        "read_u64",
+                        "read_u64be",
+                        "read_u64le",
+                        "read_bytes",
+                        "read_chunk",
+                        "eof",
+                    ];
+                    let writer_methods = [
+                        "write_u8",
+                        "write_u16",
+                        "write_u16be",
+                        "write_u16le",
+                        "write_u32",
+                        "write_u32be",
+                        "write_u32le",
+                        "write_u64",
+                        "write_u64be",
+                        "write_u64le",
+                        "write_bytes",
+                    ];
+                    if reader_methods.contains(&field.name.as_str())
+                        || writer_methods.contains(&field.name.as_str())
+                    {
                         self.generate_expr(object);
                         self.write(&format!(".{}(", field.name));
                         for (i, arg) in args.iter().enumerate() {
@@ -1075,22 +1134,20 @@ impl JavaScriptGenerator {
                     }
 
                     // Check for struct method calls (object.method(args))
-                    if let ExprKind::Ident(obj_ident) = &object.kind {
-                        if let Some(struct_name) = self.var_types.get(&obj_ident.name).cloned() {
-                            if let Some(methods) = self.struct_methods.get(&struct_name).cloned() {
-                                if let Some(mangled_name) = methods.get(&field.name) {
-                                    // Generate: StructName__method(object, args...)
-                                    self.write(&format!("{}(", mangled_name));
-                                    self.generate_expr(object);
-                                    for arg in args {
-                                        self.write(", ");
-                                        self.generate_expr(arg);
-                                    }
-                                    self.write(")");
-                                    return;
-                                }
-                            }
+                    if let ExprKind::Ident(obj_ident) = &object.kind
+                        && let Some(struct_name) = self.var_types.get(&obj_ident.name).cloned()
+                        && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
+                        && let Some(mangled_name) = methods.get(&field.name)
+                    {
+                        // Generate: StructName__method(object, args...)
+                        self.write(&format!("{}(", mangled_name));
+                        self.generate_expr(object);
+                        for arg in args {
+                            self.write(", ");
+                            self.generate_expr(arg);
                         }
+                        self.write(")");
+                        return;
                     }
                 }
 
@@ -1120,7 +1177,9 @@ impl JavaScriptGenerator {
                             false
                         }
                     });
-                    let all_ints = elements.iter().all(|e| matches!(e.kind, ExprKind::Integer(_)));
+                    let all_ints = elements
+                        .iter()
+                        .all(|e| matches!(e.kind, ExprKind::Integer(_)));
 
                     if all_bytes {
                         // Use Uint8Array for byte arrays
@@ -1145,7 +1204,7 @@ impl JavaScriptGenerator {
             }
             ExprKind::ArrayRepeat { value, count } => {
                 // Check if value is a byte type - use Uint8Array
-                let is_byte = self.is_byte_value(value);
+                let is_byte = is_byte_value(value);
 
                 // Check if count is a literal (no need for Number() conversion)
                 let count_is_literal = matches!(count.kind, ExprKind::Integer(_));
@@ -1218,7 +1277,11 @@ impl JavaScriptGenerator {
                 }
                 self.write(" }");
             }
-            ExprKind::Conditional { condition, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 // JavaScript ternary: condition ? then : else
                 self.write("(");
                 self.generate_expr(condition);
@@ -1228,7 +1291,11 @@ impl JavaScriptGenerator {
                 self.generate_expr(else_expr);
                 self.write(")");
             }
-            ExprKind::EnumVariant { enum_name, variant_name, args } => {
+            ExprKind::EnumVariant {
+                enum_name,
+                variant_name,
+                args,
+            } => {
                 // Generate: EnumName.VariantName or EnumName.VariantName(args...)
                 if args.is_empty() {
                     self.write(&format!("{}.{}", enum_name.name, variant_name.name));
@@ -1261,7 +1328,12 @@ impl JavaScriptGenerator {
                 self.generate_expr(expr);
                 self.write(")");
             }
-            ExprKind::MethodCall { receiver, mangled_name, args, .. } => {
+            ExprKind::MethodCall {
+                receiver,
+                mangled_name,
+                args,
+                ..
+            } => {
                 // Generate: mangled_name(receiver, args...)
                 self.write(&format!("{}(", mangled_name));
                 self.generate_expr(receiver);
@@ -1287,11 +1359,21 @@ impl JavaScriptGenerator {
             }
             PatternKind::Ident(ident) => {
                 // Binding pattern - always matches, bind the value
-                self.write(&format!("if ((() => {{ let {} = {}; return true; }})())", ident.name, scrutinee));
+                self.write(&format!(
+                    "if ((() => {{ let {} = {}; return true; }})())",
+                    ident.name, scrutinee
+                ));
             }
-            PatternKind::EnumVariant { enum_name: _, variant_name, bindings } => {
+            PatternKind::EnumVariant {
+                enum_name: _,
+                variant_name,
+                bindings,
+            } => {
                 // Check the tag matches
-                self.write(&format!("if ({}.tag === \"{}\"", scrutinee, variant_name.name));
+                self.write(&format!(
+                    "if ({}.tag === \"{}\"",
+                    scrutinee, variant_name.name
+                ));
                 // If there are bindings, we need to extract them
                 if !bindings.is_empty() {
                     // For now, just check the tag; bindings are handled in the body
@@ -1347,7 +1429,7 @@ impl JavaScriptGenerator {
 
     /// Get the Reader method name for reading a field type
     fn get_read_method_for_type(&self, ty: &ParserType) -> Option<String> {
-        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+        use crate::parser::{Endianness, PrimitiveType, TypeKind};
 
         match &ty.kind {
             TypeKind::Primitive(p) => {
@@ -1372,7 +1454,7 @@ impl JavaScriptGenerator {
 
     /// Get the Writer method name for writing a field type
     fn get_write_method_for_type(&self, ty: &ParserType) -> Option<String> {
-        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+        use crate::parser::{Endianness, PrimitiveType, TypeKind};
 
         match &ty.kind {
             TypeKind::Primitive(p) => {
@@ -1395,38 +1477,6 @@ impl JavaScriptGenerator {
         }
     }
 
-    /// Generate code to read a struct from a Reader
-    fn generate_struct_read(&mut self, reader_expr: &Expr, struct_expr: &Expr, struct_name: &str) {
-        if let Some(fields) = self.struct_defs.get(struct_name).cloned() {
-            for field in &fields {
-                if let Some(read_method) = self.get_read_method_for_type(&field.ty) {
-                    self.write_indent();
-                    self.generate_expr(struct_expr);
-                    self.write(&format!(".{} = ", field.name));
-                    self.generate_expr(reader_expr);
-                    self.write(&format!(".{}();\n", read_method));
-                }
-                // TODO: Handle nested structs, arrays, etc.
-            }
-        }
-    }
-
-    /// Generate code to write a struct to a Writer
-    fn generate_struct_write(&mut self, writer_expr: &Expr, struct_expr: &Expr, struct_name: &str) {
-        if let Some(fields) = self.struct_defs.get(struct_name).cloned() {
-            for field in &fields {
-                if let Some(write_method) = self.get_write_method_for_type(&field.ty) {
-                    self.write_indent();
-                    self.generate_expr(writer_expr);
-                    self.write(&format!(".{}(", write_method));
-                    self.generate_expr(struct_expr);
-                    self.write(&format!(".{});\n", field.name));
-                }
-                // TODO: Handle nested structs, arrays, etc.
-            }
-        }
-    }
-
     fn generate_builtin(&mut self, name: BuiltinFunc, args: &[Expr]) {
         match name {
             BuiltinFunc::Assert => {
@@ -1438,7 +1488,7 @@ impl JavaScriptGenerator {
     }
 
     fn generate_cast(&mut self, expr: &Expr, ty: &crate::parser::Type) {
-        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+        use crate::parser::{Endianness, PrimitiveType, TypeKind};
 
         // Check for endian byte conversions (byte slice/array to integer)
         // e.g., buf[0..4] as u32be -> use DataView
@@ -1450,7 +1500,7 @@ impl JavaScriptGenerator {
                 let native = p.to_native();
 
                 // Check if source is a slice/array (byte conversion)
-                if self.is_byte_sequence_expr(expr) {
+                if is_byte_sequence_expr(expr) {
                     // Use DataView to read the bytes
                     // new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(0, littleEndian)
                     let getter = match native {
@@ -1515,51 +1565,62 @@ impl JavaScriptGenerator {
 
         // Check for integer to byte array cast
         // e.g., value as u8[4] -> create Uint8Array and use DataView
-        if let TypeKind::Array { element, size } = &ty.kind {
-            if let TypeKind::Primitive(PrimitiveType::U8) = &element.kind {
-                // Get the endianness from the source expression
-                let (little_endian, bits) = self.get_expr_endianness_info(expr);
+        if let TypeKind::Array { element, size } = &ty.kind
+            && let TypeKind::Primitive(PrimitiveType::U8) = &element.kind
+        {
+            // Get the endianness from the source expression
+            let (little_endian, bits) = self.get_expr_endianness_info(expr);
 
-                if bits <= 64 {
-                    let setter = match bits {
-                        16 => "setUint16",
-                        64 => "setBigUint64",
-                        _ => "setUint32",
-                    };
+            if bits <= 64 {
+                let setter = match bits {
+                    16 => "setUint16",
+                    64 => "setBigUint64",
+                    _ => "setUint32",
+                };
 
-                    self.write(&format!("(() => {{ const __a = new Uint8Array({}); new DataView(__a.buffer).{}(0, ", size, setter));
-                    if bits == 64 {
-                        self.write("BigInt(");
-                        self.generate_expr(expr);
-                        self.write(")");
-                    } else {
-                        self.generate_expr(expr);
-                    }
-                    self.write(&format!(", {}); return __a; }})()", little_endian));
-                    return;
+                self.write(&format!(
+                    "(() => {{ const __a = new Uint8Array({}); new DataView(__a.buffer).{}(0, ",
+                    size, setter
+                ));
+                if bits == 64 {
+                    self.write("BigInt(");
+                    self.generate_expr(expr);
+                    self.write(")");
                 } else {
-                    // 128-bit - manual byte manipulation
-                    let inner_expr = if let ExprKind::Cast { expr: inner, .. } = &expr.kind {
-                        inner
-                    } else {
-                        expr
-                    };
-
-                    self.write(&format!("(() => {{ const __v = BigInt("));
-                    self.generate_expr(inner_expr);
-                    self.write("); const __a = new Uint8Array(16);");
-                    if little_endian {
-                        for i in 0..16 {
-                            self.write(&format!(" __a[{}] = Number((__v >> {}n) & 0xFFn);", i, i * 8));
-                        }
-                    } else {
-                        for i in 0..16 {
-                            self.write(&format!(" __a[{}] = Number((__v >> {}n) & 0xFFn);", i, (15 - i) * 8));
-                        }
-                    }
-                    self.write(" return __a; })()");
-                    return;
+                    self.generate_expr(expr);
                 }
+                self.write(&format!(", {}); return __a; }})()", little_endian));
+                return;
+            } else {
+                // 128-bit - manual byte manipulation
+                let inner_expr = if let ExprKind::Cast { expr: inner, .. } = &expr.kind {
+                    inner
+                } else {
+                    expr
+                };
+
+                self.write("(() => { const __v = BigInt(");
+                self.generate_expr(inner_expr);
+                self.write("); const __a = new Uint8Array(16);");
+                if little_endian {
+                    for i in 0..16 {
+                        self.write(&format!(
+                            " __a[{}] = Number((__v >> {}n) & 0xFFn);",
+                            i,
+                            i * 8
+                        ));
+                    }
+                } else {
+                    for i in 0..16 {
+                        self.write(&format!(
+                            " __a[{}] = Number((__v >> {}n) & 0xFFn);",
+                            i,
+                            (15 - i) * 8
+                        ));
+                    }
+                }
+                self.write(" return __a; })()");
+                return;
             }
         }
 
@@ -1630,59 +1691,37 @@ impl JavaScriptGenerator {
         }
     }
 
-    /// Check if an expression produces a byte sequence (for from_bytes conversion)
-    fn is_byte_sequence_expr(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Slice { .. } => true,
-            ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
-            ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
-            ExprKind::Index { .. } => false, // Single element
-            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Paren(inner) => {
-                self.is_byte_sequence_expr(inner)
-            }
-            ExprKind::Ident(_) => true, // Assume variables can be byte sequences
-            ExprKind::Field { .. } => true,
-            _ => false,
-        }
-    }
-
-    /// Check if an expression is a plain integer literal (not already BigInt)
-    fn is_plain_integer_literal(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Integer(n) => *n <= (1u128 << 53), // Small integers are plain
-            ExprKind::Paren(inner) => self.is_plain_integer_literal(inner),
-            _ => false,
-        }
-    }
-
     /// Check if a type annotation indicates a BigInt type (u64/i64/u128/i128)
     fn is_bigint_type(&self, ty: Option<&crate::parser::Type>) -> bool {
-        use crate::parser::{TypeKind, PrimitiveType};
+        use crate::parser::{PrimitiveType, TypeKind};
 
-        if let Some(ty) = ty {
-            if let TypeKind::Primitive(p) = &ty.kind {
-                let native = p.to_native();
-                return matches!(native,
-                    PrimitiveType::U64 | PrimitiveType::I64 |
-                    PrimitiveType::U128 | PrimitiveType::I128
-                );
-            }
+        if let Some(ty) = ty
+            && let TypeKind::Primitive(p) = &ty.kind
+        {
+            let native = p.to_native();
+            return matches!(
+                native,
+                PrimitiveType::U64 | PrimitiveType::I64 | PrimitiveType::U128 | PrimitiveType::I128
+            );
         }
         false
     }
 
     /// Check if an expression involves BigInt (u64/i64/u128/i128 types)
     fn expr_uses_bigint(&self, expr: &Expr) -> bool {
-        use crate::parser::{TypeKind, PrimitiveType};
+        use crate::parser::{PrimitiveType, TypeKind};
 
         match &expr.kind {
             // Cast determines the output type - it's BigInt only if target is BigInt
             ExprKind::Cast { ty, expr: _ } => {
                 if let TypeKind::Primitive(p) = &ty.kind {
                     let native = p.to_native();
-                    matches!(native,
-                        PrimitiveType::U64 | PrimitiveType::I64 |
-                        PrimitiveType::U128 | PrimitiveType::I128
+                    matches!(
+                        native,
+                        PrimitiveType::U64
+                            | PrimitiveType::I64
+                            | PrimitiveType::U128
+                            | PrimitiveType::I128
                     )
                 } else {
                     false
@@ -1693,16 +1732,18 @@ impl JavaScriptGenerator {
                 self.expr_uses_bigint(left) || self.expr_uses_bigint(right)
             }
             // Unary operations propagate BigInt
-            ExprKind::Unary { operand, .. } => {
-                self.expr_uses_bigint(operand)
-            }
+            ExprKind::Unary { operand, .. } => self.expr_uses_bigint(operand),
             // Parentheses propagate BigInt
             ExprKind::Paren(inner) => self.expr_uses_bigint(inner),
             // Conditional expressions - check all branches
-            ExprKind::Conditional { condition, then_expr, else_expr } => {
-                self.expr_uses_bigint(condition) ||
-                self.expr_uses_bigint(then_expr) ||
-                self.expr_uses_bigint(else_expr)
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_uses_bigint(condition)
+                    || self.expr_uses_bigint(then_expr)
+                    || self.expr_uses_bigint(else_expr)
             }
             // Large integer literals become BigInt
             ExprKind::Integer(n) => *n > (1u128 << 53),
@@ -1714,11 +1755,11 @@ impl JavaScriptGenerator {
                     self.bigint_funcs.contains(&ident.name)
                 } else if let ExprKind::Field { object, field } = &func.kind {
                     // Check for method calls (object.method())
-                    if let ExprKind::Ident(obj_ident) = &object.kind {
-                        if let Some(struct_name) = self.var_types.get(&obj_ident.name) {
-                            let mangled_name = format!("{}__{}", struct_name, field.name);
-                            return self.bigint_funcs.contains(&mangled_name);
-                        }
+                    if let ExprKind::Ident(obj_ident) = &object.kind
+                        && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    {
+                        let mangled_name = format!("{}__{}", struct_name, field.name);
+                        return self.bigint_funcs.contains(&mangled_name);
                     }
                     false
                 } else {
@@ -1726,59 +1767,101 @@ impl JavaScriptGenerator {
                 }
             }
             // Check MethodCall expressions directly
-            ExprKind::MethodCall { mangled_name, .. } => {
-                self.bigint_funcs.contains(mangled_name)
-            }
+            ExprKind::MethodCall { mangled_name, .. } => self.bigint_funcs.contains(mangled_name),
             // Check field access - if field is BigInt type
-            ExprKind::Field { field, .. } => {
-                self.bigint_fields.contains(&field.name)
-            }
+            ExprKind::Field { field, .. } => self.bigint_fields.contains(&field.name),
             // Everything else is not BigInt
-            _ => false,
-        }
-    }
-
-    /// Check if an expression produces a byte value (u8)
-    fn is_byte_value(&self, expr: &Expr) -> bool {
-        use crate::parser::{TypeKind, PrimitiveType};
-
-        match &expr.kind {
-            // Small integer literals are bytes
-            ExprKind::Integer(n) => *n <= 255,
-            // Cast to u8 produces a byte
-            ExprKind::Cast { ty, .. } => {
-                if let TypeKind::Primitive(p) = &ty.kind {
-                    matches!(p.to_native(), PrimitiveType::U8)
-                } else {
-                    false
-                }
-            }
-            // Parentheses propagate byte type
-            ExprKind::Paren(inner) => self.is_byte_value(inner),
             _ => false,
         }
     }
 
     /// Get endianness info from an expression (little_endian, bits)
     fn get_expr_endianness_info(&self, expr: &Expr) -> (bool, u32) {
-        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+        use crate::parser::{Endianness, PrimitiveType, TypeKind};
 
-        if let ExprKind::Cast { ty, .. } = &expr.kind {
-            if let TypeKind::Primitive(p) = &ty.kind {
-                let endian = p.endianness();
-                let little = endian == Endianness::Little;
-                let bits = match p.to_native() {
-                    PrimitiveType::U16 | PrimitiveType::I16 => 16,
-                    PrimitiveType::U32 | PrimitiveType::I32 => 32,
-                    PrimitiveType::U64 | PrimitiveType::I64 => 64,
-                    PrimitiveType::U128 | PrimitiveType::I128 => 128,
-                    _ => 32,
-                };
-                return (little, bits);
-            }
+        if let ExprKind::Cast { ty, .. } = &expr.kind
+            && let TypeKind::Primitive(p) = &ty.kind
+        {
+            let endian = p.endianness();
+            let little = endian == Endianness::Little;
+            let bits = match p.to_native() {
+                PrimitiveType::U16 | PrimitiveType::I16 => 16,
+                PrimitiveType::U32 | PrimitiveType::I32 => 32,
+                PrimitiveType::U64 | PrimitiveType::I64 => 64,
+                PrimitiveType::U128 | PrimitiveType::I128 => 128,
+                _ => 32,
+            };
+            return (little, bits);
         }
         // Default to little endian, 32 bits
         (true, 32)
+    }
+}
+
+/// Check if an expression is likely an array type (used for comparison)
+fn is_array_like_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        // These builtin expressions produce arrays
+        ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
+        // Array literals
+        ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
+        // Slice expressions produce array views
+        ExprKind::Slice { .. } => true,
+        // References to arrays are still arrays
+        ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
+            is_array_like_expr(inner)
+        }
+        // Parenthesized expressions
+        ExprKind::Paren(inner) => is_array_like_expr(inner),
+        // Builtins - only Assert remains and it doesn't return an array
+        ExprKind::Builtin { .. } => false,
+        // Index into array returns element, not array
+        ExprKind::Index { .. } => false,
+        // Field access - we don't have type info, so assume primitive (not array)
+        ExprKind::Field { .. } => false,
+        // Identifiers - we don't have type info
+        ExprKind::Ident(_) => false,
+        // Function calls could return arrays
+        ExprKind::Call { .. } => false,
+        // Other expressions
+        _ => false,
+    }
+}
+
+/// Check if an expression produces a byte sequence (for from_bytes conversion)
+fn is_byte_sequence_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Slice { .. } => true,
+        ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
+        ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
+        ExprKind::Index { .. } => false, // Single element
+        ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Paren(inner) => {
+            is_byte_sequence_expr(inner)
+        }
+        ExprKind::Ident(_) => true, // Assume variables can be byte sequences
+        ExprKind::Field { .. } => true,
+        _ => false,
+    }
+}
+
+/// Check if an expression produces a byte value (u8)
+fn is_byte_value(expr: &Expr) -> bool {
+    use crate::parser::{PrimitiveType, TypeKind};
+
+    match &expr.kind {
+        // Small integer literals are bytes
+        ExprKind::Integer(n) => *n <= 255,
+        // Cast to u8 produces a byte
+        ExprKind::Cast { ty, .. } => {
+            if let TypeKind::Primitive(p) = &ty.kind {
+                matches!(p.to_native(), PrimitiveType::U8)
+            } else {
+                false
+            }
+        }
+        // Parentheses propagate byte type
+        ExprKind::Paren(inner) => is_byte_value(inner),
+        _ => false,
     }
 }
 
@@ -1799,18 +1882,22 @@ impl CodeGenerator for JavaScriptGenerator {
         for item in &ast.ast.items {
             match &item.kind {
                 ItemKind::Function(func) => {
-                    if let Some(ret_ty) = &func.return_type {
-                        if self.is_bigint_type(Some(ret_ty)) {
-                            self.bigint_funcs.insert(func.name.name.clone());
-                        }
+                    if let Some(ret_ty) = &func.return_type
+                        && self.is_bigint_type(Some(ret_ty))
+                    {
+                        self.bigint_funcs.insert(func.name.name.clone());
                     }
                 }
                 ItemKind::Struct(s) => {
                     // Collect struct field info for read/write generation
-                    let fields: Vec<StructFieldInfo> = s.fields.iter().map(|f| StructFieldInfo {
-                        name: f.name.name.clone(),
-                        ty: f.ty.clone(),
-                    }).collect();
+                    let fields: Vec<StructFieldInfo> = s
+                        .fields
+                        .iter()
+                        .map(|f| StructFieldInfo {
+                            name: f.name.name.clone(),
+                            ty: f.ty.clone(),
+                        })
+                        .collect();
                     self.struct_defs.insert(s.name.name.clone(), fields);
 
                     for field in &s.fields {
@@ -1822,10 +1909,14 @@ impl CodeGenerator for JavaScriptGenerator {
                 }
                 ItemKind::Layout(l) => {
                     // Also collect layout field info
-                    let fields: Vec<StructFieldInfo> = l.fields.iter().map(|f| StructFieldInfo {
-                        name: f.name.name.clone(),
-                        ty: f.ty.clone(),
-                    }).collect();
+                    let fields: Vec<StructFieldInfo> = l
+                        .fields
+                        .iter()
+                        .map(|f| StructFieldInfo {
+                            name: f.name.name.clone(),
+                            ty: f.ty.clone(),
+                        })
+                        .collect();
                     self.struct_defs.insert(l.name.name.clone(), fields);
 
                     for field in &l.fields {
@@ -1841,13 +1932,15 @@ impl CodeGenerator for JavaScriptGenerator {
                         let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
                         methods.insert(method.name.name.clone(), mangled);
                         // Also track if method returns BigInt
-                        if let Some(ret_ty) = &method.return_type {
-                            if self.is_bigint_type(Some(ret_ty)) {
-                                self.bigint_funcs.insert(format!("{}__{}", impl_def.target.name, method.name.name));
-                            }
+                        if let Some(ret_ty) = &method.return_type
+                            && self.is_bigint_type(Some(ret_ty))
+                        {
+                            self.bigint_funcs
+                                .insert(format!("{}__{}", impl_def.target.name, method.name.name));
                         }
                     }
-                    self.struct_methods.insert(impl_def.target.name.clone(), methods);
+                    self.struct_methods
+                        .insert(impl_def.target.name.clone(), methods);
                 }
                 _ => {}
             }
@@ -1866,7 +1959,10 @@ impl CodeGenerator for JavaScriptGenerator {
         self.generate_ast(&ast.ast);
 
         // Collect test names for the runner
-        let test_names: Vec<_> = ast.ast.items.iter()
+        let test_names: Vec<_> = ast
+            .ast
+            .items
+            .iter()
             .filter_map(|item| {
                 if let ItemKind::Test(t) = &item.kind {
                     Some(t.name.name.clone())

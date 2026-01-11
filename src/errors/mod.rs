@@ -9,7 +9,7 @@ use std::fmt;
 use std::ops::Range;
 use thiserror::Error;
 
-pub use diagnostic::{print_error, print_errors, format_error};
+pub use diagnostic::{format_error, print_error, print_errors};
 
 /// A span in the source code, represented as a byte range
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,28 +69,16 @@ impl From<SourceSpan> for Range<usize> {
 #[derive(Error, Debug)]
 pub enum AlgocError {
     #[error("Lexer error: {message}")]
-    Lexer {
-        message: String,
-        span: SourceSpan,
-    },
+    Lexer { message: String, span: SourceSpan },
 
     #[error("Parser error: {message}")]
-    Parser {
-        message: String,
-        span: SourceSpan,
-    },
+    Parser { message: String, span: SourceSpan },
 
     #[error("Type error: {message}")]
-    Type {
-        message: String,
-        span: SourceSpan,
-    },
+    Type { message: String, span: SourceSpan },
 
     #[error("Semantic error: {message}")]
-    Semantic {
-        message: String,
-        span: SourceSpan,
-    },
+    Semantic { message: String, span: SourceSpan },
 
     #[error("Code generation error: {message}")]
     CodeGen {

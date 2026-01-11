@@ -2,10 +2,12 @@
 //!
 //! Verifies that all expressions have compatible types.
 
-use crate::errors::{AlgocError, AlgocResult, SourceSpan};
-use crate::parser::{self, Ast, Item, ItemKind, BinaryOp, UnaryOp, BuiltinFunc, PrimitiveType as AstPrimitive};
 use super::scope::{Scope, ScopeStack, Symbol, SymbolKind};
-use super::types::{Type, TypeKind, Endianness};
+use super::types::{Endianness, Type, TypeKind};
+use crate::errors::{AlgocError, AlgocResult, SourceSpan};
+use crate::parser::{
+    self, Ast, BinaryOp, BuiltinFunc, Item, ItemKind, PrimitiveType as AstPrimitive, UnaryOp,
+};
 
 /// Type checker that verifies type correctness
 pub struct TypeChecker<'a> {
@@ -60,25 +62,17 @@ impl<'a> TypeChecker<'a> {
             parser::TypeKind::Array { element, size } => {
                 Type::array(self.ast_to_type(element), *size)
             }
-            parser::TypeKind::Slice { element } => {
-                Type::slice(self.ast_to_type(element))
-            }
+            parser::TypeKind::Slice { element } => Type::slice(self.ast_to_type(element)),
             parser::TypeKind::ArrayRef { element, size } => {
                 Type::reference(Type::array(self.ast_to_type(element), *size), false)
             }
-            parser::TypeKind::MutRef(inner) => {
-                Type::reference(self.ast_to_type(inner), true)
-            }
-            parser::TypeKind::Ref(inner) => {
-                Type::reference(self.ast_to_type(inner), false)
-            }
-            parser::TypeKind::Named(ident) => {
-                match ident.name.as_str() {
-                    "Reader" => Type::reader(),
-                    "Writer" => Type::writer(),
-                    _ => Type::struct_type(ident.name.clone()),
-                }
-            }
+            parser::TypeKind::MutRef(inner) => Type::reference(self.ast_to_type(inner), true),
+            parser::TypeKind::Ref(inner) => Type::reference(self.ast_to_type(inner), false),
+            parser::TypeKind::Named(ident) => match ident.name.as_str() {
+                "Reader" => Type::reader(),
+                "Writer" => Type::writer(),
+                _ => Type::struct_type(ident.name.clone()),
+            },
         }
     }
 
@@ -121,7 +115,9 @@ impl<'a> TypeChecker<'a> {
     fn check_item(&mut self, item: &Item) {
         match &item.kind {
             ItemKind::Function(func) => {
-                let return_type = func.return_type.as_ref()
+                let return_type = func
+                    .return_type
+                    .as_ref()
                     .map(|t| self.ast_to_type(t))
                     .unwrap_or_else(Type::unit);
                 self.current_return_type = Some(return_type);
@@ -145,8 +141,10 @@ impl<'a> TypeChecker<'a> {
                 let actual_ty = self.infer_expr_with_hint(&c.value, Some(&declared_ty));
                 if !actual_ty.is_compatible_with(&declared_ty) {
                     self.error(
-                        format!("constant '{}' has type {}, but initializer has type {}",
-                            c.name.name, declared_ty, actual_ty),
+                        format!(
+                            "constant '{}' has type {}, but initializer has type {}",
+                            c.name.name, declared_ty, actual_ty
+                        ),
                         c.value.span,
                     );
                 }
@@ -168,7 +166,9 @@ impl<'a> TypeChecker<'a> {
             ItemKind::Impl(impl_def) => {
                 // Check each method in the impl block
                 for method in &impl_def.methods {
-                    let return_type = method.return_type.as_ref()
+                    let return_type = method
+                        .return_type
+                        .as_ref()
                         .map(|t| self.ast_to_type(t))
                         .unwrap_or_else(Type::unit);
                     self.current_return_type = Some(return_type);
@@ -201,19 +201,24 @@ impl<'a> TypeChecker<'a> {
     /// Check a statement
     fn check_stmt(&mut self, stmt: &parser::Stmt) {
         match &stmt.kind {
-            parser::StmtKind::Let { name, ty, init, mutable } => {
+            parser::StmtKind::Let {
+                name,
+                ty,
+                init,
+                mutable,
+            } => {
                 let declared_ty = ty.as_ref().map(|t| self.ast_to_type(t));
 
                 if let Some(init) = init {
                     // Use declared type as hint for type inference
                     let init_ty = self.infer_expr_with_hint(init, declared_ty.as_ref());
-                    if let Some(ref declared) = declared_ty {
-                        if !init_ty.is_compatible_with(declared) {
-                            self.error(
-                                format!("cannot assign {} to variable of type {}", init_ty, declared),
-                                init.span,
-                            );
-                        }
+                    if let Some(ref declared) = declared_ty
+                        && !init_ty.is_compatible_with(declared)
+                    {
+                        self.error(
+                            format!("cannot assign {} to variable of type {}", init_ty, declared),
+                            init.span,
+                        );
                     }
                 }
 
@@ -221,7 +226,10 @@ impl<'a> TypeChecker<'a> {
                     if let Some(init) = init {
                         self.infer_expr(init)
                     } else {
-                        self.error("variable without type annotation must have initializer", name.span);
+                        self.error(
+                            "variable without type annotation must have initializer",
+                            name.span,
+                        );
                         Type::error()
                     }
                 });
@@ -247,21 +255,32 @@ impl<'a> TypeChecker<'a> {
                 // Check that target is assignable (lvalue)
                 self.check_assignable(target);
             }
-            parser::StmtKind::CompoundAssign { target, op, value } => {
+            parser::StmtKind::CompoundAssign {
+                target,
+                op: _,
+                value,
+            } => {
                 let target_ty = self.infer_expr(target);
                 let value_ty = self.infer_expr(value);
 
                 // For compound assignment, both sides should be numeric
                 if !target_ty.is_integer() || !value_ty.is_integer() {
                     self.error(
-                        format!("compound assignment requires integer types, got {} and {}", target_ty, value_ty),
+                        format!(
+                            "compound assignment requires integer types, got {} and {}",
+                            target_ty, value_ty
+                        ),
                         stmt.span,
                     );
                 }
 
                 self.check_assignable(target);
             }
-            parser::StmtKind::If { condition, then_block, else_block } => {
+            parser::StmtKind::If {
+                condition,
+                then_block,
+                else_block,
+            } => {
                 let cond_ty = self.infer_expr(condition);
                 if !cond_ty.is_bool() && !cond_ty.is_error() {
                     self.error(
@@ -280,7 +299,13 @@ impl<'a> TypeChecker<'a> {
                     self.scopes.pop();
                 }
             }
-            parser::StmtKind::For { var, start, end, body, .. } => {
+            parser::StmtKind::For {
+                var,
+                start,
+                end,
+                body,
+                ..
+            } => {
                 let start_ty = self.infer_expr(start);
                 let end_ty = self.infer_expr(end);
 
@@ -299,7 +324,11 @@ impl<'a> TypeChecker<'a> {
 
                 self.scopes.push();
                 // Loop variable has same type as range bounds (default to u64)
-                let var_ty = if start_ty.is_integer() { start_ty } else { Type::int(64, false) };
+                let var_ty = if start_ty.is_integer() {
+                    start_ty
+                } else {
+                    Type::int(64, false)
+                };
                 let symbol = Symbol::variable(var_ty, var.span, false);
                 let _ = self.scopes.define(var.name.clone(), symbol);
                 self.check_block(body);
@@ -327,17 +356,21 @@ impl<'a> TypeChecker<'a> {
                 // Could check if we're inside a loop, but that's a semantic check
             }
             parser::StmtKind::Return(expr) => {
-                let return_ty = expr.as_ref()
+                let return_ty = expr
+                    .as_ref()
                     .map(|e| self.infer_expr(e))
                     .unwrap_or_else(Type::unit);
 
-                if let Some(ref expected) = self.current_return_type {
-                    if !return_ty.is_compatible_with(expected) {
-                        self.error(
-                            format!("return type mismatch: expected {}, got {}", expected, return_ty),
-                            stmt.span,
-                        );
-                    }
+                if let Some(ref expected) = self.current_return_type
+                    && !return_ty.is_compatible_with(expected)
+                {
+                    self.error(
+                        format!(
+                            "return type mismatch: expected {}, got {}",
+                            expected, return_ty
+                        ),
+                        stmt.span,
+                    );
                 }
             }
             parser::StmtKind::Block(block) => {
@@ -352,13 +385,14 @@ impl<'a> TypeChecker<'a> {
     fn check_assignable(&mut self, expr: &parser::Expr) {
         match &expr.kind {
             parser::ExprKind::Ident(ident) => {
-                if let Some(sym) = self.scopes.lookup(&ident.name) {
-                    if !sym.mutable && sym.kind == SymbolKind::Variable {
-                        self.error(
-                            format!("cannot assign to immutable variable '{}'", ident.name),
-                            ident.span,
-                        );
-                    }
+                if let Some(sym) = self.scopes.lookup(&ident.name)
+                    && !sym.mutable
+                    && sym.kind == SymbolKind::Variable
+                {
+                    self.error(
+                        format!("cannot assign to immutable variable '{}'", ident.name),
+                        ident.span,
+                    );
                 }
             }
             parser::ExprKind::Index { array, .. } => {
@@ -410,9 +444,15 @@ impl<'a> TypeChecker<'a> {
             parser::PatternKind::Literal(lit_expr) => {
                 // Check that the literal type matches expected
                 let lit_ty = self.infer_expr(lit_expr);
-                if !lit_ty.is_compatible_with(expected_ty) && !lit_ty.is_error() && !expected_ty.is_error() {
+                if !lit_ty.is_compatible_with(expected_ty)
+                    && !lit_ty.is_error()
+                    && !expected_ty.is_error()
+                {
                     self.error(
-                        format!("pattern type mismatch: expected {}, got {}", expected_ty, lit_ty),
+                        format!(
+                            "pattern type mismatch: expected {}, got {}",
+                            expected_ty, lit_ty
+                        ),
                         pattern.span,
                     );
                 }
@@ -422,12 +462,19 @@ impl<'a> TypeChecker<'a> {
                 let symbol = Symbol::variable(expected_ty.clone(), ident.span, false);
                 let _ = self.scopes.define(ident.name.clone(), symbol);
             }
-            parser::PatternKind::EnumVariant { enum_name, variant_name, bindings } => {
+            parser::PatternKind::EnumVariant {
+                enum_name,
+                variant_name,
+                bindings,
+            } => {
                 // Check that we're matching an enum type
                 if let TypeKind::Enum { name } = &expected_ty.kind {
                     if name != &enum_name.name {
                         self.error(
-                            format!("pattern matches enum '{}', but expected '{}'", enum_name.name, name),
+                            format!(
+                                "pattern matches enum '{}', but expected '{}'",
+                                enum_name.name, name
+                            ),
                             pattern.span,
                         );
                         return;
@@ -439,32 +486,41 @@ impl<'a> TypeChecker<'a> {
                             // Check binding count matches
                             if bindings.len() != variant_def.data_types.len() {
                                 self.error(
-                                    format!("pattern for '{}::{}' has {} bindings, expected {}",
-                                        enum_name.name, variant_name.name,
-                                        bindings.len(), variant_def.data_types.len()),
+                                    format!(
+                                        "pattern for '{}::{}' has {} bindings, expected {}",
+                                        enum_name.name,
+                                        variant_name.name,
+                                        bindings.len(),
+                                        variant_def.data_types.len()
+                                    ),
                                     pattern.span,
                                 );
                             } else {
                                 // Recursively check each binding pattern with the appropriate type
-                                for (binding, data_ty) in bindings.iter().zip(variant_def.data_types.iter()) {
+                                for (binding, data_ty) in
+                                    bindings.iter().zip(variant_def.data_types.iter())
+                                {
                                     self.check_pattern(binding, data_ty);
                                 }
                             }
                         } else {
                             self.error(
-                                format!("enum '{}' has no variant '{}'", enum_name.name, variant_name.name),
+                                format!(
+                                    "enum '{}' has no variant '{}'",
+                                    enum_name.name, variant_name.name
+                                ),
                                 variant_name.span,
                             );
                         }
                     } else {
-                        self.error(
-                            format!("unknown enum '{}'", enum_name.name),
-                            enum_name.span,
-                        );
+                        self.error(format!("unknown enum '{}'", enum_name.name), enum_name.span);
                     }
                 } else if !expected_ty.is_error() {
                     self.error(
-                        format!("cannot match enum pattern against non-enum type {}", expected_ty),
+                        format!(
+                            "cannot match enum pattern against non-enum type {}",
+                            expected_ty
+                        ),
                         pattern.span,
                     );
                 }
@@ -487,28 +543,37 @@ impl<'a> TypeChecker<'a> {
     /// Infer the type of an expression with an optional expected type hint
     fn infer_expr_with_hint(&mut self, expr: &parser::Expr, hint: Option<&Type>) -> Type {
         // Handle array literals specially when we have a type hint
-        if let parser::ExprKind::Array(elements) = &expr.kind {
-            if let Some(expected) = hint {
-                if let TypeKind::Array { element: expected_elem, size } = &expected.kind {
-                    // Use the expected element type for each element
-                    for elem in elements {
-                        let elem_ty = self.infer_expr_with_hint(elem, Some(expected_elem));
-                        if !elem_ty.is_compatible_with(expected_elem) {
-                            self.error(
-                                format!("array element type mismatch: expected {}, got {}", expected_elem, elem_ty),
-                                elem.span,
-                            );
-                        }
-                    }
-                    if elements.len() as u64 != *size {
-                        self.error(
-                            format!("array length mismatch: expected {}, got {}", size, elements.len()),
-                            expr.span,
-                        );
-                    }
-                    return expected.clone();
+        if let parser::ExprKind::Array(elements) = &expr.kind
+            && let Some(expected) = hint
+            && let TypeKind::Array {
+                element: expected_elem,
+                size,
+            } = &expected.kind
+        {
+            // Use the expected element type for each element
+            for elem in elements {
+                let elem_ty = self.infer_expr_with_hint(elem, Some(expected_elem));
+                if !elem_ty.is_compatible_with(expected_elem) {
+                    self.error(
+                        format!(
+                            "array element type mismatch: expected {}, got {}",
+                            expected_elem, elem_ty
+                        ),
+                        elem.span,
+                    );
                 }
             }
+            if elements.len() as u64 != *size {
+                self.error(
+                    format!(
+                        "array length mismatch: expected {}, got {}",
+                        size,
+                        elements.len()
+                    ),
+                    expr.span,
+                );
+            }
+            return expected.clone();
         }
 
         // Handle array repeat syntax with type hint
@@ -522,43 +587,48 @@ impl<'a> TypeChecker<'a> {
                 );
             }
 
-            if let Some(expected) = hint {
-                if let TypeKind::Array { element: expected_elem, size } = &expected.kind {
-                    let elem_ty = self.infer_expr_with_hint(value, Some(expected_elem));
-                    if !elem_ty.is_compatible_with(expected_elem) {
-                        self.error(
-                            format!("array element type mismatch: expected {}, got {}", expected_elem, elem_ty),
-                            value.span,
-                        );
-                    }
-                    // Only check size if count is a compile-time constant
-                    if let parser::ExprKind::Integer(n) = &count.kind {
-                        if *n as u64 != *size {
-                            self.error(
-                                format!("array length mismatch: expected {}, got {}", size, n),
-                                expr.span,
-                            );
-                        }
-                    }
-                    return expected.clone();
+            if let Some(expected) = hint
+                && let TypeKind::Array {
+                    element: expected_elem,
+                    size,
+                } = &expected.kind
+            {
+                let elem_ty = self.infer_expr_with_hint(value, Some(expected_elem));
+                if !elem_ty.is_compatible_with(expected_elem) {
+                    self.error(
+                        format!(
+                            "array element type mismatch: expected {}, got {}",
+                            expected_elem, elem_ty
+                        ),
+                        value.span,
+                    );
                 }
+                // Only check size if count is a compile-time constant
+                if let parser::ExprKind::Integer(n) = &count.kind
+                    && *n as u64 != *size
+                {
+                    self.error(
+                        format!("array length mismatch: expected {}, got {}", size, n),
+                        expr.span,
+                    );
+                }
+                return expected.clone();
             }
         }
 
         // Handle integer literals with type hint
-        if let parser::ExprKind::Integer(n) = &expr.kind {
-            if let Some(expected) = hint {
-                if let TypeKind::Int { bits, signed, .. } = &expected.kind {
-                    // Check that the value fits in the expected type
-                    let max_val = if *signed {
-                        (1u128 << (bits - 1)) - 1
-                    } else {
-                        (1u128 << bits) - 1
-                    };
-                    if *n <= max_val {
-                        return expected.clone();
-                    }
-                }
+        if let parser::ExprKind::Integer(n) = &expr.kind
+            && let Some(expected) = hint
+            && let TypeKind::Int { bits, signed, .. } = &expected.kind
+        {
+            // Check that the value fits in the expected type
+            let max_val = if *signed {
+                (1u128 << (bits - 1)) - 1
+            } else {
+                (1u128 << bits) - 1
+            };
+            if *n <= max_val {
+                return expected.clone();
             }
         }
 
@@ -643,25 +713,30 @@ impl<'a> TypeChecker<'a> {
                 if let Some(elem_ty) = array_ty.element_type() {
                     elem_ty.clone()
                 } else if !array_ty.is_error() {
-                    self.error(
-                        format!("cannot index into type {}", array_ty),
-                        array.span,
-                    );
+                    self.error(format!("cannot index into type {}", array_ty), array.span);
                     Type::error()
                 } else {
                     Type::error()
                 }
             }
-            parser::ExprKind::Slice { array, start, end, .. } => {
+            parser::ExprKind::Slice {
+                array, start, end, ..
+            } => {
                 let array_ty = self.infer_expr(array);
                 let start_ty = self.infer_expr(start);
                 let end_ty = self.infer_expr(end);
 
                 if !start_ty.is_integer() && !start_ty.is_error() {
-                    self.error(format!("slice start must be integer, got {}", start_ty), start.span);
+                    self.error(
+                        format!("slice start must be integer, got {}", start_ty),
+                        start.span,
+                    );
                 }
                 if !end_ty.is_integer() && !end_ty.is_error() {
-                    self.error(format!("slice end must be integer, got {}", end_ty), end.span);
+                    self.error(
+                        format!("slice end must be integer, got {}", end_ty),
+                        end.span,
+                    );
                 }
 
                 if let Some(elem_ty) = array_ty.element_type() {
@@ -718,12 +793,31 @@ impl<'a> TypeChecker<'a> {
                         } else {
                             let data_ty = self.infer_expr(&args[0]);
                             // Accept byte slices/arrays
-                            if let Some(elem) = self.get_element_type(&data_ty) {
-                                if !matches!(&elem.kind, TypeKind::Int { bits: 8, signed: false, .. }) {
-                                    self.error(format!("Reader() data must be byte slice/array, got {}", data_ty), args[0].span);
+                            if let Some(elem) = get_element_type(&data_ty) {
+                                if !matches!(
+                                    &elem.kind,
+                                    TypeKind::Int {
+                                        bits: 8,
+                                        signed: false,
+                                        ..
+                                    }
+                                ) {
+                                    self.error(
+                                        format!(
+                                            "Reader() data must be byte slice/array, got {}",
+                                            data_ty
+                                        ),
+                                        args[0].span,
+                                    );
                                 }
                             } else if !data_ty.is_error() {
-                                self.error(format!("Reader() data must be byte slice/array, got {}", data_ty), args[0].span);
+                                self.error(
+                                    format!(
+                                        "Reader() data must be byte slice/array, got {}",
+                                        data_ty
+                                    ),
+                                    args[0].span,
+                                );
                             }
                         }
                         return Type::reader();
@@ -734,12 +828,31 @@ impl<'a> TypeChecker<'a> {
                         } else {
                             let data_ty = self.infer_expr(&args[0]);
                             // Accept mutable byte slices/arrays
-                            if let Some(elem) = self.get_element_type(&data_ty) {
-                                if !matches!(&elem.kind, TypeKind::Int { bits: 8, signed: false, .. }) {
-                                    self.error(format!("Writer() data must be byte slice/array, got {}", data_ty), args[0].span);
+                            if let Some(elem) = get_element_type(&data_ty) {
+                                if !matches!(
+                                    &elem.kind,
+                                    TypeKind::Int {
+                                        bits: 8,
+                                        signed: false,
+                                        ..
+                                    }
+                                ) {
+                                    self.error(
+                                        format!(
+                                            "Writer() data must be byte slice/array, got {}",
+                                            data_ty
+                                        ),
+                                        args[0].span,
+                                    );
                                 }
                             } else if !data_ty.is_error() {
-                                self.error(format!("Writer() data must be byte slice/array, got {}", data_ty), args[0].span);
+                                self.error(
+                                    format!(
+                                        "Writer() data must be byte slice/array, got {}",
+                                        data_ty
+                                    ),
+                                    args[0].span,
+                                );
                             }
                         }
                         return Type::writer();
@@ -749,7 +862,9 @@ impl<'a> TypeChecker<'a> {
                 // Check for method calls (e.g., slice.len())
                 if let parser::ExprKind::Field { object, field } = &func.kind {
                     let object_ty = self.infer_expr(object);
-                    if let Some(result_ty) = self.check_method_call(&object_ty, &field.name, args, expr.span) {
+                    if let Some(result_ty) =
+                        self.check_method_call(&object_ty, &field.name, args, expr.span)
+                    {
                         return result_ty;
                     }
                 }
@@ -757,7 +872,10 @@ impl<'a> TypeChecker<'a> {
                 let func_ty = self.infer_expr(func);
 
                 match &func_ty.kind {
-                    TypeKind::Function { params, return_type } => {
+                    TypeKind::Function {
+                        params,
+                        return_type,
+                    } => {
                         if args.len() != params.len() {
                             self.error(
                                 format!("expected {} arguments, got {}", params.len(), args.len()),
@@ -769,7 +887,10 @@ impl<'a> TypeChecker<'a> {
                             let arg_ty = self.infer_expr(arg);
                             if !arg_ty.is_compatible_with(param_ty) {
                                 self.error(
-                                    format!("argument type mismatch: expected {}, got {}", param_ty, arg_ty),
+                                    format!(
+                                        "argument type mismatch: expected {}, got {}",
+                                        param_ty, arg_ty
+                                    ),
                                     arg.span,
                                 );
                             }
@@ -779,14 +900,15 @@ impl<'a> TypeChecker<'a> {
                     }
                     TypeKind::Error => Type::error(),
                     _ => {
-                        self.error(format!("cannot call non-function type {}", func_ty), expr.span);
+                        self.error(
+                            format!("cannot call non-function type {}", func_ty),
+                            expr.span,
+                        );
                         Type::error()
                     }
                 }
             }
-            parser::ExprKind::Builtin { name, args } => {
-                self.check_builtin(*name, args, expr.span)
-            }
+            parser::ExprKind::Builtin { name, args } => self.check_builtin(*name, args, expr.span),
             parser::ExprKind::Array(elements) => {
                 if elements.is_empty() {
                     self.error("cannot infer type of empty array literal", expr.span);
@@ -798,7 +920,10 @@ impl<'a> TypeChecker<'a> {
                     let ty = self.infer_expr(elem);
                     if !ty.is_compatible_with(&elem_ty) {
                         self.error(
-                            format!("array element type mismatch: expected {}, got {}", elem_ty, ty),
+                            format!(
+                                "array element type mismatch: expected {}, got {}",
+                                elem_ty, ty
+                            ),
                             elem.span,
                         );
                     }
@@ -855,10 +980,16 @@ impl<'a> TypeChecker<'a> {
                 let start_ty = self.infer_expr(start);
                 let end_ty = self.infer_expr(end);
                 if !start_ty.is_integer() && !start_ty.is_error() {
-                    self.error(format!("range start must be integer, got {}", start_ty), start.span);
+                    self.error(
+                        format!("range start must be integer, got {}", start_ty),
+                        start.span,
+                    );
                 }
                 if !end_ty.is_integer() && !end_ty.is_error() {
-                    self.error(format!("range end must be integer, got {}", end_ty), end.span);
+                    self.error(
+                        format!("range end must be integer, got {}", end_ty),
+                        end.span,
+                    );
                 }
                 // Range type - for now just return the start type
                 start_ty
@@ -882,14 +1013,19 @@ impl<'a> TypeChecker<'a> {
                             let value_ty = self.infer_expr(field_value);
                             if !value_ty.is_compatible_with(&field_def.ty) {
                                 self.error(
-                                    format!("field '{}' expects {}, got {}",
-                                        field_name.name, field_def.ty, value_ty),
+                                    format!(
+                                        "field '{}' expects {}, got {}",
+                                        field_name.name, field_def.ty, value_ty
+                                    ),
                                     field_value.span,
                                 );
                             }
                         } else {
                             self.error(
-                                format!("struct '{}' has no field '{}'", name.name, field_name.name),
+                                format!(
+                                    "struct '{}' has no field '{}'",
+                                    name.name, field_name.name
+                                ),
                                 field_name.span,
                             );
                         }
@@ -900,12 +1036,19 @@ impl<'a> TypeChecker<'a> {
                     Type::error()
                 }
             }
-            parser::ExprKind::Conditional { condition, then_expr, else_expr } => {
+            parser::ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 // Check condition is boolean
                 let cond_ty = self.infer_expr(condition);
                 if !cond_ty.is_bool() && !cond_ty.is_error() {
                     self.error(
-                        format!("conditional expression requires bool condition, got {}", cond_ty),
+                        format!(
+                            "conditional expression requires bool condition, got {}",
+                            cond_ty
+                        ),
                         condition.span,
                     );
                 }
@@ -923,8 +1066,10 @@ impl<'a> TypeChecker<'a> {
 
                 if !then_ty.is_compatible_with(&else_ty) {
                     self.error(
-                        format!("conditional branches have incompatible types: {} and {}",
-                            then_ty, else_ty),
+                        format!(
+                            "conditional branches have incompatible types: {} and {}",
+                            then_ty, else_ty
+                        ),
                         expr.span,
                     );
                     return Type::error();
@@ -933,7 +1078,11 @@ impl<'a> TypeChecker<'a> {
                 // Return the more specific type (or either if they're the same)
                 then_ty
             }
-            parser::ExprKind::EnumVariant { enum_name, variant_name, args } => {
+            parser::ExprKind::EnumVariant {
+                enum_name,
+                variant_name,
+                args,
+            } => {
                 // Look up the enum definition
                 if let Some(enum_def) = self.global_scope.get_enum(&enum_name.name) {
                     // Check that the variant exists
@@ -944,13 +1093,16 @@ impl<'a> TypeChecker<'a> {
 
                         if expected_count != actual_count {
                             self.error(
-                                format!("enum variant '{}::{}' expects {} arguments, got {}",
-                                    enum_name.name, variant_name.name, expected_count, actual_count),
+                                format!(
+                                    "enum variant '{}::{}' expects {} arguments, got {}",
+                                    enum_name.name, variant_name.name, expected_count, actual_count
+                                ),
                                 expr.span,
                             );
                         } else {
                             // Check each argument type
-                            for (arg, expected_ty) in args.iter().zip(variant_def.data_types.iter()) {
+                            for (arg, expected_ty) in args.iter().zip(variant_def.data_types.iter())
+                            {
                                 let arg_ty = self.infer_expr(arg);
                                 if !arg_ty.is_compatible_with(expected_ty) {
                                     self.error(
@@ -963,19 +1115,24 @@ impl<'a> TypeChecker<'a> {
                         }
                     } else {
                         self.error(
-                            format!("enum '{}' has no variant '{}'", enum_name.name, variant_name.name),
+                            format!(
+                                "enum '{}' has no variant '{}'",
+                                enum_name.name, variant_name.name
+                            ),
                             variant_name.span,
                         );
                     }
                 } else {
-                    self.error(
-                        format!("unknown enum '{}'", enum_name.name),
-                        enum_name.span,
-                    );
+                    self.error(format!("unknown enum '{}'", enum_name.name), enum_name.span);
                 }
-                Type::new(TypeKind::Enum { name: enum_name.name.clone() })
+                Type::new(TypeKind::Enum {
+                    name: enum_name.name.clone(),
+                })
             }
-            parser::ExprKind::Match { expr: match_expr, arms } => {
+            parser::ExprKind::Match {
+                expr: match_expr,
+                arms,
+            } => {
                 // Infer the type of the matched expression
                 let match_ty = self.infer_expr(match_expr);
 
@@ -999,7 +1156,10 @@ impl<'a> TypeChecker<'a> {
                     if let Some(ref expected) = result_ty {
                         if !arm_ty.is_compatible_with(expected) {
                             self.error(
-                                format!("match arm has incompatible type: expected {}, got {}", expected, arm_ty),
+                                format!(
+                                    "match arm has incompatible type: expected {}, got {}",
+                                    expected, arm_ty
+                                ),
                                 arm.span,
                             );
                         }
@@ -1009,7 +1169,12 @@ impl<'a> TypeChecker<'a> {
                 }
                 result_ty.unwrap_or_else(Type::error)
             }
-            parser::ExprKind::MethodCall { receiver, args, mangled_name, .. } => {
+            parser::ExprKind::MethodCall {
+                receiver,
+                args,
+                mangled_name,
+                ..
+            } => {
                 // Check receiver and all arguments
                 self.infer_expr(receiver);
                 for arg in args {
@@ -1017,10 +1182,10 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 // Look up the method function type
-                if let Some(sym) = self.global_scope.get(&mangled_name) {
-                    if let TypeKind::Function { return_type, .. } = &sym.ty.kind {
-                        return (**return_type).clone();
-                    }
+                if let Some(sym) = self.global_scope.get(mangled_name)
+                    && let TypeKind::Function { return_type, .. } = &sym.ty.kind
+                {
+                    return (**return_type).clone();
                 }
                 Type::unit()
             }
@@ -1028,7 +1193,13 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Check binary operator types
-    fn check_binary_op(&mut self, op: BinaryOp, left: &Type, right: &Type, span: SourceSpan) -> Type {
+    fn check_binary_op(
+        &mut self,
+        op: BinaryOp,
+        left: &Type,
+        right: &Type,
+        span: SourceSpan,
+    ) -> Type {
         if left.is_error() || right.is_error() {
             return Type::error();
         }
@@ -1038,7 +1209,10 @@ impl<'a> TypeChecker<'a> {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                 if !left.is_integer() || !right.is_integer() {
                     self.error(
-                        format!("arithmetic operator requires integer operands, got {} and {}", left, right),
+                        format!(
+                            "arithmetic operator requires integer operands, got {} and {}",
+                            left, right
+                        ),
                         span,
                     );
                     return Type::error();
@@ -1054,7 +1228,10 @@ impl<'a> TypeChecker<'a> {
             BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
                 if !left.is_integer() || !right.is_integer() {
                     self.error(
-                        format!("bitwise operator requires integer operands, got {} and {}", left, right),
+                        format!(
+                            "bitwise operator requires integer operands, got {} and {}",
+                            left, right
+                        ),
                         span,
                     );
                     return Type::error();
@@ -1069,7 +1246,10 @@ impl<'a> TypeChecker<'a> {
             BinaryOp::Shl | BinaryOp::Shr => {
                 if !left.is_integer() || !right.is_integer() {
                     self.error(
-                        format!("shift operator requires integer operands, got {} and {}", left, right),
+                        format!(
+                            "shift operator requires integer operands, got {} and {}",
+                            left, right
+                        ),
                         span,
                     );
                     return Type::error();
@@ -1077,12 +1257,14 @@ impl<'a> TypeChecker<'a> {
                 left.clone()
             }
             // Comparison operators: comparable -> bool
-            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => {
                 if !left.is_compatible_with(right) {
-                    self.error(
-                        format!("cannot compare {} and {}", left, right),
-                        span,
-                    );
+                    self.error(format!("cannot compare {} and {}", left, right), span);
                 }
                 Type::bool()
             }
@@ -1090,7 +1272,10 @@ impl<'a> TypeChecker<'a> {
             BinaryOp::And | BinaryOp::Or => {
                 if !left.is_bool() || !right.is_bool() {
                     self.error(
-                        format!("logical operator requires boolean operands, got {} and {}", left, right),
+                        format!(
+                            "logical operator requires boolean operands, got {} and {}",
+                            left, right
+                        ),
                         span,
                     );
                     return Type::error();
@@ -1123,7 +1308,10 @@ impl<'a> TypeChecker<'a> {
             }
             UnaryOp::BitNot => {
                 if !operand.is_integer() {
-                    self.error(format!("bitwise not requires integer, got {}", operand), span);
+                    self.error(
+                        format!("bitwise not requires integer, got {}", operand),
+                        span,
+                    );
                     return Type::error();
                 }
                 operand.clone()
@@ -1132,16 +1320,27 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Check builtin function types
-    fn check_builtin(&mut self, name: BuiltinFunc, args: &[parser::Expr], span: SourceSpan) -> Type {
+    fn check_builtin(
+        &mut self,
+        name: BuiltinFunc,
+        args: &[parser::Expr],
+        span: SourceSpan,
+    ) -> Type {
         match name {
             BuiltinFunc::Assert => {
                 if args.len() != 1 {
-                    self.error(format!("assert requires 1 argument, got {}", args.len()), span);
+                    self.error(
+                        format!("assert requires 1 argument, got {}", args.len()),
+                        span,
+                    );
                     return Type::error();
                 }
                 let cond_ty = self.infer_expr(&args[0]);
                 if !cond_ty.is_bool() && !cond_ty.is_error() {
-                    self.error(format!("assert condition must be bool, got {}", cond_ty), args[0].span);
+                    self.error(
+                        format!("assert condition must be bool, got {}", cond_ty),
+                        args[0].span,
+                    );
                 }
                 Type::unit()
             }
@@ -1151,7 +1350,13 @@ impl<'a> TypeChecker<'a> {
     #[allow(dead_code)]
     fn check_read_args(&mut self, args: &[parser::Expr], bits: u32, span: SourceSpan) -> Type {
         if args.len() != 2 {
-            self.error(format!("read function requires 2 arguments (buffer, offset), got {}", args.len()), span);
+            self.error(
+                format!(
+                    "read function requires 2 arguments (buffer, offset), got {}",
+                    args.len()
+                ),
+                span,
+            );
             return Type::error();
         }
         let buf_ty = self.infer_expr(&args[0]);
@@ -1159,38 +1364,30 @@ impl<'a> TypeChecker<'a> {
 
         // Buffer should be a reference to bytes
         if !buf_ty.is_ref() && !buf_ty.is_error() {
-            self.error(format!("read buffer must be a reference, got {}", buf_ty), args[0].span);
+            self.error(
+                format!("read buffer must be a reference, got {}", buf_ty),
+                args[0].span,
+            );
         }
         if !offset_ty.is_integer() && !offset_ty.is_error() {
-            self.error(format!("offset must be integer, got {}", offset_ty), args[1].span);
+            self.error(
+                format!("offset must be integer, got {}", offset_ty),
+                args[1].span,
+            );
         }
 
         Type::int(bits, false)
     }
 
-    fn check_write_args(&mut self, args: &[parser::Expr], bits: u32, span: SourceSpan) {
-        if args.len() != 3 {
-            self.error(format!("write function requires 3 arguments (buffer, offset, value), got {}", args.len()), span);
-            return;
-        }
-        let buf_ty = self.infer_expr(&args[0]);
-        let offset_ty = self.infer_expr(&args[1]);
-        let value_ty = self.infer_expr(&args[2]);
-
-        if !buf_ty.is_mut_ref() && !buf_ty.is_error() {
-            self.error(format!("write buffer must be a mutable reference, got {}", buf_ty), args[0].span);
-        }
-        if !offset_ty.is_integer() && !offset_ty.is_error() {
-            self.error(format!("offset must be integer, got {}", offset_ty), args[1].span);
-        }
-        if !value_ty.is_integer() && !value_ty.is_error() {
-            self.error(format!("value must be integer, got {}", value_ty), args[2].span);
-        }
-    }
-
     /// Check method call on a type (e.g., slice.len())
     /// Returns Some(result_type) if it's a valid method call, None if not a method
-    fn check_method_call(&mut self, object_ty: &Type, method: &str, args: &[parser::Expr], span: SourceSpan) -> Option<Type> {
+    fn check_method_call(
+        &mut self,
+        object_ty: &Type,
+        method: &str,
+        args: &[parser::Expr],
+        span: SourceSpan,
+    ) -> Option<Type> {
         // Handle references by dereferencing
         let base_ty = if let Some(inner) = object_ty.deref_type() {
             inner
@@ -1209,37 +1406,47 @@ impl<'a> TypeChecker<'a> {
         }
 
         // Check for struct methods defined in impl blocks
-        if let TypeKind::Struct { name } = &base_ty.kind {
-            if let Some(struct_def) = self.global_scope.get_struct(name) {
-                if let Some(mangled_name) = struct_def.get_method(method) {
-                    // Look up the method's function type
-                    if let Some(sym) = self.global_scope.get(mangled_name) {
-                        if let TypeKind::Function { params, return_type } = &sym.ty.kind {
-                            // First parameter is self, skip it for argument count
-                            let expected_args = params.len().saturating_sub(1);
-                            if args.len() != expected_args {
-                                self.error(
-                                    format!("method '{}' expects {} arguments, got {}",
-                                        method, expected_args, args.len()),
-                                    span,
-                                );
-                            } else {
-                                // Check argument types (skip self parameter)
-                                for (i, (arg, param_ty)) in args.iter().zip(params.iter().skip(1)).enumerate() {
-                                    let arg_ty = self.infer_expr(arg);
-                                    if !arg_ty.is_compatible_with(param_ty) {
-                                        self.error(
-                                            format!("argument {} type mismatch: expected {}, got {}",
-                                                i + 1, param_ty, arg_ty),
-                                            arg.span,
-                                        );
-                                    }
-                                }
-                            }
-                            return Some((**return_type).clone());
+        if let TypeKind::Struct { name } = &base_ty.kind
+            && let Some(struct_def) = self.global_scope.get_struct(name)
+            && let Some(mangled_name) = struct_def.get_method(method)
+        {
+            // Look up the method's function type
+            if let Some(sym) = self.global_scope.get(mangled_name)
+                && let TypeKind::Function {
+                    params,
+                    return_type,
+                } = &sym.ty.kind
+            {
+                // First parameter is self, skip it for argument count
+                let expected_args = params.len().saturating_sub(1);
+                if args.len() != expected_args {
+                    self.error(
+                        format!(
+                            "method '{}' expects {} arguments, got {}",
+                            method,
+                            expected_args,
+                            args.len()
+                        ),
+                        span,
+                    );
+                } else {
+                    // Check argument types (skip self parameter)
+                    for (i, (arg, param_ty)) in args.iter().zip(params.iter().skip(1)).enumerate() {
+                        let arg_ty = self.infer_expr(arg);
+                        if !arg_ty.is_compatible_with(param_ty) {
+                            self.error(
+                                format!(
+                                    "argument {} type mismatch: expected {}, got {}",
+                                    i + 1,
+                                    param_ty,
+                                    arg_ty
+                                ),
+                                arg.span,
+                            );
                         }
                     }
                 }
+                return Some((**return_type).clone());
             }
         }
 
@@ -1261,7 +1468,12 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Check Reader method calls
-    fn check_reader_method(&mut self, method: &str, args: &[parser::Expr], span: SourceSpan) -> Option<Type> {
+    fn check_reader_method(
+        &mut self,
+        method: &str,
+        args: &[parser::Expr],
+        span: SourceSpan,
+    ) -> Option<Type> {
         match method {
             // Single-byte read (no endianness)
             "read_u8" => {
@@ -1314,7 +1526,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let count_ty = self.infer_expr(&args[0]);
                     if !count_ty.is_integer() && !count_ty.is_error() {
-                        self.error(format!("read_bytes() count must be integer, got {}", count_ty), args[0].span);
+                        self.error(
+                            format!("read_bytes() count must be integer, got {}", count_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::slice(Type::int(8, false))) // &[u8]
@@ -1326,7 +1541,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let max_ty = self.infer_expr(&args[0]);
                     if !max_ty.is_integer() && !max_ty.is_error() {
-                        self.error(format!("read_chunk() max_size must be integer, got {}", max_ty), args[0].span);
+                        self.error(
+                            format!("read_chunk() max_size must be integer, got {}", max_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::slice(Type::int(8, false))) // &[u8]
@@ -1341,7 +1559,10 @@ impl<'a> TypeChecker<'a> {
             // Read into a struct
             "read" => {
                 if args.len() != 1 {
-                    self.error("read() requires exactly 1 argument (mutable reference to struct)", span);
+                    self.error(
+                        "read() requires exactly 1 argument (mutable reference to struct)",
+                        span,
+                    );
                 } else {
                     let arg_ty = self.infer_expr(&args[0]);
                     // Check it's a mutable reference to a struct
@@ -1355,10 +1576,19 @@ impl<'a> TypeChecker<'a> {
                                 self.error(format!("unknown struct '{}'", name), args[0].span);
                             }
                         } else {
-                            self.error(format!("read() requires a struct reference, got {}", arg_ty), args[0].span);
+                            self.error(
+                                format!("read() requires a struct reference, got {}", arg_ty),
+                                args[0].span,
+                            );
                         }
                     } else if !arg_ty.is_error() {
-                        self.error(format!("read() requires a mutable reference to struct, got {}", arg_ty), args[0].span);
+                        self.error(
+                            format!(
+                                "read() requires a mutable reference to struct, got {}",
+                                arg_ty
+                            ),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1371,7 +1601,12 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Check Writer method calls
-    fn check_writer_method(&mut self, method: &str, args: &[parser::Expr], span: SourceSpan) -> Option<Type> {
+    fn check_writer_method(
+        &mut self,
+        method: &str,
+        args: &[parser::Expr],
+        span: SourceSpan,
+    ) -> Option<Type> {
         match method {
             // Single-byte write
             "write_u8" => {
@@ -1380,7 +1615,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let val_ty = self.infer_expr(&args[0]);
                     if !val_ty.is_integer() && !val_ty.is_error() {
-                        self.error(format!("write_u8() value must be integer, got {}", val_ty), args[0].span);
+                        self.error(
+                            format!("write_u8() value must be integer, got {}", val_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1392,7 +1630,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let val_ty = self.infer_expr(&args[0]);
                     if !val_ty.is_integer() && !val_ty.is_error() {
-                        self.error(format!("{}() value must be integer, got {}", method, val_ty), args[0].span);
+                        self.error(
+                            format!("{}() value must be integer, got {}", method, val_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1403,7 +1644,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let val_ty = self.infer_expr(&args[0]);
                     if !val_ty.is_integer() && !val_ty.is_error() {
-                        self.error(format!("write_u16le() value must be integer, got {}", val_ty), args[0].span);
+                        self.error(
+                            format!("write_u16le() value must be integer, got {}", val_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1414,7 +1658,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let val_ty = self.infer_expr(&args[0]);
                     if !val_ty.is_integer() && !val_ty.is_error() {
-                        self.error(format!("{}() value must be integer, got {}", method, val_ty), args[0].span);
+                        self.error(
+                            format!("{}() value must be integer, got {}", method, val_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1425,7 +1672,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let val_ty = self.infer_expr(&args[0]);
                     if !val_ty.is_integer() && !val_ty.is_error() {
-                        self.error(format!("write_u32le() value must be integer, got {}", val_ty), args[0].span);
+                        self.error(
+                            format!("write_u32le() value must be integer, got {}", val_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1436,7 +1686,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let val_ty = self.infer_expr(&args[0]);
                     if !val_ty.is_integer() && !val_ty.is_error() {
-                        self.error(format!("{}() value must be integer, got {}", method, val_ty), args[0].span);
+                        self.error(
+                            format!("{}() value must be integer, got {}", method, val_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1447,7 +1700,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let val_ty = self.infer_expr(&args[0]);
                     if !val_ty.is_integer() && !val_ty.is_error() {
-                        self.error(format!("write_u64le() value must be integer, got {}", val_ty), args[0].span);
+                        self.error(
+                            format!("write_u64le() value must be integer, got {}", val_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1459,13 +1715,32 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     let data_ty = self.infer_expr(&args[0]);
                     // Check it's a byte slice or array
-                    let elem_ty = self.get_element_type(&data_ty);
+                    let elem_ty = get_element_type(&data_ty);
                     if let Some(elem) = elem_ty {
-                        if !matches!(&elem.kind, TypeKind::Int { bits: 8, signed: false, .. }) {
-                            self.error(format!("write_bytes() data must be byte slice/array, got {}", data_ty), args[0].span);
+                        if !matches!(
+                            &elem.kind,
+                            TypeKind::Int {
+                                bits: 8,
+                                signed: false,
+                                ..
+                            }
+                        ) {
+                            self.error(
+                                format!(
+                                    "write_bytes() data must be byte slice/array, got {}",
+                                    data_ty
+                                ),
+                                args[0].span,
+                            );
                         }
                     } else if !data_ty.is_error() {
-                        self.error(format!("write_bytes() data must be byte slice/array, got {}", data_ty), args[0].span);
+                        self.error(
+                            format!(
+                                "write_bytes() data must be byte slice/array, got {}",
+                                data_ty
+                            ),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1473,7 +1748,10 @@ impl<'a> TypeChecker<'a> {
             // Write a struct
             "write" => {
                 if args.len() != 1 {
-                    self.error("write() requires exactly 1 argument (reference to struct)", span);
+                    self.error(
+                        "write() requires exactly 1 argument (reference to struct)",
+                        span,
+                    );
                 } else {
                     let arg_ty = self.infer_expr(&args[0]);
                     // Check it's a reference to a struct (mutable or not)
@@ -1484,10 +1762,16 @@ impl<'a> TypeChecker<'a> {
                                 self.error(format!("unknown struct '{}'", name), args[0].span);
                             }
                         } else {
-                            self.error(format!("write() requires a struct reference, got {}", arg_ty), args[0].span);
+                            self.error(
+                                format!("write() requires a struct reference, got {}", arg_ty),
+                                args[0].span,
+                            );
                         }
                     } else if !arg_ty.is_error() {
-                        self.error(format!("write() requires a reference to struct, got {}", arg_ty), args[0].span);
+                        self.error(
+                            format!("write() requires a reference to struct, got {}", arg_ty),
+                            args[0].span,
+                        );
                     }
                 }
                 Some(Type::unit())
@@ -1518,10 +1802,15 @@ impl<'a> TypeChecker<'a> {
         // Slice/array of u8 to integer type (byte reinterpretation)
         // e.g., buf[0..4] as u32be
         if to_ty.is_integer() {
-            let elem_ty = self.get_element_type(from_ty);
+            let elem_ty = get_element_type(from_ty);
             if let Some(elem) = elem_ty {
                 // Check element is u8
-                if let TypeKind::Int { bits: 8, signed: false, .. } = &elem.kind {
+                if let TypeKind::Int {
+                    bits: 8,
+                    signed: false,
+                    ..
+                } = &elem.kind
+                {
                     // Valid: byte slice/array to integer
                     // The size check is done at runtime (slice) or could be checked
                     // at compile time for fixed-size arrays
@@ -1529,8 +1818,10 @@ impl<'a> TypeChecker<'a> {
                         let required_bytes = to_ty.bit_width().unwrap_or(0) / 8;
                         if *size != required_bytes as u64 {
                             self.error(
-                                format!("cannot cast [u8; {}] to {}: expected {} bytes",
-                                    size, to_ty, required_bytes),
+                                format!(
+                                    "cannot cast [u8; {}] to {}: expected {} bytes",
+                                    size, to_ty, required_bytes
+                                ),
                                 span,
                             );
                         }
@@ -1543,48 +1834,50 @@ impl<'a> TypeChecker<'a> {
 
         // Integer to byte array (for writing endian values)
         // e.g., value as u8[4] - this produces bytes in the integer's endian format
-        if from_ty.is_integer() {
-            if let TypeKind::Array { element, size } = &to_ty.kind {
-                if let TypeKind::Int { bits: 8, signed: false, .. } = &element.kind {
-                    let from_bytes = from_ty.bit_width().unwrap_or(0) / 8;
-                    if *size == from_bytes as u64 {
-                        return; // Valid: integer to byte array
-                    } else {
-                        self.error(
-                            format!("cannot cast {} to [u8; {}]: {} has {} bytes",
-                                from_ty, size, from_ty, from_bytes),
-                            span,
-                        );
-                        return;
-                    }
-                }
+        if from_ty.is_integer()
+            && let TypeKind::Array { element, size } = &to_ty.kind
+            && let TypeKind::Int {
+                bits: 8,
+                signed: false,
+                ..
+            } = &element.kind
+        {
+            let from_bytes = from_ty.bit_width().unwrap_or(0) / 8;
+            if *size == from_bytes as u64 {
+                return; // Valid: integer to byte array
+            } else {
+                self.error(
+                    format!(
+                        "cannot cast {} to [u8; {}]: {} has {} bytes",
+                        from_ty, size, from_ty, from_bytes
+                    ),
+                    span,
+                );
+                return;
             }
         }
 
         // Reference casts (strip mutability, etc.)
         if from_ty.is_ref() && to_ty.is_ref() {
             // Check inner types are compatible
-            if let (Some(from_inner), Some(to_inner)) = (from_ty.deref_type(), to_ty.deref_type()) {
-                if from_inner.is_compatible_with(to_inner) {
-                    return;
-                }
+            if let (Some(from_inner), Some(to_inner)) = (from_ty.deref_type(), to_ty.deref_type())
+                && from_inner.is_compatible_with(to_inner)
+            {
+                return;
             }
         }
 
         // If none of the above, it's an invalid cast
-        self.error(
-            format!("cannot cast {} to {}", from_ty, to_ty),
-            span,
-        );
+        self.error(format!("cannot cast {} to {}", from_ty, to_ty), span);
     }
+}
 
-    /// Helper to get element type from array, slice, or reference to array/slice
-    fn get_element_type<'b>(&self, ty: &'b Type) -> Option<&'b Type> {
-        match &ty.kind {
-            TypeKind::Array { element, .. } => Some(element),
-            TypeKind::Slice { element } => Some(element),
-            TypeKind::Ref { inner, .. } => self.get_element_type(inner),
-            _ => None,
-        }
+/// Helper to get element type from array, slice, or reference to array/slice
+fn get_element_type(ty: &Type) -> Option<&Type> {
+    match &ty.kind {
+        TypeKind::Array { element, .. } => Some(element),
+        TypeKind::Slice { element } => Some(element),
+        TypeKind::Ref { inner, .. } => get_element_type(inner),
+        _ => None,
     }
 }

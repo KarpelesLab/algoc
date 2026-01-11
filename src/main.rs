@@ -6,8 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use algoc::{Parser, analyze, errors::print_error, CodeGenerator, JavaScriptGenerator, PythonGenerator};
 use algoc::parser::{Ast, Item, ItemKind};
+use algoc::{
+    CodeGenerator, JavaScriptGenerator, Parser, PythonGenerator, analyze, errors::print_error,
+};
 
 /// Load and parse a file, recursively processing `use` statements
 fn load_with_imports(
@@ -15,8 +17,12 @@ fn load_with_imports(
     loaded: &mut HashSet<PathBuf>,
 ) -> Result<Ast, (String, String)> {
     // Canonicalize to detect circular/duplicate imports
-    let canonical = filepath.canonicalize()
-        .map_err(|e| (filepath.display().to_string(), format!("cannot resolve path: {}", e)))?;
+    let canonical = filepath.canonicalize().map_err(|e| {
+        (
+            filepath.display().to_string(),
+            format!("cannot resolve path: {}", e),
+        )
+    })?;
 
     // Skip if already loaded
     if loaded.contains(&canonical) {
@@ -25,12 +31,17 @@ fn load_with_imports(
     loaded.insert(canonical.clone());
 
     // Read source
-    let source = fs::read_to_string(filepath)
-        .map_err(|e| (filepath.display().to_string(), format!("cannot read file: {}", e)))?;
+    let source = fs::read_to_string(filepath).map_err(|e| {
+        (
+            filepath.display().to_string(),
+            format!("cannot read file: {}", e),
+        )
+    })?;
 
     // Parse
     let parser = Parser::new(&source);
-    let ast = parser.parse()
+    let ast = parser
+        .parse()
         .map_err(|e| (filepath.display().to_string(), format!("{}", e)))?;
 
     // Process imports and collect items
@@ -125,7 +136,11 @@ fn main() -> ExitCode {
                                 println!("  const {}", c.name.name);
                             }
                             algoc::parser::ItemKind::Test(t) => {
-                                println!("  test {} ({} statements)", t.name.name, t.body.stmts.len());
+                                println!(
+                                    "  test {} ({} statements)",
+                                    t.name.name,
+                                    t.body.stmts.len()
+                                );
                             }
                             algoc::parser::ItemKind::Use(u) => {
                                 println!("  use \"{}\"", u.path);
@@ -166,7 +181,10 @@ fn main() -> ExitCode {
             // Analyze (name resolution + type checking)
             match analyze(ast) {
                 Ok(analyzed) => {
-                    println!("OK: {} items type-checked successfully", analyzed.ast.items.len());
+                    println!(
+                        "OK: {} items type-checked successfully",
+                        analyzed.ast.items.len()
+                    );
 
                     // Print some analysis info
                     let symbols: Vec<_> = analyzed.global_scope.symbols().collect();
@@ -323,7 +341,7 @@ fn main() -> ExitCode {
             let filename = &args[2];
 
             // Parse arguments
-            let mut target = String::from("js");  // Default to JavaScript
+            let mut target = String::from("js"); // Default to JavaScript
             let mut i = 3;
             while i < args.len() {
                 match args[i].as_str() {

@@ -2,10 +2,10 @@
 //!
 //! Resolves all names to their definitions and builds symbol tables.
 
+use super::scope::{EnumDef, EnumVariantDef, Scope, ScopeStack, StructDef, StructField, Symbol};
+use super::types::{Endianness, Type, TypeKind};
 use crate::errors::{AlgocError, AlgocResult, SourceSpan};
 use crate::parser::{self, Ast, Item, ItemKind, PrimitiveType as AstPrimitive};
-use super::scope::{Scope, ScopeStack, Symbol, StructDef, StructField, EnumDef, EnumVariantDef};
-use super::types::{Type, TypeKind, Endianness};
 
 /// Name resolver that builds symbol tables
 pub struct Resolver {
@@ -83,7 +83,9 @@ impl Resolver {
                             Type::struct_type(ident.name.clone())
                         // Check if it's a known enum
                         } else if self.scopes.lookup_enum(&ident.name).is_some() {
-                            Type::new(TypeKind::Enum { name: ident.name.clone() })
+                            Type::new(TypeKind::Enum {
+                                name: ident.name.clone(),
+                            })
                         } else {
                             self.error(format!("unknown type '{}'", ident.name), ident.span);
                             Type::error()
@@ -135,10 +137,14 @@ impl Resolver {
         match &item.kind {
             ItemKind::Function(func) => {
                 // Build function type
-                let params: Vec<Type> = func.params.iter()
+                let params: Vec<Type> = func
+                    .params
+                    .iter()
                     .map(|p| self.resolve_type(&p.ty))
                     .collect();
-                let return_type = func.return_type.as_ref()
+                let return_type = func
+                    .return_type
+                    .as_ref()
                     .map(|t| self.resolve_type(t))
                     .unwrap_or_else(Type::unit);
 
@@ -148,7 +154,11 @@ impl Resolver {
                 });
 
                 let symbol = Symbol::function(func_type, func.name.span);
-                if let Err(e) = self.scopes.global_mut().define(func.name.name.clone(), symbol) {
+                if let Err(e) = self
+                    .scopes
+                    .global_mut()
+                    .define(func.name.name.clone(), symbol)
+                {
                     self.error(e, func.name.span);
                 }
             }
@@ -162,7 +172,11 @@ impl Resolver {
                         field.span,
                     ));
                 }
-                if let Err(e) = self.scopes.global_mut().define_struct(s.name.name.clone(), def) {
+                if let Err(e) = self
+                    .scopes
+                    .global_mut()
+                    .define_struct(s.name.name.clone(), def)
+                {
                     self.error(e, s.name.span);
                 }
             }
@@ -177,7 +191,11 @@ impl Resolver {
                         field.span,
                     ));
                 }
-                if let Err(e) = self.scopes.global_mut().define_struct(l.name.name.clone(), def) {
+                if let Err(e) = self
+                    .scopes
+                    .global_mut()
+                    .define_struct(l.name.name.clone(), def)
+                {
                     self.error(e, l.name.span);
                 }
             }
@@ -213,12 +231,18 @@ impl Resolver {
                         variant.span,
                     ));
                 }
-                if let Err(err) = self.scopes.global_mut().define_enum(e.name.name.clone(), def) {
+                if let Err(err) = self
+                    .scopes
+                    .global_mut()
+                    .define_enum(e.name.name.clone(), def)
+                {
                     self.error(err, e.name.span);
                 }
 
                 // Also define the enum as a symbol for use in expressions
-                let enum_type = Type::new(TypeKind::Enum { name: e.name.name.clone() });
+                let enum_type = Type::new(TypeKind::Enum {
+                    name: e.name.name.clone(),
+                });
                 let symbol = Symbol::constant(enum_type, e.name.span);
                 if let Err(err) = self.scopes.global_mut().define(e.name.name.clone(), symbol) {
                     self.error(err, e.name.span);
@@ -227,17 +251,24 @@ impl Resolver {
             ItemKind::Impl(impl_def) => {
                 // Check that the target struct exists
                 if self.scopes.lookup_struct(&impl_def.target.name).is_none() {
-                    self.error(format!("impl for unknown type '{}'", impl_def.target.name), impl_def.target.span);
+                    self.error(
+                        format!("impl for unknown type '{}'", impl_def.target.name),
+                        impl_def.target.span,
+                    );
                     return;
                 }
 
                 // Register each method with a mangled name: StructName__method_name
                 for method in &impl_def.methods {
                     // Build method type (includes self parameter)
-                    let params: Vec<Type> = method.params.iter()
+                    let params: Vec<Type> = method
+                        .params
+                        .iter()
                         .map(|p| self.resolve_type(&p.ty))
                         .collect();
-                    let return_type = method.return_type.as_ref()
+                    let return_type = method
+                        .return_type
+                        .as_ref()
                         .map(|t| self.resolve_type(t))
                         .unwrap_or_else(Type::unit);
 
@@ -247,14 +278,22 @@ impl Resolver {
                     });
 
                     // Register as StructName__method
-                    let mangled_name = format!("{}__{}",impl_def.target.name, method.name.name);
+                    let mangled_name = format!("{}__{}", impl_def.target.name, method.name.name);
                     let symbol = Symbol::function(func_type, method.name.span);
-                    if let Err(e) = self.scopes.global_mut().define(mangled_name.clone(), symbol) {
+                    if let Err(e) = self
+                        .scopes
+                        .global_mut()
+                        .define(mangled_name.clone(), symbol)
+                    {
                         self.error(e, method.name.span);
                     }
 
                     // Also register the method in the struct's method table
-                    if let Some(struct_def) = self.scopes.global_mut().get_struct_mut(&impl_def.target.name) {
+                    if let Some(struct_def) = self
+                        .scopes
+                        .global_mut()
+                        .get_struct_mut(&impl_def.target.name)
+                    {
                         struct_def.add_method(method.name.name.clone(), mangled_name);
                     }
                 }
@@ -271,8 +310,6 @@ impl Resolver {
                 // Add parameters to scope
                 for param in &func.params {
                     let ty = self.resolve_type(&param.ty);
-                    // Check if parameter is mutable reference
-                    let mutable = matches!(ty.kind, TypeKind::Ref { mutable: true, .. });
                     let symbol = Symbol::parameter(ty, param.span);
                     if let Err(e) = self.scopes.define(param.name.name.clone(), symbol) {
                         self.error(e, param.name.span);
@@ -333,9 +370,15 @@ impl Resolver {
     /// Resolve a statement
     fn resolve_stmt(&mut self, stmt: &parser::Stmt) {
         match &stmt.kind {
-            parser::StmtKind::Let { name, ty, mutable, init } => {
+            parser::StmtKind::Let {
+                name,
+                ty,
+                mutable,
+                init,
+            } => {
                 // Resolve the type if specified
-                let var_ty = ty.as_ref()
+                let var_ty = ty
+                    .as_ref()
                     .map(|t| self.resolve_type(t))
                     .unwrap_or_else(Type::error);
 
@@ -361,7 +404,11 @@ impl Resolver {
                 self.resolve_expr(target);
                 self.resolve_expr(value);
             }
-            parser::StmtKind::If { condition, then_block, else_block } => {
+            parser::StmtKind::If {
+                condition,
+                then_block,
+                else_block,
+            } => {
                 self.resolve_expr(condition);
                 self.scopes.push();
                 self.resolve_block(then_block);
@@ -372,7 +419,13 @@ impl Resolver {
                     self.scopes.pop();
                 }
             }
-            parser::StmtKind::For { var, start, end, body, .. } => {
+            parser::StmtKind::For {
+                var,
+                start,
+                end,
+                body,
+                ..
+            } => {
                 self.resolve_expr(start);
                 self.resolve_expr(end);
 
@@ -415,19 +468,20 @@ impl Resolver {
     /// Resolve an expression
     fn resolve_expr(&mut self, expr: &parser::Expr) {
         match &expr.kind {
-            parser::ExprKind::Integer(_) |
-            parser::ExprKind::Bool(_) |
-            parser::ExprKind::String(_) |
-            parser::ExprKind::Bytes(_) |
-            parser::ExprKind::Hex(_) => {
+            parser::ExprKind::Integer(_)
+            | parser::ExprKind::Bool(_)
+            | parser::ExprKind::String(_)
+            | parser::ExprKind::Bytes(_)
+            | parser::ExprKind::Hex(_) => {
                 // Literals don't need resolution
             }
             parser::ExprKind::Ident(ident) => {
                 // Reader and Writer are built-in type constructors, not variables
-                if ident.name != "Reader" && ident.name != "Writer" {
-                    if self.scopes.lookup(&ident.name).is_none() {
-                        self.error(format!("undefined variable '{}'", ident.name), ident.span);
-                    }
+                if ident.name != "Reader"
+                    && ident.name != "Writer"
+                    && self.scopes.lookup(&ident.name).is_none()
+                {
+                    self.error(format!("undefined variable '{}'", ident.name), ident.span);
                 }
             }
             parser::ExprKind::Binary { left, right, .. } => {
@@ -441,7 +495,9 @@ impl Resolver {
                 self.resolve_expr(array);
                 self.resolve_expr(index);
             }
-            parser::ExprKind::Slice { array, start, end, .. } => {
+            parser::ExprKind::Slice {
+                array, start, end, ..
+            } => {
                 self.resolve_expr(array);
                 self.resolve_expr(start);
                 self.resolve_expr(end);
@@ -475,10 +531,10 @@ impl Resolver {
                 self.resolve_expr(expr);
                 self.resolve_type(ty);
             }
-            parser::ExprKind::Ref(inner) |
-            parser::ExprKind::MutRef(inner) |
-            parser::ExprKind::Deref(inner) |
-            parser::ExprKind::Paren(inner) => {
+            parser::ExprKind::Ref(inner)
+            | parser::ExprKind::MutRef(inner)
+            | parser::ExprKind::Deref(inner)
+            | parser::ExprKind::Paren(inner) => {
                 self.resolve_expr(inner);
             }
             parser::ExprKind::Range { start, end, .. } => {
@@ -494,12 +550,20 @@ impl Resolver {
                     self.resolve_expr(value);
                 }
             }
-            parser::ExprKind::Conditional { condition, then_expr, else_expr } => {
+            parser::ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 self.resolve_expr(condition);
                 self.resolve_expr(then_expr);
                 self.resolve_expr(else_expr);
             }
-            parser::ExprKind::EnumVariant { enum_name, variant_name: _, args } => {
+            parser::ExprKind::EnumVariant {
+                enum_name,
+                variant_name: _,
+                args,
+            } => {
                 // Check enum exists - for now just check if the name is defined
                 if self.scopes.lookup(&enum_name.name).is_none() {
                     self.error(format!("unknown enum '{}'", enum_name.name), enum_name.span);
@@ -543,7 +607,11 @@ impl Resolver {
                     self.error(e, ident.span);
                 }
             }
-            parser::PatternKind::EnumVariant { enum_name, variant_name: _, bindings } => {
+            parser::PatternKind::EnumVariant {
+                enum_name,
+                variant_name: _,
+                bindings,
+            } => {
                 // Check enum exists
                 if self.scopes.lookup(&enum_name.name).is_none() {
                     self.error(format!("unknown enum '{}'", enum_name.name), enum_name.span);

@@ -2,14 +2,14 @@
 //!
 //! Parses a token stream into an AST.
 
+use super::ast::*;
 use crate::errors::{AlgocError, AlgocResult, SourceSpan};
 use crate::lexer::{Keyword, Lexer, Token, TokenKind};
-use super::ast::*;
 
 /// The parser for AlgoC source code
 pub struct Parser<'src> {
     /// The source code (for error messages)
-    source: &'src str,
+    _source: &'src str,
     /// Tokens from the lexer
     tokens: Vec<Token>,
     /// Current position in the token stream
@@ -22,7 +22,7 @@ impl<'src> Parser<'src> {
         let lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         Self {
-            source,
+            _source: source,
             tokens,
             pos: 0,
         }
@@ -48,16 +48,9 @@ impl<'src> Parser<'src> {
 
     /// Peek at the current token
     fn peek(&self) -> &Token {
-        self.tokens.get(self.pos).unwrap_or_else(|| {
-            self.tokens.last().expect("tokens should have at least EOF")
-        })
-    }
-
-    /// Peek at the next token (one ahead)
-    fn peek_next(&self) -> &Token {
-        self.tokens.get(self.pos + 1).unwrap_or_else(|| {
-            self.tokens.last().expect("tokens should have at least EOF")
-        })
+        self.tokens
+            .get(self.pos)
+            .unwrap_or_else(|| self.tokens.last().expect("tokens should have at least EOF"))
     }
 
     /// Get the current token's span
@@ -173,7 +166,10 @@ impl<'src> Parser<'src> {
             ItemKind::Test(self.parse_test()?)
         } else {
             return Err(AlgocError::parser(
-                format!("expected item (use, fn, struct, enum, const, impl, test), found {}", self.peek().kind),
+                format!(
+                    "expected item (use, fn, struct, enum, const, impl, test), found {}",
+                    self.peek().kind
+                ),
                 self.current_span(),
             ));
         };
@@ -195,7 +191,10 @@ impl<'src> Parser<'src> {
             }
             _ => {
                 return Err(AlgocError::parser(
-                    format!("expected path string after 'use', found {}", self.peek().kind),
+                    format!(
+                        "expected path string after 'use', found {}",
+                        self.peek().kind
+                    ),
                     self.current_span(),
                 ));
             }
@@ -296,7 +295,11 @@ impl<'src> Parser<'src> {
         self.expect(&TokenKind::RBrace, "expected '}' after impl methods")?;
 
         let span = start.merge(self.previous().span);
-        Ok(ImplDef { target, methods, span })
+        Ok(ImplDef {
+            target,
+            methods,
+            span,
+        })
     }
 
     fn parse_enum_variants(&mut self) -> AlgocResult<Vec<EnumVariant>> {
@@ -389,7 +392,10 @@ impl<'src> Parser<'src> {
             TypeModifierKind::Aligned(n)
         } else {
             return Err(AlgocError::parser(
-                format!("expected type modifier (big_endian, little_endian, aligned, packed), found {}", self.peek().kind),
+                format!(
+                    "expected type modifier (big_endian, little_endian, aligned, packed), found {}",
+                    self.peek().kind
+                ),
                 self.current_span(),
             ));
         };
@@ -844,7 +850,10 @@ impl<'src> Parser<'src> {
         if let Some(op) = op {
             self.advance();
             let value = self.parse_expr()?;
-            self.expect(&TokenKind::Semicolon, "expected ';' after compound assignment")?;
+            self.expect(
+                &TokenKind::Semicolon,
+                "expected ';' after compound assignment",
+            )?;
             return Ok(StmtKind::CompoundAssign {
                 target: expr,
                 op,
@@ -1143,7 +1152,7 @@ impl<'src> Parser<'src> {
                     return Err(AlgocError::parser(
                         "expected string in bytes()",
                         self.current_span(),
-                    ))
+                    ));
                 }
             };
             self.advance();
@@ -1163,7 +1172,7 @@ impl<'src> Parser<'src> {
                     return Err(AlgocError::parser(
                         "expected string in hex()",
                         self.current_span(),
-                    ))
+                    ));
                 }
             };
             self.advance();
@@ -1244,7 +1253,10 @@ impl<'src> Parser<'src> {
                 // Check for arguments
                 let args = if self.match_token(&TokenKind::LParen) {
                     let args = self.parse_args()?;
-                    self.expect(&TokenKind::RParen, "expected ')' after enum variant arguments")?;
+                    self.expect(
+                        &TokenKind::RParen,
+                        "expected ')' after enum variant arguments",
+                    )?;
                     args
                 } else {
                     Vec::new()
@@ -1267,11 +1279,14 @@ impl<'src> Parser<'src> {
             if self.check(&TokenKind::LBrace) {
                 // Look ahead: tokens are { ident : ...
                 // pos is at {, pos+1 should be ident, pos+2 should be :
-                let is_struct_lit = self.tokens.get(self.pos + 1).is_some_and(|t| {
-                    matches!(t.kind, TokenKind::Ident(_))
-                }) && self.tokens.get(self.pos + 2).is_some_and(|t| {
-                    matches!(t.kind, TokenKind::Colon)
-                });
+                let is_struct_lit = self
+                    .tokens
+                    .get(self.pos + 1)
+                    .is_some_and(|t| matches!(t.kind, TokenKind::Ident(_)))
+                    && self
+                        .tokens
+                        .get(self.pos + 2)
+                        .is_some_and(|t| matches!(t.kind, TokenKind::Colon));
 
                 if is_struct_lit {
                     self.advance(); // consume {
@@ -1328,7 +1343,10 @@ impl<'src> Parser<'src> {
 
             let span = start.merge(self.previous().span);
             Ok(Expr {
-                kind: ExprKind::Builtin { name: builtin, args },
+                kind: ExprKind::Builtin {
+                    name: builtin,
+                    args,
+                },
                 span,
             })
         })())
@@ -1374,21 +1392,25 @@ impl<'src> Parser<'src> {
         let body = self.parse_expr()?;
 
         let span = start.merge(self.previous().span);
-        Ok(MatchArm { pattern, body, span })
+        Ok(MatchArm {
+            pattern,
+            body,
+            span,
+        })
     }
 
     fn parse_pattern(&mut self) -> AlgocResult<Pattern> {
         let start = self.current_span();
 
         // Wildcard pattern: _
-        if let TokenKind::Ident(name) = &self.peek().kind {
-            if name == "_" {
-                self.advance();
-                return Ok(Pattern {
-                    kind: PatternKind::Wildcard,
-                    span: self.previous().span,
-                });
-            }
+        if let TokenKind::Ident(name) = &self.peek().kind
+            && name == "_"
+        {
+            self.advance();
+            return Ok(Pattern {
+                kind: PatternKind::Wildcard,
+                span: self.previous().span,
+            });
         }
 
         // Integer literal pattern

@@ -175,19 +175,11 @@ pub enum TypeKind {
     /// Primitive type: u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, bool
     Primitive(PrimitiveType),
     /// Array type: T[N]
-    Array {
-        element: Box<Type>,
-        size: u64,
-    },
+    Array { element: Box<Type>, size: u64 },
     /// Slice type: &[T]
-    Slice {
-        element: Box<Type>,
-    },
+    Slice { element: Box<Type> },
     /// Reference to fixed array: &[T; N]
-    ArrayRef {
-        element: Box<Type>,
-        size: u64,
-    },
+    ArrayRef { element: Box<Type>, size: u64 },
     /// Mutable reference: &mut T
     MutRef(Box<Type>),
     /// Immutable reference: &T
@@ -246,18 +238,30 @@ impl PrimitiveType {
     pub fn bit_width(&self) -> u32 {
         match self {
             PrimitiveType::U8 | PrimitiveType::I8 => 8,
-            PrimitiveType::U16 | PrimitiveType::I16 |
-            PrimitiveType::U16Be | PrimitiveType::I16Be |
-            PrimitiveType::U16Le | PrimitiveType::I16Le => 16,
-            PrimitiveType::U32 | PrimitiveType::I32 |
-            PrimitiveType::U32Be | PrimitiveType::I32Be |
-            PrimitiveType::U32Le | PrimitiveType::I32Le => 32,
-            PrimitiveType::U64 | PrimitiveType::I64 |
-            PrimitiveType::U64Be | PrimitiveType::I64Be |
-            PrimitiveType::U64Le | PrimitiveType::I64Le => 64,
-            PrimitiveType::U128 | PrimitiveType::I128 |
-            PrimitiveType::U128Be | PrimitiveType::I128Be |
-            PrimitiveType::U128Le | PrimitiveType::I128Le => 128,
+            PrimitiveType::U16
+            | PrimitiveType::I16
+            | PrimitiveType::U16Be
+            | PrimitiveType::I16Be
+            | PrimitiveType::U16Le
+            | PrimitiveType::I16Le => 16,
+            PrimitiveType::U32
+            | PrimitiveType::I32
+            | PrimitiveType::U32Be
+            | PrimitiveType::I32Be
+            | PrimitiveType::U32Le
+            | PrimitiveType::I32Le => 32,
+            PrimitiveType::U64
+            | PrimitiveType::I64
+            | PrimitiveType::U64Be
+            | PrimitiveType::I64Be
+            | PrimitiveType::U64Le
+            | PrimitiveType::I64Le => 64,
+            PrimitiveType::U128
+            | PrimitiveType::I128
+            | PrimitiveType::U128Be
+            | PrimitiveType::I128Be
+            | PrimitiveType::U128Le
+            | PrimitiveType::I128Le => 128,
             PrimitiveType::Bool => 1,
         }
     }
@@ -266,26 +270,41 @@ impl PrimitiveType {
     pub fn is_signed(&self) -> bool {
         matches!(
             self,
-            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 |
-            PrimitiveType::I64 | PrimitiveType::I128 |
-            PrimitiveType::I16Be | PrimitiveType::I32Be |
-            PrimitiveType::I64Be | PrimitiveType::I128Be |
-            PrimitiveType::I16Le | PrimitiveType::I32Le |
-            PrimitiveType::I64Le | PrimitiveType::I128Le
+            PrimitiveType::I8
+                | PrimitiveType::I16
+                | PrimitiveType::I32
+                | PrimitiveType::I64
+                | PrimitiveType::I128
+                | PrimitiveType::I16Be
+                | PrimitiveType::I32Be
+                | PrimitiveType::I64Be
+                | PrimitiveType::I128Be
+                | PrimitiveType::I16Le
+                | PrimitiveType::I32Le
+                | PrimitiveType::I64Le
+                | PrimitiveType::I128Le
         )
     }
 
     /// Get the endianness of this type
     pub fn endianness(&self) -> Endianness {
         match self {
-            PrimitiveType::U16Be | PrimitiveType::U32Be |
-            PrimitiveType::U64Be | PrimitiveType::U128Be |
-            PrimitiveType::I16Be | PrimitiveType::I32Be |
-            PrimitiveType::I64Be | PrimitiveType::I128Be => Endianness::Big,
-            PrimitiveType::U16Le | PrimitiveType::U32Le |
-            PrimitiveType::U64Le | PrimitiveType::U128Le |
-            PrimitiveType::I16Le | PrimitiveType::I32Le |
-            PrimitiveType::I64Le | PrimitiveType::I128Le => Endianness::Little,
+            PrimitiveType::U16Be
+            | PrimitiveType::U32Be
+            | PrimitiveType::U64Be
+            | PrimitiveType::U128Be
+            | PrimitiveType::I16Be
+            | PrimitiveType::I32Be
+            | PrimitiveType::I64Be
+            | PrimitiveType::I128Be => Endianness::Big,
+            PrimitiveType::U16Le
+            | PrimitiveType::U32Le
+            | PrimitiveType::U64Le
+            | PrimitiveType::U128Le
+            | PrimitiveType::I16Le
+            | PrimitiveType::I32Le
+            | PrimitiveType::I64Le
+            | PrimitiveType::I128Le => Endianness::Little,
             _ => Endianness::Native,
         }
     }
@@ -347,10 +366,7 @@ pub enum StmtKind {
     /// Expression statement
     Expr(Expr),
     /// Assignment: `place = value;`
-    Assign {
-        target: Expr,
-        value: Expr,
-    },
+    Assign { target: Expr, value: Expr },
     /// Compound assignment: `place += value;`
     CompoundAssign {
         target: Expr,
@@ -372,14 +388,9 @@ pub enum StmtKind {
         body: Block,
     },
     /// While loop
-    While {
-        condition: Expr,
-        body: Block,
-    },
+    While { condition: Expr, body: Block },
     /// Infinite loop
-    Loop {
-        body: Block,
-    },
+    Loop { body: Block },
     /// Break
     Break,
     /// Continue
@@ -414,15 +425,9 @@ pub enum ExprKind {
         right: Box<Expr>,
     },
     /// Unary operation: `-a`, `!a`, `~a`
-    Unary {
-        op: UnaryOp,
-        operand: Box<Expr>,
-    },
+    Unary { op: UnaryOp, operand: Box<Expr> },
     /// Array indexing: `arr[idx]`
-    Index {
-        array: Box<Expr>,
-        index: Box<Expr>,
-    },
+    Index { array: Box<Expr>, index: Box<Expr> },
     /// Array/slice slicing: `arr[start..end]` or `arr[start..=end]`
     Slice {
         array: Box<Expr>,
@@ -431,32 +436,17 @@ pub enum ExprKind {
         inclusive: bool,
     },
     /// Field access: `obj.field`
-    Field {
-        object: Box<Expr>,
-        field: Ident,
-    },
+    Field { object: Box<Expr>, field: Ident },
     /// Function call: `func(args)`
-    Call {
-        func: Box<Expr>,
-        args: Vec<Expr>,
-    },
+    Call { func: Box<Expr>, args: Vec<Expr> },
     /// Built-in function call
-    Builtin {
-        name: BuiltinFunc,
-        args: Vec<Expr>,
-    },
+    Builtin { name: BuiltinFunc, args: Vec<Expr> },
     /// Array literal: `[1, 2, 3]`
     Array(Vec<Expr>),
     /// Array repeat: `[value; count]` - count can be a runtime expression
-    ArrayRepeat {
-        value: Box<Expr>,
-        count: Box<Expr>,
-    },
+    ArrayRepeat { value: Box<Expr>, count: Box<Expr> },
     /// Cast: `expr as Type`
-    Cast {
-        expr: Box<Expr>,
-        ty: Type,
-    },
+    Cast { expr: Box<Expr>, ty: Type },
     /// Reference: `&expr`
     Ref(Box<Expr>),
     /// Mutable reference: `&mut expr`

@@ -2,16 +2,16 @@
 //!
 //! This module handles name resolution, type checking, and semantic validation.
 
-mod types;
-mod scope;
-mod resolver;
 mod checker;
+mod resolver;
+mod scope;
+mod types;
 mod validator;
 
-pub use types::{Type, TypeKind, TypeError};
-pub use scope::{Scope, Symbol, SymbolKind};
-pub use resolver::Resolver;
 pub use checker::TypeChecker;
+pub use resolver::Resolver;
+pub use scope::{Scope, Symbol, SymbolKind};
+pub use types::{Type, TypeError, TypeKind};
 pub use validator::Validator;
 
 use crate::errors::AlgocResult;

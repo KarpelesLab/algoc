@@ -3,14 +3,14 @@
 //! Generates Python code from the analyzed AST.
 //! Uses bytearray for mutable byte buffers and handles bitwise operations.
 
-use std::collections::HashMap;
+use super::CodeGenerator;
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
-    Ast, Item, ItemKind, Function, Stmt, StmtKind, Expr, ExprKind,
-    BinaryOp, UnaryOp, BuiltinFunc, Block, Type as ParserType,
+    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
+    Type as ParserType, UnaryOp,
 };
-use super::CodeGenerator;
+use std::collections::HashMap;
 
 /// Struct field info for read/write generation
 #[derive(Clone)]
@@ -80,27 +80,6 @@ impl PythonGenerator {
         self.indent = self.indent.saturating_sub(1);
     }
 
-    /// Check if an expression is likely an array type (used for comparison)
-    fn is_array_like_expr(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
-            ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
-            ExprKind::Slice { .. } => true,
-            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
-                self.is_array_like_expr(inner)
-            }
-            ExprKind::Paren(inner) => self.is_array_like_expr(inner),
-            ExprKind::Builtin { .. } => false,
-            ExprKind::Index { .. } => false,
-            // Field access - we don't have type info, so assume primitive (not array)
-            // For array field comparisons, users should use constant_time_eq explicitly
-            ExprKind::Field { .. } => false,
-            ExprKind::Ident(_) => false,
-            ExprKind::Call { .. } => false,
-            _ => false,
-        }
-    }
-
     /// Generate the runtime helper functions
     fn generate_runtime(&mut self) {
         self.writeln("# AlgoC Runtime Helpers");
@@ -130,7 +109,9 @@ impl PythonGenerator {
         self.indent();
         self.writeln("def __init__(self, data):");
         self.indent();
-        self.writeln("self.data = bytes(data) if not isinstance(data, (bytes, bytearray)) else data");
+        self.writeln(
+            "self.data = bytes(data) if not isinstance(data, (bytes, bytearray)) else data",
+        );
         self.writeln("self.pos = 0");
         self.dedent();
         self.writeln("");
@@ -307,7 +288,9 @@ impl PythonGenerator {
         // write_bytes - copy byte slice/array byte-by-byte for list compatibility
         self.writeln("def write_bytes(self, data):");
         self.indent();
-        self.writeln("if self.pos + len(data) > len(self.data): raise BufferError('Buffer overflow')");
+        self.writeln(
+            "if self.pos + len(data) > len(self.data): raise BufferError('Buffer overflow')",
+        );
         self.writeln("for i, b in enumerate(data): self.data[self.pos + i] = b");
         self.writeln("self.pos += len(data)");
         self.dedent();
@@ -384,11 +367,15 @@ impl PythonGenerator {
 
     fn generate_method(&mut self, struct_name: &str, func: &crate::parser::Function) {
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
-        self.writeln(&format!("def {}({}):", mangled_name,
-            func.params.iter()
+        self.writeln(&format!(
+            "def {}({}):",
+            mangled_name,
+            func.params
+                .iter()
                 .map(|p| p.name.name.clone())
                 .collect::<Vec<_>>()
-                .join(", ")));
+                .join(", ")
+        ));
         self.indent();
         if func.body.stmts.is_empty() {
             self.writeln("pass");
@@ -501,7 +488,8 @@ impl PythonGenerator {
                         // Tuple variant becomes a class with positional args
                         self.writeln(&format!("class {}:", variant.name.name));
                         self.indent();
-                        let params: Vec<String> = (0..types.len()).map(|i| format!("v{}", i)).collect();
+                        let params: Vec<String> =
+                            (0..types.len()).map(|i| format!("v{}", i)).collect();
                         let params_str = params.join(", ");
                         self.writeln(&format!("def __init__(self, {}):", params_str));
                         self.indent();
@@ -516,13 +504,17 @@ impl PythonGenerator {
                         // Struct variant becomes a class with named args
                         self.writeln(&format!("class {}:", variant.name.name));
                         self.indent();
-                        let params: Vec<&str> = fields.iter().map(|f| f.name.name.as_str()).collect();
+                        let params: Vec<&str> =
+                            fields.iter().map(|f| f.name.name.as_str()).collect();
                         let params_str = params.join(", ");
                         self.writeln(&format!("def __init__(self, {}):", params_str));
                         self.indent();
                         self.writeln(&format!("self.tag = \"{}\"", variant.name.name));
                         for field in fields {
-                            self.writeln(&format!("self.{} = {}", field.name.name, field.name.name));
+                            self.writeln(&format!(
+                                "self.{} = {}",
+                                field.name.name, field.name.name
+                            ));
                         }
                         self.dedent();
                         self.dedent();
@@ -538,14 +530,12 @@ impl PythonGenerator {
         match &ty.kind {
             crate::parser::TypeKind::Primitive(_) => "0".to_string(),
             crate::parser::TypeKind::Array { element, size } => {
-                match &element.kind {
-                    crate::parser::TypeKind::Primitive(p) => {
-                        match p {
-                            crate::parser::PrimitiveType::U8 => format!("bytearray({})", size),
-                            _ => format!("[0] * {}", size),
-                        }
-                    }
-                    _ => format!("[0] * {}", size),
+                if let crate::parser::TypeKind::Primitive(crate::parser::PrimitiveType::U8) =
+                    &element.kind
+                {
+                    format!("bytearray({})", size)
+                } else {
+                    format!("[0] * {}", size)
                 }
             }
             crate::parser::TypeKind::Named(ident) => {
@@ -590,17 +580,22 @@ impl PythonGenerator {
         match &stmt.kind {
             StmtKind::Let { name, ty, init, .. } => {
                 // Track variable type for struct read/write generation
-                if let Some(ty) = ty {
-                    if let crate::parser::TypeKind::Named(type_ident) = &ty.kind {
-                        self.var_types.insert(name.name.clone(), type_ident.name.clone());
-                    }
+                if let Some(ty) = ty
+                    && let crate::parser::TypeKind::Named(type_ident) = &ty.kind
+                {
+                    self.var_types
+                        .insert(name.name.clone(), type_ident.name.clone());
                 }
 
                 self.write_indent();
                 self.write(&format!("{} = ", name.name));
                 if let Some(init) = init {
                     // Check if init is a struct literal - need special handling
-                    if let ExprKind::StructLit { name: struct_name, fields } = &init.kind {
+                    if let ExprKind::StructLit {
+                        name: struct_name,
+                        fields,
+                    } = &init.kind
+                    {
                         // Create the struct
                         self.write(&format!("{}()\n", struct_name.name));
                         // Assign each field
@@ -628,36 +623,42 @@ impl PythonGenerator {
             }
             StmtKind::Assign { target, value } => {
                 // Check for endian cast assignment: buf[0..4] as u32be = value
-                if let ExprKind::Cast { expr: inner, ty } = &target.kind {
-                    if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
-                        let endian = p.endianness();
-                        if endian != crate::parser::Endianness::Native {
-                            if let ExprKind::Slice { array, start, end, .. } = &inner.kind {
-                                // Generate: array[start:end] = value.to_bytes(N, 'big'/'little')
-                                let byte_order = if endian == crate::parser::Endianness::Big {
-                                    "'big'"
-                                } else {
-                                    "'little'"
-                                };
-                                let byte_count = match p.to_native() {
-                                    crate::parser::PrimitiveType::U16 | crate::parser::PrimitiveType::I16 => 2,
-                                    crate::parser::PrimitiveType::U32 | crate::parser::PrimitiveType::I32 => 4,
-                                    crate::parser::PrimitiveType::U64 | crate::parser::PrimitiveType::I64 => 8,
-                                    crate::parser::PrimitiveType::U128 | crate::parser::PrimitiveType::I128 => 16,
-                                    _ => 4,
-                                };
-                                self.write_indent();
-                                self.generate_expr(array);
-                                self.write("[");
-                                self.generate_expr(start);
-                                self.write(":");
-                                self.generate_expr(end);
-                                self.write("] = list((");
-                                self.generate_expr(value);
-                                self.write(&format!(").to_bytes({}, {}))\n", byte_count, byte_order));
-                                return;
-                            }
-                        }
+                if let ExprKind::Cast { expr: inner, ty } = &target.kind
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    let endian = p.endianness();
+                    if endian != crate::parser::Endianness::Native
+                        && let ExprKind::Slice {
+                            array, start, end, ..
+                        } = &inner.kind
+                    {
+                        // Generate: array[start:end] = value.to_bytes(N, 'big'/'little')
+                        let byte_order = if endian == crate::parser::Endianness::Big {
+                            "'big'"
+                        } else {
+                            "'little'"
+                        };
+                        let byte_count = match p.to_native() {
+                            crate::parser::PrimitiveType::U16
+                            | crate::parser::PrimitiveType::I16 => 2,
+                            crate::parser::PrimitiveType::U32
+                            | crate::parser::PrimitiveType::I32 => 4,
+                            crate::parser::PrimitiveType::U64
+                            | crate::parser::PrimitiveType::I64 => 8,
+                            crate::parser::PrimitiveType::U128
+                            | crate::parser::PrimitiveType::I128 => 16,
+                            _ => 4,
+                        };
+                        self.write_indent();
+                        self.generate_expr(array);
+                        self.write("[");
+                        self.generate_expr(start);
+                        self.write(":");
+                        self.generate_expr(end);
+                        self.write("] = list((");
+                        self.generate_expr(value);
+                        self.write(&format!(").to_bytes({}, {}))\n", byte_count, byte_order));
+                        return;
                     }
                 }
                 self.write_indent();
@@ -686,7 +687,11 @@ impl PythonGenerator {
                 self.generate_expr(value);
                 self.write("\n");
             }
-            StmtKind::If { condition, then_block, else_block } => {
+            StmtKind::If {
+                condition,
+                then_block,
+                else_block,
+            } => {
                 self.write_indent();
                 self.write("if ");
                 self.generate_expr(condition);
@@ -709,7 +714,13 @@ impl PythonGenerator {
                     self.dedent();
                 }
             }
-            StmtKind::For { var, start, end, inclusive, body } => {
+            StmtKind::For {
+                var,
+                start,
+                end,
+                inclusive,
+                body,
+            } => {
                 self.write_indent();
                 self.write(&format!("for {} in range(", var.name));
                 self.generate_expr(start);
@@ -800,8 +811,8 @@ impl PythonGenerator {
             ExprKind::Binary { left, op, right } => {
                 // For array comparisons, use constant_time_eq
                 if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
-                    let left_is_array = self.is_array_like_expr(left);
-                    let right_is_array = self.is_array_like_expr(right);
+                    let left_is_array = is_array_like_expr(left);
+                    let right_is_array = is_array_like_expr(right);
 
                     if left_is_array || right_is_array {
                         if matches!(op, BinaryOp::Ne) {
@@ -817,14 +828,20 @@ impl PythonGenerator {
                 }
 
                 // Python integers are arbitrary precision, so we need to mask for bitwise ops
-                let needs_mask = matches!(op,
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul |
-                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor |
-                    BinaryOp::Shl | BinaryOp::Shr
+                let needs_mask = matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
                 );
 
                 // Check if either operand uses 64-bit types
-                let uses_u64 = self.expr_uses_u64(left) || self.expr_uses_u64(right);
+                let uses_u64 = expr_uses_u64(left) || expr_uses_u64(right);
 
                 if needs_mask {
                     if uses_u64 {
@@ -839,7 +856,7 @@ impl PythonGenerator {
                     BinaryOp::Add => " + ",
                     BinaryOp::Sub => " - ",
                     BinaryOp::Mul => " * ",
-                    BinaryOp::Div => " // ",  // Integer division
+                    BinaryOp::Div => " // ", // Integer division
                     BinaryOp::Rem => " % ",
                     BinaryOp::BitAnd => " & ",
                     BinaryOp::BitOr => " | ",
@@ -889,7 +906,9 @@ impl PythonGenerator {
                 self.generate_expr(index);
                 self.write("]");
             }
-            ExprKind::Slice { array, start, end, .. } => {
+            ExprKind::Slice {
+                array, start, end, ..
+            } => {
                 self.generate_expr(array);
                 self.write("[");
                 self.generate_expr(start);
@@ -903,18 +922,18 @@ impl PythonGenerator {
             }
             ExprKind::Call { func, args } => {
                 // Check for Reader/Writer constructor calls
-                if let ExprKind::Ident(ident) = &func.kind {
-                    if ident.name == "Reader" || ident.name == "Writer" {
-                        self.write(&format!("{}(", ident.name));
-                        for (i, arg) in args.iter().enumerate() {
-                            if i > 0 {
-                                self.write(", ");
-                            }
-                            self.generate_expr(arg);
+                if let ExprKind::Ident(ident) = &func.kind
+                    && (ident.name == "Reader" || ident.name == "Writer")
+                {
+                    self.write(&format!("{}(", ident.name));
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
                         }
-                        self.write(")");
-                        return;
+                        self.generate_expr(arg);
                     }
+                    self.write(")");
+                    return;
                 }
 
                 // Check for method calls like slice.len() or reader.read_u32()
@@ -928,31 +947,33 @@ impl PythonGenerator {
                     }
 
                     // Handle reader.read(&mut struct) - expand to field reads
-                    if field.name == "read" && args.len() == 1 {
-                        if let ExprKind::MutRef(inner) = &args[0].kind {
-                            if let ExprKind::Ident(var_ident) = &inner.kind {
-                                if let Some(struct_name) = self.var_types.get(&var_ident.name).cloned() {
-                                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
-                                        // Generate: [setattr(obj, 'f1', reader.m1()), setattr(obj, 'f2', reader.m2()), ...]
-                                        self.write("[");
-                                        let mut first = true;
-                                        for field_info in &fields {
-                                            if let Some(read_method) = self.get_read_method_for_type(&field_info.ty) {
-                                                if !first {
-                                                    self.write(", ");
-                                                }
-                                                first = false;
-                                                self.write(&format!("setattr({}, '{}', ", var_ident.name, field_info.name));
-                                                self.generate_expr(object);
-                                                self.write(&format!(".{}())", read_method));
-                                            }
-                                        }
-                                        self.write("]");
-                                        return;
-                                    }
+                    if field.name == "read"
+                        && args.len() == 1
+                        && let ExprKind::MutRef(inner) = &args[0].kind
+                        && let ExprKind::Ident(var_ident) = &inner.kind
+                        && let Some(struct_name) = self.var_types.get(&var_ident.name).cloned()
+                        && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
+                    {
+                        // Generate: [setattr(obj, 'f1', reader.m1()), setattr(obj, 'f2', reader.m2()), ...]
+                        self.write("[");
+                        let mut first = true;
+                        for field_info in &fields {
+                            if let Some(read_method) = self.get_read_method_for_type(&field_info.ty)
+                            {
+                                if !first {
+                                    self.write(", ");
                                 }
+                                first = false;
+                                self.write(&format!(
+                                    "setattr({}, '{}', ",
+                                    var_ident.name, field_info.name
+                                ));
+                                self.generate_expr(object);
+                                self.write(&format!(".{}())", read_method));
                             }
                         }
+                        self.write("]");
+                        return;
                     }
 
                     // Handle writer.write(&struct) - expand to field writes
@@ -961,39 +982,66 @@ impl PythonGenerator {
                             ExprKind::Ref(inner) | ExprKind::MutRef(inner) => Some(inner.as_ref()),
                             _ => None,
                         };
-                        if let Some(inner) = inner_expr {
-                            if let ExprKind::Ident(var_ident) = &inner.kind {
-                                if let Some(struct_name) = self.var_types.get(&var_ident.name).cloned() {
-                                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
-                                        // Generate: [writer.m1(obj.f1), writer.m2(obj.f2), ...]
-                                        self.write("[");
-                                        let mut first = true;
-                                        for field_info in &fields {
-                                            if let Some(write_method) = self.get_write_method_for_type(&field_info.ty) {
-                                                if !first {
-                                                    self.write(", ");
-                                                }
-                                                first = false;
-                                                self.generate_expr(object);
-                                                self.write(&format!(".{}({}.{})", write_method, var_ident.name, field_info.name));
-                                            }
-                                        }
-                                        self.write("]");
-                                        return;
+                        if let Some(inner) = inner_expr
+                            && let ExprKind::Ident(var_ident) = &inner.kind
+                            && let Some(struct_name) = self.var_types.get(&var_ident.name).cloned()
+                            && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
+                        {
+                            // Generate: [writer.m1(obj.f1), writer.m2(obj.f2), ...]
+                            self.write("[");
+                            let mut first = true;
+                            for field_info in &fields {
+                                if let Some(write_method) =
+                                    self.get_write_method_for_type(&field_info.ty)
+                                {
+                                    if !first {
+                                        self.write(", ");
                                     }
+                                    first = false;
+                                    self.generate_expr(object);
+                                    self.write(&format!(
+                                        ".{}({}.{})",
+                                        write_method, var_ident.name, field_info.name
+                                    ));
                                 }
                             }
+                            self.write("]");
+                            return;
                         }
                     }
 
                     // Reader/Writer method calls - pass through directly
-                    let reader_methods = ["read_u8", "read_u16", "read_u16be", "read_u16le",
-                        "read_u32", "read_u32be", "read_u32le", "read_u64", "read_u64be", "read_u64le",
-                        "read_bytes", "read_chunk", "eof"];
-                    let writer_methods = ["write_u8", "write_u16", "write_u16be", "write_u16le",
-                        "write_u32", "write_u32be", "write_u32le", "write_u64", "write_u64be", "write_u64le",
-                        "write_bytes"];
-                    if reader_methods.contains(&field.name.as_str()) || writer_methods.contains(&field.name.as_str()) {
+                    let reader_methods = [
+                        "read_u8",
+                        "read_u16",
+                        "read_u16be",
+                        "read_u16le",
+                        "read_u32",
+                        "read_u32be",
+                        "read_u32le",
+                        "read_u64",
+                        "read_u64be",
+                        "read_u64le",
+                        "read_bytes",
+                        "read_chunk",
+                        "eof",
+                    ];
+                    let writer_methods = [
+                        "write_u8",
+                        "write_u16",
+                        "write_u16be",
+                        "write_u16le",
+                        "write_u32",
+                        "write_u32be",
+                        "write_u32le",
+                        "write_u64",
+                        "write_u64be",
+                        "write_u64le",
+                        "write_bytes",
+                    ];
+                    if reader_methods.contains(&field.name.as_str())
+                        || writer_methods.contains(&field.name.as_str())
+                    {
                         self.generate_expr(object);
                         self.write(&format!(".{}(", field.name));
                         for (i, arg) in args.iter().enumerate() {
@@ -1008,22 +1056,20 @@ impl PythonGenerator {
 
                     // Check for struct method calls (object.method(args))
                     // First, try to get the struct type from var_types
-                    if let ExprKind::Ident(obj_ident) = &object.kind {
-                        if let Some(struct_name) = self.var_types.get(&obj_ident.name).cloned() {
-                            if let Some(methods) = self.struct_methods.get(&struct_name).cloned() {
-                                if let Some(mangled_name) = methods.get(&field.name) {
-                                    // Generate: StructName__method(object, args...)
-                                    self.write(&format!("{}(", mangled_name));
-                                    self.generate_expr(object);
-                                    for arg in args {
-                                        self.write(", ");
-                                        self.generate_expr(arg);
-                                    }
-                                    self.write(")");
-                                    return;
-                                }
-                            }
+                    if let ExprKind::Ident(obj_ident) = &object.kind
+                        && let Some(struct_name) = self.var_types.get(&obj_ident.name).cloned()
+                        && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
+                        && let Some(mangled_name) = methods.get(&field.name)
+                    {
+                        // Generate: StructName__method(object, args...)
+                        self.write(&format!("{}(", mangled_name));
+                        self.generate_expr(object);
+                        for arg in args {
+                            self.write(", ");
+                            self.generate_expr(arg);
                         }
+                        self.write(")");
+                        return;
                     }
                 }
 
@@ -1082,12 +1128,29 @@ impl PythonGenerator {
                 self.write(")");
             }
             ExprKind::StructLit { name, fields } => {
-                // Create struct instance and set fields
-                self.write(&format!("{}()", name.name));
-                // Note: This doesn't handle field initialization inline
-                // For proper struct literals, we'd need a different approach
+                if fields.is_empty() {
+                    // No fields to initialize
+                    self.write(&format!("{}()", name.name));
+                } else {
+                    // Create struct instance and initialize fields using lambda
+                    // (lambda __o: (setattr(__o, 'f1', v1), ..., __o)[-1])(S())
+                    self.write("(lambda __o: (");
+                    for (i, (field_name, value)) in fields.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.write(&format!("setattr(__o, '{}', ", field_name.name));
+                        self.generate_expr(value);
+                        self.write(")");
+                    }
+                    self.write(&format!(", __o)[-1])({}())", name.name));
+                }
             }
-            ExprKind::Conditional { condition, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 // Python conditional: then_expr if condition else else_expr
                 self.write("(");
                 self.generate_expr(then_expr);
@@ -1097,7 +1160,11 @@ impl PythonGenerator {
                 self.generate_expr(else_expr);
                 self.write(")");
             }
-            ExprKind::EnumVariant { enum_name, variant_name, args } => {
+            ExprKind::EnumVariant {
+                enum_name,
+                variant_name,
+                args,
+            } => {
                 // Generate: EnumName.VariantName or EnumName.VariantName(args...)
                 if args.is_empty() {
                     self.write(&format!("{}.{}", enum_name.name, variant_name.name));
@@ -1123,7 +1190,12 @@ impl PythonGenerator {
                 self.generate_expr(expr);
                 self.write(")");
             }
-            ExprKind::MethodCall { receiver, mangled_name, args, .. } => {
+            ExprKind::MethodCall {
+                receiver,
+                mangled_name,
+                args,
+                ..
+            } => {
                 // Generate: mangled_name(receiver, args...)
                 self.write(&format!("{}(", mangled_name));
                 self.generate_expr(receiver);
@@ -1138,7 +1210,7 @@ impl PythonGenerator {
 
     fn generate_match_arms(&mut self, arms: &[crate::parser::MatchArm], index: usize) {
         if index >= arms.len() {
-            self.write("None");  // No arm matched, shouldn't happen with exhaustive matching
+            self.write("None"); // No arm matched, shouldn't happen with exhaustive matching
             return;
         }
 
@@ -1189,7 +1261,7 @@ impl PythonGenerator {
     }
 
     fn generate_cast(&mut self, expr: &Expr, ty: &crate::parser::Type) {
-        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+        use crate::parser::{Endianness, PrimitiveType, TypeKind};
 
         // Check for endian byte conversions (byte slice/array to integer)
         // e.g., buf[0..4] as u32be -> int.from_bytes(buf[0:4], 'big')
@@ -1204,7 +1276,7 @@ impl PythonGenerator {
                 };
 
                 // Check if source is a slice/array (byte conversion)
-                if self.is_byte_sequence_expr(expr) {
+                if is_byte_sequence_expr(expr) {
                     self.write("int.from_bytes(bytes(");
                     self.generate_expr(expr);
                     self.write("), ");
@@ -1250,15 +1322,15 @@ impl PythonGenerator {
 
         // Check for integer to byte array cast
         // e.g., value as u8[4] -> value.to_bytes(4, 'big')
-        if let TypeKind::Array { element, size } = &ty.kind {
-            if let TypeKind::Primitive(PrimitiveType::U8) = &element.kind {
-                // Get the endianness from the source expression if it's an endian type
-                let byte_order = self.get_expr_endianness(expr);
-                self.write("(");
-                self.generate_expr(expr);
-                self.write(&format!(").to_bytes({}, {})", size, byte_order));
-                return;
-            }
+        if let TypeKind::Array { element, size } = &ty.kind
+            && let TypeKind::Primitive(PrimitiveType::U8) = &element.kind
+        {
+            // Get the endianness from the source expression if it's an endian type
+            let byte_order = self.get_expr_endianness(expr);
+            self.write("(");
+            self.generate_expr(expr);
+            self.write(&format!(").to_bytes({}, {})", size, byte_order));
+            return;
         }
 
         // Standard integer casts (masking)
@@ -1307,75 +1379,19 @@ impl PythonGenerator {
         }
     }
 
-    /// Check if an expression produces a byte sequence (for from_bytes conversion)
-    fn is_byte_sequence_expr(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Slice { .. } => true,
-            ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
-            ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
-            ExprKind::Index { array, .. } => {
-                // array[i] is a single byte, not a sequence
-                false
-            }
-            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Paren(inner) => {
-                self.is_byte_sequence_expr(inner)
-            }
-            ExprKind::Ident(_) => {
-                // Could be a byte array/slice variable - assume yes for safety
-                // The type checker will have validated this
-                true
-            }
-            ExprKind::Field { .. } => true,
-            _ => false,
-        }
-    }
-
-    /// Check if an expression involves 64-bit or larger types
-    fn expr_uses_u64(&self, expr: &Expr) -> bool {
-        use crate::parser::{TypeKind, PrimitiveType};
-
-        match &expr.kind {
-            // Cast determines the output type
-            ExprKind::Cast { ty, .. } => {
-                if let TypeKind::Primitive(p) = &ty.kind {
-                    let native = p.to_native();
-                    matches!(native,
-                        PrimitiveType::U64 | PrimitiveType::I64 |
-                        PrimitiveType::U128 | PrimitiveType::I128
-                    )
-                } else {
-                    false
-                }
-            }
-            // Binary operations propagate u64
-            ExprKind::Binary { left, right, .. } => {
-                self.expr_uses_u64(left) || self.expr_uses_u64(right)
-            }
-            // Unary operations propagate u64
-            ExprKind::Unary { operand, .. } => {
-                self.expr_uses_u64(operand)
-            }
-            // Parentheses propagate u64
-            ExprKind::Paren(inner) => self.expr_uses_u64(inner),
-            // Large integer literals need u64
-            ExprKind::Integer(n) => *n > 0xFFFFFFFF,
-            _ => false,
-        }
-    }
-
     /// Get the byte order string for an expression based on its type
     fn get_expr_endianness(&self, expr: &Expr) -> &'static str {
-        use crate::parser::{TypeKind, Endianness};
+        use crate::parser::{Endianness, TypeKind};
 
         // Check if the expression is a cast to an endian type
-        if let ExprKind::Cast { ty, .. } = &expr.kind {
-            if let TypeKind::Primitive(p) = &ty.kind {
-                return match p.endianness() {
-                    Endianness::Big => "'big'",
-                    Endianness::Little => "'little'",
-                    Endianness::Native => "'little'", // Default to little for native
-                };
-            }
+        if let ExprKind::Cast { ty, .. } = &expr.kind
+            && let TypeKind::Primitive(p) = &ty.kind
+        {
+            return match p.endianness() {
+                Endianness::Big => "'big'",
+                Endianness::Little => "'little'",
+                Endianness::Native => "'little'", // Default to little for native
+            };
         }
         // Default to little endian (most common)
         "'little'"
@@ -1383,7 +1399,7 @@ impl PythonGenerator {
 
     /// Get the Reader method name for reading a field type
     fn get_read_method_for_type(&self, ty: &ParserType) -> Option<String> {
-        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+        use crate::parser::{Endianness, PrimitiveType, TypeKind};
 
         match &ty.kind {
             TypeKind::Primitive(p) => {
@@ -1408,7 +1424,7 @@ impl PythonGenerator {
 
     /// Get the Writer method name for writing a field type
     fn get_write_method_for_type(&self, ty: &ParserType) -> Option<String> {
-        use crate::parser::{TypeKind, PrimitiveType, Endianness};
+        use crate::parser::{Endianness, PrimitiveType, TypeKind};
 
         match &ty.kind {
             TypeKind::Primitive(p) => {
@@ -1432,6 +1448,73 @@ impl PythonGenerator {
     }
 }
 
+/// Check if an expression is likely an array type (used for comparison)
+fn is_array_like_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
+        ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
+        ExprKind::Slice { .. } => true,
+        ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
+            is_array_like_expr(inner)
+        }
+        ExprKind::Paren(inner) => is_array_like_expr(inner),
+        ExprKind::Builtin { .. } => false,
+        ExprKind::Index { .. } => false,
+        ExprKind::Field { .. } => false,
+        ExprKind::Ident(_) => false,
+        ExprKind::Call { .. } => false,
+        _ => false,
+    }
+}
+
+/// Check if an expression produces a byte sequence (for from_bytes conversion)
+fn is_byte_sequence_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Slice { .. } => true,
+        ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
+        ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => true,
+        ExprKind::Index { .. } => false, // array[i] is a single byte, not a sequence
+        ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Paren(inner) => {
+            is_byte_sequence_expr(inner)
+        }
+        ExprKind::Ident(_) => true, // Assume variables can be byte sequences
+        ExprKind::Field { .. } => true,
+        _ => false,
+    }
+}
+
+/// Check if an expression involves 64-bit or larger types
+fn expr_uses_u64(expr: &Expr) -> bool {
+    use crate::parser::{PrimitiveType, TypeKind};
+
+    match &expr.kind {
+        // Cast determines the output type
+        ExprKind::Cast { ty, .. } => {
+            if let TypeKind::Primitive(p) = &ty.kind {
+                let native = p.to_native();
+                matches!(
+                    native,
+                    PrimitiveType::U64
+                        | PrimitiveType::I64
+                        | PrimitiveType::U128
+                        | PrimitiveType::I128
+                )
+            } else {
+                false
+            }
+        }
+        // Binary operations propagate u64
+        ExprKind::Binary { left, right, .. } => expr_uses_u64(left) || expr_uses_u64(right),
+        // Unary operations propagate u64
+        ExprKind::Unary { operand, .. } => expr_uses_u64(operand),
+        // Parentheses propagate u64
+        ExprKind::Paren(inner) => expr_uses_u64(inner),
+        // Large integer literals need u64
+        ExprKind::Integer(n) => *n > 0xFFFFFFFF,
+        _ => false,
+    }
+}
+
 impl Default for PythonGenerator {
     fn default() -> Self {
         Self::new()
@@ -1448,17 +1531,25 @@ impl CodeGenerator for PythonGenerator {
         for item in &ast.ast.items {
             match &item.kind {
                 ItemKind::Struct(s) => {
-                    let fields: Vec<StructFieldInfo> = s.fields.iter().map(|f| StructFieldInfo {
-                        name: f.name.name.clone(),
-                        ty: f.ty.clone(),
-                    }).collect();
+                    let fields: Vec<StructFieldInfo> = s
+                        .fields
+                        .iter()
+                        .map(|f| StructFieldInfo {
+                            name: f.name.name.clone(),
+                            ty: f.ty.clone(),
+                        })
+                        .collect();
                     self.struct_defs.insert(s.name.name.clone(), fields);
                 }
                 ItemKind::Layout(l) => {
-                    let fields: Vec<StructFieldInfo> = l.fields.iter().map(|f| StructFieldInfo {
-                        name: f.name.name.clone(),
-                        ty: f.ty.clone(),
-                    }).collect();
+                    let fields: Vec<StructFieldInfo> = l
+                        .fields
+                        .iter()
+                        .map(|f| StructFieldInfo {
+                            name: f.name.name.clone(),
+                            ty: f.ty.clone(),
+                        })
+                        .collect();
                     self.struct_defs.insert(l.name.name.clone(), fields);
                 }
                 ItemKind::Impl(impl_def) => {
@@ -1468,7 +1559,8 @@ impl CodeGenerator for PythonGenerator {
                         let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
                         methods.insert(method.name.name.clone(), mangled);
                     }
-                    self.struct_methods.insert(impl_def.target.name.clone(), methods);
+                    self.struct_methods
+                        .insert(impl_def.target.name.clone(), methods);
                 }
                 _ => {}
             }
@@ -1487,7 +1579,10 @@ impl CodeGenerator for PythonGenerator {
         self.generate_ast(&ast.ast);
 
         // Collect test names for the runner
-        let test_names: Vec<_> = ast.ast.items.iter()
+        let test_names: Vec<_> = ast
+            .ast
+            .items
+            .iter()
             .filter_map(|item| {
                 if let ItemKind::Test(t) = &item.kind {
                     Some(t.name.name.clone())

@@ -2,8 +2,8 @@
 //!
 //! Hand-written lexer that tokenizes AlgoC source code into a stream of tokens.
 
-mod token;
 mod scanner;
+mod token;
 
-pub use token::{Token, TokenKind, Keyword};
 pub use scanner::Lexer;
+pub use token::{Keyword, Token, TokenKind};
