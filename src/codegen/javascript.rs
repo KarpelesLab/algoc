@@ -1877,7 +1877,7 @@ impl CodeGenerator for JavaScriptGenerator {
             .collect();
 
         // Generate test runner if tests are included
-        if self.include_tests && !test_names.is_empty() {
+        if self.include_tests {
             self.writeln("// Test Runner");
             self.writeln("function run_tests() {");
             self.indent();
@@ -1947,7 +1947,7 @@ impl CodeGenerator for JavaScriptGenerator {
                 first = false;
             }
         }
-        if self.include_tests && !test_names.is_empty() {
+        if self.include_tests {
             if !first {
                 self.write(", ");
             }
@@ -1958,7 +1958,7 @@ impl CodeGenerator for JavaScriptGenerator {
         self.writeln("}");
 
         // Auto-run tests if this is the main module
-        if self.include_tests && !test_names.is_empty() {
+        if self.include_tests {
             self.writeln("");
             self.writeln("// Auto-run tests if executed directly");
             self.writeln("if (typeof require !== 'undefined' && require.main === module) {");

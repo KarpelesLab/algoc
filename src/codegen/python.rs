@@ -1458,7 +1458,7 @@ impl CodeGenerator for PythonGenerator {
             .collect();
 
         // Generate test runner if tests are included
-        if self.include_tests && !test_names.is_empty() {
+        if self.include_tests {
             self.writeln("# Test Runner");
             self.writeln("def run_tests():");
             self.indent();
@@ -1502,7 +1502,7 @@ impl CodeGenerator for PythonGenerator {
         // Main block
         self.writeln("if __name__ == '__main__':");
         self.indent();
-        if self.include_tests && !test_names.is_empty() {
+        if self.include_tests {
             self.writeln("import sys");
             self.writeln("sys.exit(0 if run_tests() else 1)");
         } else {

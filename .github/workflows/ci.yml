@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run cargo tests
+        run: cargo test
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run stdlib tests (JavaScript)
+        run: |
+          echo "Running stdlib tests with JavaScript target..."
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            cargo run --release -- test "$file" --target js
+          done
+
+      - name: Run stdlib tests (Python)
+        run: |
+          echo "Running stdlib tests with Python target..."
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            cargo run --release -- test "$file" --target python
+          done
