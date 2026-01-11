@@ -58,6 +58,11 @@ impl Scope {
         self.structs.get(name)
     }
 
+    /// Look up a struct by name (mutable)
+    pub fn get_struct_mut(&mut self, name: &str) -> Option<&mut StructDef> {
+        self.structs.get_mut(name)
+    }
+
     /// Define an enum in this scope
     pub fn define_enum(&mut self, name: String, def: EnumDef) -> Result<(), String> {
         if self.enums.contains_key(&name) {
@@ -174,6 +179,8 @@ pub struct StructDef {
     pub name: String,
     /// Fields of the struct
     pub fields: Vec<StructField>,
+    /// Methods defined for this struct (method name -> mangled function name)
+    pub methods: HashMap<String, String>,
     /// Source location
     pub span: SourceSpan,
 }
@@ -184,6 +191,7 @@ impl StructDef {
         Self {
             name,
             fields: Vec::new(),
+            methods: HashMap::new(),
             span,
         }
     }
@@ -201,6 +209,16 @@ impl StructDef {
     /// Get the index of a field by name
     pub fn field_index(&self, name: &str) -> Option<usize> {
         self.fields.iter().position(|f| f.name == name)
+    }
+
+    /// Add a method to the struct
+    pub fn add_method(&mut self, name: String, mangled_name: String) {
+        self.methods.insert(name, mangled_name);
+    }
+
+    /// Get a method's mangled name by its short name
+    pub fn get_method(&self, name: &str) -> Option<&String> {
+        self.methods.get(name)
     }
 }
 

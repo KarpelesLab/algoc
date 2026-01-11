@@ -34,6 +34,7 @@ pub enum Keyword {
     Mut,
     Test,
     Match,
+    Impl,
 
     // Types
     U8,
@@ -114,6 +115,7 @@ impl Keyword {
             "mut" => Some(Keyword::Mut),
             "test" => Some(Keyword::Test),
             "match" => Some(Keyword::Match),
+            "impl" => Some(Keyword::Impl),
 
             // Types
             "u8" => Some(Keyword::U8),
@@ -196,6 +198,7 @@ impl fmt::Display for Keyword {
             Keyword::Mut => "mut",
             Keyword::Test => "test",
             Keyword::Match => "match",
+            Keyword::Impl => "impl",
             Keyword::U8 => "u8",
             Keyword::U16 => "u16",
             Keyword::U32 => "u32",

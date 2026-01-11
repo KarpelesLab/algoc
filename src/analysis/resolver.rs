@@ -224,6 +224,41 @@ impl Resolver {
                     self.error(err, e.name.span);
                 }
             }
+            ItemKind::Impl(impl_def) => {
+                // Check that the target struct exists
+                if self.scopes.lookup_struct(&impl_def.target.name).is_none() {
+                    self.error(format!("impl for unknown type '{}'", impl_def.target.name), impl_def.target.span);
+                    return;
+                }
+
+                // Register each method with a mangled name: StructName__method_name
+                for method in &impl_def.methods {
+                    // Build method type (includes self parameter)
+                    let params: Vec<Type> = method.params.iter()
+                        .map(|p| self.resolve_type(&p.ty))
+                        .collect();
+                    let return_type = method.return_type.as_ref()
+                        .map(|t| self.resolve_type(t))
+                        .unwrap_or_else(Type::unit);
+
+                    let func_type = Type::new(TypeKind::Function {
+                        params,
+                        return_type: Box::new(return_type),
+                    });
+
+                    // Register as StructName__method
+                    let mangled_name = format!("{}__{}",impl_def.target.name, method.name.name);
+                    let symbol = Symbol::function(func_type, method.name.span);
+                    if let Err(e) = self.scopes.global_mut().define(mangled_name.clone(), symbol) {
+                        self.error(e, method.name.span);
+                    }
+
+                    // Also register the method in the struct's method table
+                    if let Some(struct_def) = self.scopes.global_mut().get_struct_mut(&impl_def.target.name) {
+                        struct_def.add_method(method.name.name.clone(), mangled_name);
+                    }
+                }
+            }
         }
     }
 
@@ -264,6 +299,26 @@ impl Resolver {
             }
             ItemKind::Use(_) => {
                 // Use statements are handled during loading
+            }
+            ItemKind::Impl(impl_def) => {
+                // Resolve each method's body
+                for method in &impl_def.methods {
+                    self.scopes.push();
+
+                    // Add parameters to scope
+                    for param in &method.params {
+                        let ty = self.resolve_type(&param.ty);
+                        let symbol = Symbol::parameter(ty, param.span);
+                        if let Err(e) = self.scopes.define(param.name.name.clone(), symbol) {
+                            self.error(e, param.name.span);
+                        }
+                    }
+
+                    // Resolve method body
+                    self.resolve_block(&method.body);
+
+                    self.scopes.pop();
+                }
             }
         }
     }
@@ -461,6 +516,13 @@ impl Resolver {
                     self.resolve_pattern(&arm.pattern);
                     self.resolve_expr(&arm.body);
                     self.scopes.pop();
+                }
+            }
+            parser::ExprKind::MethodCall { receiver, args, .. } => {
+                // Resolve receiver and arguments
+                self.resolve_expr(receiver);
+                for arg in args {
+                    self.resolve_expr(arg);
                 }
             }
         }

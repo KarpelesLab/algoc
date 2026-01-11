@@ -165,6 +165,29 @@ impl<'a> TypeChecker<'a> {
             ItemKind::Use(_) => {
                 // Use statements are handled during loading
             }
+            ItemKind::Impl(impl_def) => {
+                // Check each method in the impl block
+                for method in &impl_def.methods {
+                    let return_type = method.return_type.as_ref()
+                        .map(|t| self.ast_to_type(t))
+                        .unwrap_or_else(Type::unit);
+                    self.current_return_type = Some(return_type);
+
+                    self.scopes.push();
+
+                    // Add parameters to scope
+                    for param in &method.params {
+                        let ty = self.ast_to_type(&param.ty);
+                        let symbol = Symbol::parameter(ty, param.span);
+                        let _ = self.scopes.define(param.name.name.clone(), symbol);
+                    }
+
+                    self.check_block(&method.body);
+
+                    self.scopes.pop();
+                    self.current_return_type = None;
+                }
+            }
         }
     }
 
@@ -986,6 +1009,21 @@ impl<'a> TypeChecker<'a> {
                 }
                 result_ty.unwrap_or_else(Type::error)
             }
+            parser::ExprKind::MethodCall { receiver, args, mangled_name, .. } => {
+                // Check receiver and all arguments
+                self.infer_expr(receiver);
+                for arg in args {
+                    self.infer_expr(arg);
+                }
+
+                // Look up the method function type
+                if let Some(sym) = self.global_scope.get(&mangled_name) {
+                    if let TypeKind::Function { return_type, .. } = &sym.ty.kind {
+                        return (**return_type).clone();
+                    }
+                }
+                Type::unit()
+            }
         }
     }
 
@@ -1168,6 +1206,41 @@ impl<'a> TypeChecker<'a> {
         // Check for Writer methods
         if base_ty.is_writer() {
             return self.check_writer_method(method, args, span);
+        }
+
+        // Check for struct methods defined in impl blocks
+        if let TypeKind::Struct { name } = &base_ty.kind {
+            if let Some(struct_def) = self.global_scope.get_struct(name) {
+                if let Some(mangled_name) = struct_def.get_method(method) {
+                    // Look up the method's function type
+                    if let Some(sym) = self.global_scope.get(mangled_name) {
+                        if let TypeKind::Function { params, return_type } = &sym.ty.kind {
+                            // First parameter is self, skip it for argument count
+                            let expected_args = params.len().saturating_sub(1);
+                            if args.len() != expected_args {
+                                self.error(
+                                    format!("method '{}' expects {} arguments, got {}",
+                                        method, expected_args, args.len()),
+                                    span,
+                                );
+                            } else {
+                                // Check argument types (skip self parameter)
+                                for (i, (arg, param_ty)) in args.iter().zip(params.iter().skip(1)).enumerate() {
+                                    let arg_ty = self.infer_expr(arg);
+                                    if !arg_ty.is_compatible_with(param_ty) {
+                                        self.error(
+                                            format!("argument {} type mismatch: expected {}, got {}",
+                                                i + 1, param_ty, arg_ty),
+                                            arg.span,
+                                        );
+                                    }
+                                }
+                            }
+                            return Some((**return_type).clone());
+                        }
+                    }
+                }
+            }
         }
 
         match method {

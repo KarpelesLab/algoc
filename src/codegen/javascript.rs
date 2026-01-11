@@ -19,6 +19,9 @@ struct StructFieldInfo {
     ty: ParserType,
 }
 
+/// Struct method info (method name -> mangled function name)
+type MethodMap = HashMap<String, String>;
+
 /// JavaScript code generator
 pub struct JavaScriptGenerator {
     /// Current indentation level
@@ -37,6 +40,8 @@ pub struct JavaScriptGenerator {
     current_func_returns_bigint: bool,
     /// Struct definitions for read/write generation
     struct_defs: HashMap<String, Vec<StructFieldInfo>>,
+    /// Struct methods: struct_name -> (method_name -> mangled_name)
+    struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
 }
@@ -52,6 +57,7 @@ impl JavaScriptGenerator {
             bigint_fields: HashSet::new(),
             current_func_returns_bigint: false,
             struct_defs: HashMap::new(),
+            struct_methods: HashMap::new(),
             var_types: HashMap::new(),
         }
     }
@@ -359,7 +365,37 @@ impl JavaScriptGenerator {
             ItemKind::Use(_) => {
                 // Use statements are handled during loading, items are already merged
             }
+            ItemKind::Impl(impl_def) => {
+                // Generate methods as standalone functions with mangled names
+                for method in &impl_def.methods {
+                    self.generate_method(&impl_def.target.name, method);
+                }
+            }
         }
+    }
+
+    fn generate_method(&mut self, struct_name: &str, func: &crate::parser::Function) {
+        // Clear BigInt variable tracking for this method
+        self.bigint_vars.clear();
+
+        let mangled_name = format!("{}__{}", struct_name, func.name.name);
+        let params: Vec<String> = func.params.iter()
+            .map(|p| p.name.name.clone())
+            .collect();
+
+        // Track BigInt parameters
+        for param in &func.params {
+            if self.is_bigint_type(Some(&param.ty)) {
+                self.bigint_vars.insert(param.name.name.clone());
+            }
+        }
+
+        self.writeln(&format!("function {}({}) {{", mangled_name, params.join(", ")));
+        self.indent();
+        self.generate_block(&func.body);
+        self.dedent();
+        self.writeln("}");
+        self.writeln("");
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
@@ -1037,6 +1073,25 @@ impl JavaScriptGenerator {
                         self.write(")");
                         return;
                     }
+
+                    // Check for struct method calls (object.method(args))
+                    if let ExprKind::Ident(obj_ident) = &object.kind {
+                        if let Some(struct_name) = self.var_types.get(&obj_ident.name).cloned() {
+                            if let Some(methods) = self.struct_methods.get(&struct_name).cloned() {
+                                if let Some(mangled_name) = methods.get(&field.name) {
+                                    // Generate: StructName__method(object, args...)
+                                    self.write(&format!("{}(", mangled_name));
+                                    self.generate_expr(object);
+                                    for arg in args {
+                                        self.write(", ");
+                                        self.generate_expr(arg);
+                                    }
+                                    self.write(")");
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 self.generate_expr(func);
@@ -1204,6 +1259,16 @@ impl JavaScriptGenerator {
                 }
                 self.write(" })(");
                 self.generate_expr(expr);
+                self.write(")");
+            }
+            ExprKind::MethodCall { receiver, mangled_name, args, .. } => {
+                // Generate: mangled_name(receiver, args...)
+                self.write(&format!("{}(", mangled_name));
+                self.generate_expr(receiver);
+                for arg in args {
+                    self.write(", ");
+                    self.generate_expr(arg);
+                }
                 self.write(")");
             }
         }
@@ -1647,9 +1712,22 @@ impl JavaScriptGenerator {
             ExprKind::Call { func, .. } => {
                 if let ExprKind::Ident(ident) = &func.kind {
                     self.bigint_funcs.contains(&ident.name)
+                } else if let ExprKind::Field { object, field } = &func.kind {
+                    // Check for method calls (object.method())
+                    if let ExprKind::Ident(obj_ident) = &object.kind {
+                        if let Some(struct_name) = self.var_types.get(&obj_ident.name) {
+                            let mangled_name = format!("{}__{}", struct_name, field.name);
+                            return self.bigint_funcs.contains(&mangled_name);
+                        }
+                    }
+                    false
                 } else {
                     false
                 }
+            }
+            // Check MethodCall expressions directly
+            ExprKind::MethodCall { mangled_name, .. } => {
+                self.bigint_funcs.contains(mangled_name)
             }
             // Check field access - if field is BigInt type
             ExprKind::Field { field, .. } => {
@@ -1755,6 +1833,21 @@ impl CodeGenerator for JavaScriptGenerator {
                             self.bigint_fields.insert(field.name.name.clone());
                         }
                     }
+                }
+                ItemKind::Impl(impl_def) => {
+                    // Collect method names for this struct
+                    let mut methods = HashMap::new();
+                    for method in &impl_def.methods {
+                        let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
+                        methods.insert(method.name.name.clone(), mangled);
+                        // Also track if method returns BigInt
+                        if let Some(ret_ty) = &method.return_type {
+                            if self.is_bigint_type(Some(ret_ty)) {
+                                self.bigint_funcs.insert(format!("{}__{}", impl_def.target.name, method.name.name));
+                            }
+                        }
+                    }
+                    self.struct_methods.insert(impl_def.target.name.clone(), methods);
                 }
                 _ => {}
             }

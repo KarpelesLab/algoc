@@ -32,6 +32,8 @@ pub enum ItemKind {
     Const(ConstDef),
     /// Enum definition: `enum Name { Variant1, Variant2(T), ... }`
     Enum(EnumDef),
+    /// Impl block: `impl StructName { fn method(&self) { ... } }`
+    Impl(ImplDef),
     /// Test definition: `test name { input: ..., expect: ... }`
     Test(TestDef),
 }
@@ -125,6 +127,16 @@ pub enum EnumVariantData {
     Tuple(Vec<Type>),
     /// Struct variant: `Point { x: i32, y: i32 }`
     Struct(Vec<Field>),
+}
+
+/// An impl block definition
+#[derive(Debug, Clone)]
+pub struct ImplDef {
+    /// The type this impl is for
+    pub target: Ident,
+    /// Methods defined in this impl block
+    pub methods: Vec<Function>,
+    pub span: SourceSpan,
 }
 
 /// A test definition (function-like)
@@ -484,6 +496,13 @@ pub enum ExprKind {
     Match {
         expr: Box<Expr>,
         arms: Vec<MatchArm>,
+    },
+    /// Method call (added by type checker): `receiver.method(args)` -> resolved function name
+    MethodCall {
+        receiver: Box<Expr>,
+        method_name: String,
+        mangled_name: String,
+        args: Vec<Expr>,
     },
 }
 

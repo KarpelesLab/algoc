@@ -133,6 +133,9 @@ fn main() -> ExitCode {
                             algoc::parser::ItemKind::Enum(e) => {
                                 println!("  enum {} ({} variants)", e.name.name, e.variants.len());
                             }
+                            algoc::parser::ItemKind::Impl(i) => {
+                                println!("  impl {} ({} methods)", i.target.name, i.methods.len());
+                            }
                         }
                     }
                     ExitCode::SUCCESS

@@ -167,11 +167,13 @@ impl<'src> Parser<'src> {
             ItemKind::Enum(self.parse_enum()?)
         } else if self.check_keyword(Keyword::Const) {
             ItemKind::Const(self.parse_const()?)
+        } else if self.check_keyword(Keyword::Impl) {
+            ItemKind::Impl(self.parse_impl()?)
         } else if self.check_keyword(Keyword::Test) {
             ItemKind::Test(self.parse_test()?)
         } else {
             return Err(AlgocError::parser(
-                format!("expected item (use, fn, struct, enum, const, test), found {}", self.peek().kind),
+                format!("expected item (use, fn, struct, enum, const, impl, test), found {}", self.peek().kind),
                 self.current_span(),
             ));
         };
@@ -270,6 +272,31 @@ impl<'src> Parser<'src> {
         self.expect(&TokenKind::RBrace, "expected '}' after enum variants")?;
 
         Ok(EnumDef { name, variants })
+    }
+
+    fn parse_impl(&mut self) -> AlgocResult<ImplDef> {
+        let start = self.current_span();
+        self.expect_keyword(Keyword::Impl, "expected 'impl'")?;
+        let target = self.parse_ident()?;
+
+        self.expect(&TokenKind::LBrace, "expected '{' after impl target")?;
+
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            if self.check_keyword(Keyword::Fn) {
+                methods.push(self.parse_function()?);
+            } else {
+                return Err(AlgocError::parser(
+                    format!("expected 'fn' in impl block, found {}", self.peek().kind),
+                    self.current_span(),
+                ));
+            }
+        }
+
+        self.expect(&TokenKind::RBrace, "expected '}' after impl methods")?;
+
+        let span = start.merge(self.previous().span);
+        Ok(ImplDef { target, methods, span })
     }
 
     fn parse_enum_variants(&mut self) -> AlgocResult<Vec<EnumVariant>> {

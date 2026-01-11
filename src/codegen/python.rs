@@ -19,6 +19,9 @@ struct StructFieldInfo {
     ty: ParserType,
 }
 
+/// Struct method info (method name -> mangled function name)
+type MethodMap = HashMap<String, String>;
+
 /// Python code generator
 pub struct PythonGenerator {
     /// Current indentation level
@@ -29,6 +32,8 @@ pub struct PythonGenerator {
     include_tests: bool,
     /// Struct definitions for read/write generation
     struct_defs: HashMap<String, Vec<StructFieldInfo>>,
+    /// Struct methods: struct_name -> (method_name -> mangled_name)
+    struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
 }
@@ -40,6 +45,7 @@ impl PythonGenerator {
             output: String::new(),
             include_tests: false,
             struct_defs: HashMap::new(),
+            struct_methods: HashMap::new(),
             var_types: HashMap::new(),
         }
     }
@@ -367,7 +373,30 @@ impl PythonGenerator {
             ItemKind::Use(_) => {
                 // Use statements are handled during loading
             }
+            ItemKind::Impl(impl_def) => {
+                // Generate methods as standalone functions with mangled names
+                for method in &impl_def.methods {
+                    self.generate_method(&impl_def.target.name, method);
+                }
+            }
         }
+    }
+
+    fn generate_method(&mut self, struct_name: &str, func: &crate::parser::Function) {
+        let mangled_name = format!("{}__{}", struct_name, func.name.name);
+        self.writeln(&format!("def {}({}):", mangled_name,
+            func.params.iter()
+                .map(|p| p.name.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")));
+        self.indent();
+        if func.body.stmts.is_empty() {
+            self.writeln("pass");
+        } else {
+            self.generate_block(&func.body);
+        }
+        self.dedent();
+        self.writeln("");
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
@@ -969,6 +998,26 @@ impl PythonGenerator {
                         self.write(")");
                         return;
                     }
+
+                    // Check for struct method calls (object.method(args))
+                    // First, try to get the struct type from var_types
+                    if let ExprKind::Ident(obj_ident) = &object.kind {
+                        if let Some(struct_name) = self.var_types.get(&obj_ident.name).cloned() {
+                            if let Some(methods) = self.struct_methods.get(&struct_name).cloned() {
+                                if let Some(mangled_name) = methods.get(&field.name) {
+                                    // Generate: StructName__method(object, args...)
+                                    self.write(&format!("{}(", mangled_name));
+                                    self.generate_expr(object);
+                                    for arg in args {
+                                        self.write(", ");
+                                        self.generate_expr(arg);
+                                    }
+                                    self.write(")");
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 self.generate_expr(func);
@@ -1065,6 +1114,16 @@ impl PythonGenerator {
                 self.generate_match_arms(arms, 0);
                 self.write(")(");
                 self.generate_expr(expr);
+                self.write(")");
+            }
+            ExprKind::MethodCall { receiver, mangled_name, args, .. } => {
+                // Generate: mangled_name(receiver, args...)
+                self.write(&format!("{}(", mangled_name));
+                self.generate_expr(receiver);
+                for arg in args {
+                    self.write(", ");
+                    self.generate_expr(arg);
+                }
                 self.write(")");
             }
         }
@@ -1343,8 +1402,9 @@ impl CodeGenerator for PythonGenerator {
     fn generate(&mut self, ast: &AnalyzedAst) -> AlgocResult<String> {
         self.output.clear();
         self.struct_defs.clear();
+        self.struct_methods.clear();
 
-        // Pre-pass: collect struct field info for read/write generation
+        // Pre-pass: collect struct field info and methods for read/write generation
         for item in &ast.ast.items {
             match &item.kind {
                 ItemKind::Struct(s) => {
@@ -1360,6 +1420,15 @@ impl CodeGenerator for PythonGenerator {
                         ty: f.ty.clone(),
                     }).collect();
                     self.struct_defs.insert(l.name.name.clone(), fields);
+                }
+                ItemKind::Impl(impl_def) => {
+                    // Collect method names for this struct
+                    let mut methods = HashMap::new();
+                    for method in &impl_def.methods {
+                        let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
+                        methods.insert(method.name.name.clone(), mangled);
+                    }
+                    self.struct_methods.insert(impl_def.target.name.clone(), methods);
                 }
                 _ => {}
             }

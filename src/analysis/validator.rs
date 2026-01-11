@@ -56,6 +56,12 @@ impl Validator {
             ItemKind::Use(_) => {
                 // Use statements are handled during loading
             }
+            ItemKind::Impl(impl_def) => {
+                // Validate each method's body
+                for method in &impl_def.methods {
+                    self.validate_block(&method.body);
+                }
+            }
         }
     }
 
