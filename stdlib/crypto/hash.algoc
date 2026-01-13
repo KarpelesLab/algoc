@@ -1,0 +1,24 @@
+// Hash interface for cryptographic hash functions
+//
+// This interface defines the common API for hash functions like SHA-256, MD5, etc.
+// It enables generic algorithms (like HMAC) to work with any hash function.
+
+interface Hash {
+    // Create a new hash state initialized to the starting values
+    static fn new() -> Self;
+
+    // Return the block size in bytes (e.g., 64 for SHA-256)
+    static fn block_size() -> u64;
+
+    // Return the output digest size in bytes (e.g., 32 for SHA-256)
+    static fn output_size() -> u64;
+
+    // Update the hash state with more input data
+    fn update(&mut self, data: &[u8]);
+
+    // Finalize the hash and write the digest to output
+    fn finalize(&mut self, output: &mut [u8]);
+
+    // Reset the hash state to initial values for reuse
+    fn reset(&mut self);
+}

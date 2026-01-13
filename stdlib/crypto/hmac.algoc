@@ -1,0 +1,170 @@
+// HMAC (Hash-based Message Authentication Code) implementation
+//
+// Implements RFC 2104/4231 HMAC using any hash function that implements the Hash interface.
+// HMAC(K, m) = H((K' ⊕ opad) || H((K' ⊕ ipad) || m))
+
+use "../runtime.algoc";
+use "hash.algoc";
+use "sha256.algoc";
+use "md5.algoc";
+
+// IPAD and OPAD constants
+const IPAD: u8 = 0x36;
+const OPAD: u8 = 0x5c;
+
+// Generic HMAC function
+// H: Hash type that implements the Hash interface
+// key: The secret key
+// message: The message to authenticate
+// output: Buffer to write the MAC (must be at least H::output_size() bytes)
+fn hmac<H: Hash>(key: &[u8], message: &[u8], output: &mut [u8]) {
+    let block_size = H::block_size();
+    let output_size = H::output_size();
+
+    // Prepare the key: if longer than block size, hash it
+    // Otherwise, use it directly (will be zero-padded)
+    let mut k_prime: u8[128];  // Buffer for processed key (max block size)
+    let key_len = key.len();
+
+    if key_len > block_size {
+        // Key is too long, hash it first
+        let mut hasher = H::new();
+        hasher.update(key);
+        hasher.finalize(&mut k_prime);
+        // Zero the rest
+        for i in output_size..block_size {
+            k_prime[i] = 0;
+        }
+    } else {
+        // Copy key and zero-pad
+        for i in 0..key_len {
+            k_prime[i] = key[i];
+        }
+        for i in key_len..block_size {
+            k_prime[i] = 0;
+        }
+    }
+
+    // Compute inner hash: H((K' ⊕ ipad) || message)
+    let mut inner_pad: u8[128];
+    for i in 0..block_size {
+        inner_pad[i] = k_prime[i] ^ IPAD;
+    }
+
+    let mut inner_hasher = H::new();
+    inner_hasher.update(inner_pad[0..block_size]);
+    inner_hasher.update(message);
+
+    let mut inner_hash: u8[64];  // Buffer for inner hash (max output size)
+    inner_hasher.finalize(&mut inner_hash);
+
+    // Compute outer hash: H((K' ⊕ opad) || inner_hash)
+    let mut outer_pad: u8[128];
+    for i in 0..block_size {
+        outer_pad[i] = k_prime[i] ^ OPAD;
+    }
+
+    let mut outer_hasher = H::new();
+    outer_hasher.update(outer_pad[0..block_size]);
+    outer_hasher.update(inner_hash[0..output_size]);
+    outer_hasher.finalize(output);
+
+    // Secure cleanup
+    secure_zero(&mut k_prime);
+    secure_zero(&mut inner_pad);
+    secure_zero(&mut outer_pad);
+    secure_zero(&mut inner_hash);
+}
+
+// Convenience wrapper for HMAC-SHA256
+fn hmac_sha256(key: &[u8], message: &[u8], output: &mut [u8; 32]) {
+    hmac::<Sha256State>(key, message, output);
+}
+
+// Convenience wrapper for HMAC-MD5
+fn hmac_md5(key: &[u8], message: &[u8], output: &mut [u8; 16]) {
+    hmac::<Md5State>(key, message, output);
+}
+
+// Test vectors from RFC 4231
+test hmac_sha256_rfc4231_1() {
+    // Test Case 1
+    let key: &[u8] = hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    let data: &[u8] = bytes("Hi There");
+    let mut mac: [u8; 32];
+    hmac_sha256(key, data, &mut mac);
+    assert(mac == hex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+}
+
+test hmac_sha256_rfc4231_2() {
+    // Test Case 2 - Key shorter than block size
+    let key: &[u8] = bytes("Jefe");
+    let data: &[u8] = bytes("what do ya want for nothing?");
+    let mut mac: [u8; 32];
+    hmac_sha256(key, data, &mut mac);
+    assert(mac == hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
+}
+
+test hmac_sha256_rfc4231_3() {
+    // Test Case 3
+    let key: &[u8] = hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let data: &[u8] = hex("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+    let mut mac: [u8; 32];
+    hmac_sha256(key, data, &mut mac);
+    assert(mac == hex("773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"));
+}
+
+test hmac_sha256_rfc4231_4() {
+    // Test Case 4
+    let key: &[u8] = hex("0102030405060708090a0b0c0d0e0f10111213141516171819");
+    let data: &[u8] = hex("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
+    let mut mac: [u8; 32];
+    hmac_sha256(key, data, &mut mac);
+    assert(mac == hex("82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"));
+}
+
+test hmac_sha256_rfc4231_6() {
+    // Test Case 6 - Key larger than block size
+    let key: &[u8] = hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let data: &[u8] = bytes("Test Using Larger Than Block-Size Key - Hash Key First");
+    let mut mac: [u8; 32];
+    hmac_sha256(key, data, &mut mac);
+    assert(mac == hex("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"));
+}
+
+test hmac_sha256_rfc4231_7() {
+    // Test Case 7 - Key and data larger than block size
+    let key: &[u8] = hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let data: &[u8] = bytes("This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.");
+    let mut mac: [u8; 32];
+    hmac_sha256(key, data, &mut mac);
+    assert(mac == hex("9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"));
+}
+
+// Test vectors from RFC 2104 for HMAC-MD5
+test hmac_md5_rfc2104_1() {
+    // Test vector 1: 16-byte key
+    let key = hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    let data: &[u8] = bytes("Hi There");
+    let mut mac: [u8; 16];
+    hmac_md5(key, data, &mut mac);
+    assert(mac == hex("9294727a3638bb1c13f48ef8158bfc9d"));
+}
+
+test hmac_md5_rfc2104_2() {
+    // Test vector 2: Key = "Jefe"
+    let key: &[u8] = bytes("Jefe");
+    let data: &[u8] = bytes("what do ya want for nothing?");
+    let mut mac: [u8; 16];
+    hmac_md5(key, data, &mut mac);
+    assert(mac == hex("750c783e6ab0b503eaa86e310a5db738"));
+}
+
+test hmac_md5_rfc2104_3() {
+    // Test vector 3: 16-byte key, 50 x 0xdd data
+    let key = hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let data = hex("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+    let mut mac: [u8; 16];
+    hmac_md5(key, data, &mut mac);
+    assert(mac == hex("56be34521d144c88dbb8c733f0e8b3f6"));
+}

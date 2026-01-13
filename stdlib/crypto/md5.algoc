@@ -6,7 +6,7 @@
 use "../runtime.algoc";
 
 // Per-round shift amounts
-const S: u32[64] = [
+const MD5_S: u32[64] = [
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
     5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
     4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
@@ -14,7 +14,7 @@ const S: u32[64] = [
 ];
 
 // Precomputed table of constants (floor(2^32 * abs(sin(i+1))))
-const K: u32[64] = [
+const MD5_K: u32[64] = [
     0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
     0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
     0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
@@ -34,7 +34,7 @@ const K: u32[64] = [
 ];
 
 // Initial hash values
-const H_INIT: u32[4] = [
+const MD5_H_INIT: u32[4] = [
     0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476
 ];
 
@@ -46,10 +46,53 @@ struct Md5State {
     total_len: u64       // Total message length in bytes
 }
 
+// Implement the Hash interface for Md5State
+impl Md5State {
+    // Create a new initialized hash state
+    static fn new() -> Self {
+        let mut state: Md5State;
+        for i in 0..4 {
+            state.h[i] = MD5_H_INIT[i];
+        }
+        state.block_len = 0;
+        state.total_len = 0;
+        return state;
+    }
+
+    // MD5 uses a 64-byte (512-bit) block
+    static fn block_size() -> u64 {
+        return 64;
+    }
+
+    // MD5 produces a 16-byte (128-bit) digest
+    static fn output_size() -> u64 {
+        return 16;
+    }
+
+    // Update with more data
+    fn update(&mut self, data: &[u8]) {
+        md5_update(self, data);
+    }
+
+    // Finalize and write digest
+    fn finalize(&mut self, output: &mut [u8]) {
+        md5_final(self, output);
+    }
+
+    // Reset to initial state
+    fn reset(&mut self) {
+        for i in 0..4 {
+            self.h[i] = H_INIT[i];
+        }
+        self.block_len = 0;
+        self.total_len = 0;
+    }
+}
+
 // Initialize MD5 state
 fn md5_init(state: &mut Md5State) {
     for i in 0..4 {
-        state.h[i] = H_INIT[i];
+        state.h[i] = MD5_H_INIT[i];
     }
     state.block_len = 0;
     state.total_len = 0;
@@ -93,11 +136,11 @@ fn md5_compress(state: &mut Md5State, block: &[u8; 64]) {
             g = (7 * i) % 16;
         }
 
-        f = f + a + K[i] + m[g];
+        f = f + a + MD5_K[i] + m[g];
         a = d;
         d = c;
         c = b;
-        b = b + rotl(f, S[i]);
+        b = b + rotl(f, MD5_S[i]);
     }
 
     // Update state

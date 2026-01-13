@@ -39,6 +39,49 @@ struct Sha256State {
     total_len: u64       // Total message length in bytes
 }
 
+// Implement the Hash interface for Sha256State
+impl Sha256State {
+    // Create a new initialized hash state
+    static fn new() -> Self {
+        let mut state: Sha256State;
+        for i in 0..8 {
+            state.h[i] = H_INIT[i];
+        }
+        state.block_len = 0;
+        state.total_len = 0;
+        return state;
+    }
+
+    // SHA-256 uses a 64-byte (512-bit) block
+    static fn block_size() -> u64 {
+        return 64;
+    }
+
+    // SHA-256 produces a 32-byte (256-bit) digest
+    static fn output_size() -> u64 {
+        return 32;
+    }
+
+    // Update with more data
+    fn update(&mut self, data: &[u8]) {
+        sha256_update(self, data);
+    }
+
+    // Finalize and write digest
+    fn finalize(&mut self, output: &mut [u8]) {
+        sha256_final(self, output);
+    }
+
+    // Reset to initial state
+    fn reset(&mut self) {
+        for i in 0..8 {
+            self.h[i] = H_INIT[i];
+        }
+        self.block_len = 0;
+        self.total_len = 0;
+    }
+}
+
 // Initialize SHA-256 state
 fn sha256_init(state: &mut Sha256State) {
     for i in 0..8 {

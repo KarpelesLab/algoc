@@ -91,6 +91,126 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Check if a struct satisfies an interface (Go-style structural typing)
+    /// Returns Ok(()) if satisfied, or a list of missing/mismatched methods
+    pub fn check_interface_satisfaction(
+        &self,
+        struct_name: &str,
+        interface_name: &str,
+        _span: SourceSpan,
+    ) -> Result<(), Vec<String>> {
+        let interface = match self.global_scope.get_interface(interface_name) {
+            Some(i) => i,
+            None => return Err(vec![format!("unknown interface '{}'", interface_name)]),
+        };
+
+        let _struct_def = match self.global_scope.get_struct(struct_name) {
+            Some(s) => s,
+            None => return Err(vec![format!("unknown struct '{}'", struct_name)]),
+        };
+
+        let mut errors = Vec::new();
+
+        for iface_method in &interface.methods {
+            // Look up the struct's method with mangled name
+            let mangled_name = format!("{}__{}", struct_name, iface_method.name);
+
+            match self.scopes.lookup(&mangled_name) {
+                Some(sym) => {
+                    // Check that it's a function with matching signature
+                    if let TypeKind::Function {
+                        params: method_params,
+                        return_type: method_return,
+                    } = &sym.ty.kind
+                    {
+                        // Check return type (substituting Self -> struct_name)
+                        let expected_return = self.substitute_self_type(
+                            &iface_method.return_type,
+                            struct_name,
+                        );
+                        if !expected_return.is_compatible_with(method_return) {
+                            errors.push(format!(
+                                "method '{}' has wrong return type: expected {}, got {}",
+                                iface_method.name, expected_return, method_return
+                            ));
+                        }
+
+                        // Check parameter types (skip self for instance methods)
+                        let expected_params: Vec<Type> = iface_method
+                            .param_types
+                            .iter()
+                            .map(|t| self.substitute_self_type(t, struct_name))
+                            .collect();
+
+                        // For instance methods, the actual method has self as first param
+                        let actual_params: Vec<&Type> = if !iface_method.is_static {
+                            // Skip self parameter when comparing
+                            method_params.iter().skip(1).collect()
+                        } else {
+                            method_params.iter().collect()
+                        };
+
+                        if expected_params.len() != actual_params.len() {
+                            errors.push(format!(
+                                "method '{}' has wrong number of parameters: expected {}, got {}",
+                                iface_method.name,
+                                expected_params.len(),
+                                actual_params.len()
+                            ));
+                        } else {
+                            for (i, (expected, actual)) in
+                                expected_params.iter().zip(actual_params.iter()).enumerate()
+                            {
+                                if !expected.is_compatible_with(actual) {
+                                    errors.push(format!(
+                                        "method '{}' parameter {} has wrong type: expected {}, got {}",
+                                        iface_method.name, i + 1, expected, actual
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        errors.push(format!(
+                            "'{}' is not a method",
+                            iface_method.name
+                        ));
+                    }
+                }
+                None => {
+                    errors.push(format!(
+                        "missing method '{}' required by interface '{}'",
+                        iface_method.name, interface_name
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Substitute Self type with a concrete struct type
+    fn substitute_self_type(&self, ty: &Type, struct_name: &str) -> Type {
+        match &ty.kind {
+            TypeKind::SelfType => Type::struct_type(struct_name.to_string()),
+            TypeKind::Ref { inner, mutable } => Type::reference(
+                self.substitute_self_type(inner, struct_name),
+                *mutable,
+            ),
+            TypeKind::Array { element, size } => Type::array(
+                self.substitute_self_type(element, struct_name),
+                *size,
+            ),
+            TypeKind::Slice { element } => {
+                Type::slice(self.substitute_self_type(element, struct_name))
+            }
+            _ => ty.clone(),
+        }
+    }
+
     fn primitive_to_type(&self, p: AstPrimitive) -> Type {
         match p {
             // Native endian types
