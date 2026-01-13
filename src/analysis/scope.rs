@@ -15,6 +15,8 @@ pub struct Scope {
     structs: HashMap<String, StructDef>,
     /// Enum definitions
     enums: HashMap<String, EnumDef>,
+    /// Interface definitions
+    interfaces: HashMap<String, InterfaceDef>,
     /// Child scopes (for functions, blocks, etc.)
     children: Vec<Scope>,
 }
@@ -26,6 +28,7 @@ impl Scope {
             symbols: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            interfaces: HashMap::new(),
             children: Vec::new(),
         }
     }
@@ -78,6 +81,20 @@ impl Scope {
     /// Look up an enum by name
     pub fn get_enum(&self, name: &str) -> Option<&EnumDef> {
         self.enums.get(name)
+    }
+
+    /// Define an interface in this scope
+    pub fn define_interface(&mut self, name: String, def: InterfaceDef) -> Result<(), String> {
+        if self.interfaces.contains_key(&name) {
+            return Err(format!("interface '{}' is already defined", name));
+        }
+        self.interfaces.insert(name, def);
+        Ok(())
+    }
+
+    /// Look up an interface by name
+    pub fn get_interface(&self, name: &str) -> Option<&InterfaceDef> {
+        self.interfaces.get(name)
     }
 
     /// Get all symbols in this scope
@@ -295,6 +312,71 @@ impl EnumVariantDef {
     }
 }
 
+/// An interface definition
+#[derive(Debug, Clone)]
+pub struct InterfaceDef {
+    /// The name of the interface
+    pub name: String,
+    /// Methods required by the interface
+    pub methods: Vec<InterfaceMethodDef>,
+    /// Source location
+    pub span: SourceSpan,
+}
+
+impl InterfaceDef {
+    /// Create a new interface definition
+    pub fn new(name: String, span: SourceSpan) -> Self {
+        Self {
+            name,
+            methods: Vec::new(),
+            span,
+        }
+    }
+
+    /// Add a method to the interface
+    pub fn add_method(&mut self, method: InterfaceMethodDef) {
+        self.methods.push(method);
+    }
+
+    /// Get a method by name
+    pub fn get_method(&self, name: &str) -> Option<&InterfaceMethodDef> {
+        self.methods.iter().find(|m| m.name == name)
+    }
+}
+
+/// A method definition in an interface
+#[derive(Debug, Clone)]
+pub struct InterfaceMethodDef {
+    /// Method name
+    pub name: String,
+    /// Whether this is a static method (no self parameter)
+    pub is_static: bool,
+    /// Parameter types (excluding self for instance methods)
+    pub param_types: Vec<Type>,
+    /// Return type (Unit if none)
+    pub return_type: Type,
+    /// Source location
+    pub span: SourceSpan,
+}
+
+impl InterfaceMethodDef {
+    pub fn new(
+        name: String,
+        is_static: bool,
+        param_types: Vec<Type>,
+        return_type: Type,
+        span: SourceSpan,
+    ) -> Self {
+        Self {
+            name,
+            is_static,
+            param_types,
+            return_type,
+            span,
+        }
+    }
+}
+
 /// A scope stack for tracking nested scopes during resolution
 #[derive(Debug)]
 pub struct ScopeStack {
@@ -368,6 +450,11 @@ impl ScopeStack {
     /// Look up an enum by name (only in global scope)
     pub fn lookup_enum(&self, name: &str) -> Option<&EnumDef> {
         self.global().get_enum(name)
+    }
+
+    /// Look up an interface by name (only in global scope)
+    pub fn lookup_interface(&self, name: &str) -> Option<&InterfaceDef> {
+        self.global().get_interface(name)
     }
 
     /// Consume the stack and return the global scope with all nested scopes

@@ -362,6 +362,9 @@ impl PythonGenerator {
                     self.generate_method(&impl_def.target.name, method);
                 }
             }
+            ItemKind::Interface(_) => {
+                // Interfaces are compile-time only, no runtime representation
+            }
         }
     }
 
@@ -1201,6 +1204,30 @@ impl PythonGenerator {
                 self.generate_expr(receiver);
                 for arg in args {
                     self.write(", ");
+                    self.generate_expr(arg);
+                }
+                self.write(")");
+            }
+            ExprKind::TypeStaticCall { type_name, method_name, args } => {
+                // Should be resolved by monomorphization - generate placeholder
+                self.write(&format!("{}__{}", type_name.name, method_name.name));
+                self.write("(");
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_expr(arg);
+                }
+                self.write(")");
+            }
+            ExprKind::GenericCall { func, args, .. } => {
+                // Should be resolved by monomorphization - generate as regular call
+                self.generate_expr(func);
+                self.write("(");
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
                     self.generate_expr(arg);
                 }
                 self.write(")");

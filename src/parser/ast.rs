@@ -34,6 +34,8 @@ pub enum ItemKind {
     Enum(EnumDef),
     /// Impl block: `impl StructName { fn method(&self) { ... } }`
     Impl(ImplDef),
+    /// Interface definition: `interface Name { fn method(&self); ... }`
+    Interface(InterfaceDef),
     /// Test definition: `test name { input: ..., expect: ... }`
     Test(TestDef),
 }
@@ -49,9 +51,22 @@ pub struct UseDef {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: Ident,
+    /// Type parameters for generic functions: `fn foo<T: Hash>(...)`
+    pub type_params: Option<Vec<TypeParam>>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     pub body: Block,
+    /// Whether this is a static method (no self parameter)
+    pub is_static: bool,
+}
+
+/// A type parameter with optional constraint: `T: Hash`
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: Ident,
+    /// Interface constraint (optional)
+    pub constraint: Option<Ident>,
+    pub span: SourceSpan,
 }
 
 /// A function parameter
@@ -147,6 +162,25 @@ pub struct TestDef {
     pub span: SourceSpan,
 }
 
+/// An interface definition: `interface Hash { ... }`
+#[derive(Debug, Clone)]
+pub struct InterfaceDef {
+    pub name: Ident,
+    pub methods: Vec<InterfaceMethod>,
+    pub span: SourceSpan,
+}
+
+/// A method signature in an interface
+#[derive(Debug, Clone)]
+pub struct InterfaceMethod {
+    pub name: Ident,
+    /// Whether this is a static method: `static fn new() -> Self;`
+    pub is_static: bool,
+    pub params: Vec<Param>,
+    pub return_type: Option<Type>,
+    pub span: SourceSpan,
+}
+
 /// An identifier with source location
 #[derive(Debug, Clone)]
 pub struct Ident {
@@ -186,6 +220,8 @@ pub enum TypeKind {
     Ref(Box<Type>),
     /// Named type (struct or type alias)
     Named(Ident),
+    /// Self type (in interface context): `Self`
+    SelfType,
 }
 
 /// Endianness for primitive types
@@ -492,6 +528,18 @@ pub enum ExprKind {
         receiver: Box<Expr>,
         method_name: String,
         mangled_name: String,
+        args: Vec<Expr>,
+    },
+    /// Type-qualified static call: `H::method(args)` where H is a type parameter
+    TypeStaticCall {
+        type_name: Ident,
+        method_name: Ident,
+        args: Vec<Expr>,
+    },
+    /// Generic function call with type arguments: `func::<Type>(args)`
+    GenericCall {
+        func: Box<Expr>,
+        type_args: Vec<Type>,
         args: Vec<Expr>,
     },
 }

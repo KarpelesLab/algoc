@@ -99,6 +99,8 @@ test sha256_abc {
 | Go | 🚧 Planned | |
 | Rust | 🚧 Planned | |
 | C | 🚧 Planned | |
+| VHDL | 🚧 Planned | Hardware description language |
+| Verilog | 🚧 Planned | Hardware description language |
 
 ## DSL Reference
 
@@ -234,7 +236,7 @@ Source (.algoc)
 └────┬────┘
      │
      ▼
-Output (.js, .py, .go, .rs, .c)
+Output (.js, .py, .go, .rs, .c, .vhd, .v)
 ```
 
 ## License

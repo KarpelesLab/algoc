@@ -352,6 +352,10 @@ pub enum TypeKind {
         params: Vec<Type>,
         return_type: Box<Type>,
     },
+    /// Self type (in interface context, resolved during monomorphization)
+    SelfType,
+    /// Type parameter (placeholder during generic checking)
+    TypeParam { name: String },
     /// Error type (used for error recovery)
     Error,
 }
@@ -408,6 +412,8 @@ impl fmt::Display for Type {
                 write!(f, ") -> {}", return_type)
             }
             TypeKind::Error => write!(f, "<error>"),
+            TypeKind::SelfType => write!(f, "Self"),
+            TypeKind::TypeParam { name } => write!(f, "{}", name),
         }
     }
 }

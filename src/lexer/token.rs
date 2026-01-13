@@ -35,6 +35,8 @@ pub enum Keyword {
     Test,
     Match,
     Impl,
+    Interface,
+    Static,
 
     // Types
     U8,
@@ -116,6 +118,8 @@ impl Keyword {
             "test" => Some(Keyword::Test),
             "match" => Some(Keyword::Match),
             "impl" => Some(Keyword::Impl),
+            "interface" => Some(Keyword::Interface),
+            "static" => Some(Keyword::Static),
 
             // Types
             "u8" => Some(Keyword::U8),
@@ -199,6 +203,8 @@ impl fmt::Display for Keyword {
             Keyword::Test => "test",
             Keyword::Match => "match",
             Keyword::Impl => "impl",
+            Keyword::Interface => "interface",
+            Keyword::Static => "static",
             Keyword::U8 => "u8",
             Keyword::U16 => "u16",
             Keyword::U32 => "u32",

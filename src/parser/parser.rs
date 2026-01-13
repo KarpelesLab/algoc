@@ -162,12 +162,14 @@ impl<'src> Parser<'src> {
             ItemKind::Const(self.parse_const()?)
         } else if self.check_keyword(Keyword::Impl) {
             ItemKind::Impl(self.parse_impl()?)
+        } else if self.check_keyword(Keyword::Interface) {
+            ItemKind::Interface(self.parse_interface()?)
         } else if self.check_keyword(Keyword::Test) {
             ItemKind::Test(self.parse_test()?)
         } else {
             return Err(AlgocError::parser(
                 format!(
-                    "expected item (use, fn, struct, enum, const, impl, test), found {}",
+                    "expected item (use, fn, struct, enum, const, impl, interface, test), found {}",
                     self.peek().kind
                 ),
                 self.current_span(),
@@ -210,6 +212,13 @@ impl<'src> Parser<'src> {
         self.expect_keyword(Keyword::Fn, "expected 'fn'")?;
         let name = self.parse_ident()?;
 
+        // Parse optional type parameters: <T: Constraint, U>
+        let type_params = if self.match_token(&TokenKind::Lt) {
+            Some(self.parse_type_params()?)
+        } else {
+            None
+        };
+
         self.expect(&TokenKind::LParen, "expected '(' after function name")?;
         let params = self.parse_params()?;
         self.expect(&TokenKind::RParen, "expected ')' after parameters")?;
@@ -224,9 +233,11 @@ impl<'src> Parser<'src> {
 
         Ok(Function {
             name,
+            type_params,
             params,
             return_type,
             body,
+            is_static: false,
         })
     }
 
@@ -249,6 +260,147 @@ impl<'src> Parser<'src> {
         }
 
         Ok(params)
+    }
+
+    /// Parse method parameters, including self-style parameters
+    /// Handles: &self, &mut self, self, and regular name: Type params
+    fn parse_method_params(&mut self) -> AlgocResult<Vec<Param>> {
+        let mut params = Vec::new();
+
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                let start = self.current_span();
+
+                // Check for &self or &mut self
+                if self.check(&TokenKind::Amp) {
+                    self.advance(); // consume &
+                    let is_mut = self.match_keyword(Keyword::Mut);
+
+                    // Check for 'self' keyword (parsed as ident)
+                    if let TokenKind::Ident(name) = &self.peek().kind {
+                        if name == "self" {
+                            self.advance(); // consume 'self'
+                            let span = start.merge(self.previous().span);
+                            let self_inner = Type {
+                                kind: TypeKind::SelfType,
+                                span,
+                            };
+                            let self_type = if is_mut {
+                                Type {
+                                    kind: TypeKind::MutRef(Box::new(self_inner)),
+                                    span,
+                                }
+                            } else {
+                                Type {
+                                    kind: TypeKind::Ref(Box::new(self_inner)),
+                                    span,
+                                }
+                            };
+                            params.push(Param {
+                                name: Ident::new("self".to_string(), span),
+                                ty: self_type,
+                                span,
+                            });
+
+                            if !self.match_token(&TokenKind::Comma) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Not a self param, need to put back the & token context
+                    // This is a parse error since we expected self after &
+                    return Err(AlgocError::parser(
+                        "expected 'self' after '&' in method parameter",
+                        self.current_span(),
+                    ));
+                }
+
+                // Check for bare 'self' parameter
+                if let TokenKind::Ident(name) = &self.peek().kind {
+                    if name == "self" {
+                        let span = self.current_span();
+                        self.advance(); // consume 'self'
+                        params.push(Param {
+                            name: Ident::new("self".to_string(), span),
+                            ty: Type {
+                                kind: TypeKind::SelfType,
+                                span,
+                            },
+                            span,
+                        });
+
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                // Regular parameter: name: Type
+                let name = self.parse_ident()?;
+                self.expect(&TokenKind::Colon, "expected ':' after parameter name")?;
+                let ty = self.parse_type()?;
+                let span = start.merge(self.previous().span);
+                params.push(Param { name, ty, span });
+
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+
+        Ok(params)
+    }
+
+    /// Parse type parameters: T, U: Constraint, V
+    /// Called after consuming the opening '<'
+    fn parse_type_params(&mut self) -> AlgocResult<Vec<TypeParam>> {
+        let mut type_params = Vec::new();
+
+        loop {
+            let start = self.current_span();
+            let name = self.parse_ident()?;
+
+            // Optional constraint: T: Interface
+            let constraint = if self.match_token(&TokenKind::Colon) {
+                Some(self.parse_ident()?)
+            } else {
+                None
+            };
+
+            let span = start.merge(self.previous().span);
+            type_params.push(TypeParam {
+                name,
+                constraint,
+                span,
+            });
+
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        self.expect(&TokenKind::Gt, "expected '>' after type parameters")?;
+        Ok(type_params)
+    }
+
+    /// Parse type arguments in generic calls: <Type1, Type2>
+    /// Called after consuming the opening '<'
+    fn parse_type_args(&mut self) -> AlgocResult<Vec<Type>> {
+        let mut types = Vec::new();
+
+        loop {
+            types.push(self.parse_type()?);
+
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        self.expect(&TokenKind::Gt, "expected '>' after type arguments")?;
+        Ok(types)
     }
 
     fn parse_struct(&mut self) -> AlgocResult<StructDef> {
@@ -282,8 +434,12 @@ impl<'src> Parser<'src> {
 
         let mut methods = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            // Check for static fn or regular fn
+            let is_static = self.match_keyword(Keyword::Static);
             if self.check_keyword(Keyword::Fn) {
-                methods.push(self.parse_function()?);
+                let mut func = self.parse_method()?;
+                func.is_static = is_static;
+                methods.push(func);
             } else {
                 return Err(AlgocError::parser(
                     format!("expected 'fn' in impl block, found {}", self.peek().kind),
@@ -298,6 +454,89 @@ impl<'src> Parser<'src> {
         Ok(ImplDef {
             target,
             methods,
+            span,
+        })
+    }
+
+    /// Parse a method (like parse_function but accepts &self, &mut self parameters)
+    fn parse_method(&mut self) -> AlgocResult<Function> {
+        self.expect_keyword(Keyword::Fn, "expected 'fn'")?;
+        let name = self.parse_ident()?;
+
+        // Parse optional type parameters: <T: Constraint, U>
+        let type_params = if self.match_token(&TokenKind::Lt) {
+            Some(self.parse_type_params()?)
+        } else {
+            None
+        };
+
+        self.expect(&TokenKind::LParen, "expected '(' after function name")?;
+        let params = self.parse_method_params()?;
+        self.expect(&TokenKind::RParen, "expected ')' after parameters")?;
+
+        let return_type = if self.match_token(&TokenKind::Arrow) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        let body = self.parse_block()?;
+
+        Ok(Function {
+            name,
+            type_params,
+            params,
+            return_type,
+            body,
+            is_static: false,
+        })
+    }
+
+    fn parse_interface(&mut self) -> AlgocResult<InterfaceDef> {
+        let start = self.current_span();
+        self.expect_keyword(Keyword::Interface, "expected 'interface'")?;
+        let name = self.parse_ident()?;
+
+        self.expect(&TokenKind::LBrace, "expected '{' after interface name")?;
+
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            methods.push(self.parse_interface_method()?);
+        }
+
+        self.expect(&TokenKind::RBrace, "expected '}' after interface methods")?;
+
+        let span = start.merge(self.previous().span);
+        Ok(InterfaceDef { name, methods, span })
+    }
+
+    fn parse_interface_method(&mut self) -> AlgocResult<InterfaceMethod> {
+        let start = self.current_span();
+
+        // Check for static keyword
+        let is_static = self.match_keyword(Keyword::Static);
+
+        self.expect_keyword(Keyword::Fn, "expected 'fn'")?;
+        let name = self.parse_ident()?;
+
+        self.expect(&TokenKind::LParen, "expected '(' after method name")?;
+        let params = self.parse_method_params()?;
+        self.expect(&TokenKind::RParen, "expected ')' after parameters")?;
+
+        let return_type = if self.match_token(&TokenKind::Arrow) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        self.expect(&TokenKind::Semicolon, "expected ';' after interface method")?;
+
+        let span = start.merge(self.previous().span);
+        Ok(InterfaceMethod {
+            name,
+            is_static,
+            params,
+            return_type,
             span,
         })
     }
@@ -1246,16 +1485,37 @@ impl<'src> Parser<'src> {
         if let TokenKind::Ident(_) = &self.peek().kind {
             let name = self.parse_ident()?;
 
-            // Check for enum variant: Name::Variant or Name::Variant(args)
+            // Check for path expressions: Name::Variant, Name::method, or func::<Type>
             if self.match_token(&TokenKind::ColonColon) {
-                let variant_name = self.parse_ident()?;
+                // Check for generic call: func::<Type>(args)
+                if self.match_token(&TokenKind::Lt) {
+                    let type_args = self.parse_type_args()?;
+                    self.expect(&TokenKind::LParen, "expected '(' after type arguments")?;
+                    let args = self.parse_args()?;
+                    self.expect(&TokenKind::RParen, "expected ')' after arguments")?;
+                    let span = start.merge(self.previous().span);
+                    return Ok(Expr {
+                        kind: ExprKind::GenericCall {
+                            func: Box::new(Expr {
+                                kind: ExprKind::Ident(name.clone()),
+                                span: name.span,
+                            }),
+                            type_args,
+                            args,
+                        },
+                        span,
+                    });
+                }
+
+                // Otherwise it's Type::method or Enum::Variant
+                let method_or_variant = self.parse_ident()?;
 
                 // Check for arguments
                 let args = if self.match_token(&TokenKind::LParen) {
                     let args = self.parse_args()?;
                     self.expect(
                         &TokenKind::RParen,
-                        "expected ')' after enum variant arguments",
+                        "expected ')' after arguments",
                     )?;
                     args
                 } else {
@@ -1263,11 +1523,26 @@ impl<'src> Parser<'src> {
                 };
 
                 let span = start.merge(self.previous().span);
+
+                // If there are arguments, treat as TypeStaticCall
+                // (analyzer will convert back to EnumVariant if needed)
+                if !args.is_empty() || self.previous().kind == TokenKind::RParen {
+                    return Ok(Expr {
+                        kind: ExprKind::TypeStaticCall {
+                            type_name: name,
+                            method_name: method_or_variant,
+                            args,
+                        },
+                        span,
+                    });
+                }
+
+                // No parens means it's an enum variant value
                 return Ok(Expr {
                     kind: ExprKind::EnumVariant {
                         enum_name: name,
-                        variant_name,
-                        args,
+                        variant_name: method_or_variant,
+                        args: Vec::new(),
                     },
                     span,
                 });

@@ -17,6 +17,8 @@ pub struct TypeChecker<'a> {
     scopes: ScopeStack,
     /// Current function's return type (for checking return statements)
     current_return_type: Option<Type>,
+    /// Current impl target (for resolving Self type)
+    current_impl_target: Option<String>,
     /// Collected errors
     errors: Vec<AlgocError>,
 }
@@ -28,6 +30,7 @@ impl<'a> TypeChecker<'a> {
             global_scope,
             scopes: ScopeStack::new(),
             current_return_type: None,
+            current_impl_target: None,
             errors: Vec::new(),
         }
     }
@@ -71,8 +74,20 @@ impl<'a> TypeChecker<'a> {
             parser::TypeKind::Named(ident) => match ident.name.as_str() {
                 "Reader" => Type::reader(),
                 "Writer" => Type::writer(),
+                "Self" => self.resolve_self_type(),
                 _ => Type::struct_type(ident.name.clone()),
             },
+            parser::TypeKind::SelfType => self.resolve_self_type(),
+        }
+    }
+
+    /// Resolve the Self type based on current impl context
+    fn resolve_self_type(&self) -> Type {
+        if let Some(ref target) = self.current_impl_target {
+            Type::struct_type(target.clone())
+        } else {
+            // Self used outside of impl block - keep as SelfType
+            Type::new(TypeKind::SelfType)
         }
     }
 
@@ -157,13 +172,16 @@ impl<'a> TypeChecker<'a> {
                 self.scopes.pop();
                 self.current_return_type = None;
             }
-            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) => {
+            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) | ItemKind::Interface(_) => {
                 // Type definitions don't need checking beyond parsing
             }
             ItemKind::Use(_) => {
                 // Use statements are handled during loading
             }
             ItemKind::Impl(impl_def) => {
+                // Set current impl target for Self resolution
+                self.current_impl_target = Some(impl_def.target.name.clone());
+
                 // Check each method in the impl block
                 for method in &impl_def.methods {
                     let return_type = method
@@ -187,6 +205,9 @@ impl<'a> TypeChecker<'a> {
                     self.scopes.pop();
                     self.current_return_type = None;
                 }
+
+                // Clear current impl target
+                self.current_impl_target = None;
             }
         }
     }
@@ -1187,6 +1208,58 @@ impl<'a> TypeChecker<'a> {
                 {
                     return (**return_type).clone();
                 }
+                Type::unit()
+            }
+            parser::ExprKind::TypeStaticCall {
+                type_name,
+                method_name,
+                args,
+            } => {
+                // Look up the mangled method name: TypeName__method_name
+                let mangled_name = format!("{}__{}", type_name.name, method_name.name);
+                let method_type = self.scopes.lookup(&mangled_name).map(|s| s.ty.clone());
+
+                // Check arguments
+                for arg in args {
+                    self.infer_expr(arg);
+                }
+
+                // Return the method's return type if found
+                match method_type {
+                    Some(Type {
+                        kind: TypeKind::Function { return_type, .. },
+                        ..
+                    }) => (*return_type).clone(),
+                    Some(ty) => {
+                        self.error(
+                            format!(
+                                "'{}::{}' is not a function",
+                                type_name.name, method_name.name
+                            ),
+                            expr.span,
+                        );
+                        ty
+                    }
+                    None => {
+                        self.error(
+                            format!(
+                                "unknown method '{}' on type '{}'",
+                                method_name.name, type_name.name
+                            ),
+                            expr.span,
+                        );
+                        Type::error()
+                    }
+                }
+            }
+            parser::ExprKind::GenericCall { func, args, .. } => {
+                // Generic calls are resolved during monomorphization
+                // For now, check the function and arguments
+                self.infer_expr(func);
+                for arg in args {
+                    self.infer_expr(arg);
+                }
+                // TODO: Proper type inference will be done during monomorphization
                 Type::unit()
             }
         }

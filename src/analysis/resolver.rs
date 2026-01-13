@@ -2,7 +2,10 @@
 //!
 //! Resolves all names to their definitions and builds symbol tables.
 
-use super::scope::{EnumDef, EnumVariantDef, Scope, ScopeStack, StructDef, StructField, Symbol};
+use super::scope::{
+    EnumDef, EnumVariantDef, InterfaceDef, InterfaceMethodDef, Scope, ScopeStack, StructDef,
+    StructField, Symbol,
+};
 use super::types::{Endianness, Type, TypeKind};
 use crate::errors::{AlgocError, AlgocResult, SourceSpan};
 use crate::parser::{self, Ast, Item, ItemKind, PrimitiveType as AstPrimitive};
@@ -13,6 +16,8 @@ pub struct Resolver {
     scopes: ScopeStack,
     /// Collected errors (we continue after errors for better diagnostics)
     errors: Vec<AlgocError>,
+    /// Current impl target (for resolving Self type)
+    current_impl_target: Option<String>,
 }
 
 impl Resolver {
@@ -21,6 +26,7 @@ impl Resolver {
         Self {
             scopes: ScopeStack::new(),
             errors: Vec::new(),
+            current_impl_target: None,
         }
     }
 
@@ -77,6 +83,7 @@ impl Resolver {
                 match ident.name.as_str() {
                     "Reader" => Type::reader(),
                     "Writer" => Type::writer(),
+                    "Self" => self.resolve_self_type(ident.span),
                     _ => {
                         // Check if it's a known struct
                         if self.scopes.lookup_struct(&ident.name).is_some() {
@@ -93,6 +100,18 @@ impl Resolver {
                     }
                 }
             }
+            parser::TypeKind::SelfType => self.resolve_self_type(ty.span),
+        }
+    }
+
+    /// Resolve the Self type based on current impl context
+    fn resolve_self_type(&self, _span: SourceSpan) -> Type {
+        if let Some(ref target) = self.current_impl_target {
+            Type::struct_type(target.clone())
+        } else {
+            // Self used outside of impl block - keep as SelfType for now
+            // (useful in interface definitions)
+            Type::new(TypeKind::SelfType)
         }
     }
 
@@ -258,6 +277,9 @@ impl Resolver {
                     return;
                 }
 
+                // Set current impl target for Self resolution
+                self.current_impl_target = Some(impl_def.target.name.clone());
+
                 // Register each method with a mangled name: StructName__method_name
                 for method in &impl_def.methods {
                     // Build method type (includes self parameter)
@@ -297,6 +319,43 @@ impl Resolver {
                         struct_def.add_method(method.name.name.clone(), mangled_name);
                     }
                 }
+
+                // Clear current impl target
+                self.current_impl_target = None;
+            }
+            ItemKind::Interface(iface) => {
+                // Register interface definition
+                let mut def = InterfaceDef::new(iface.name.name.clone(), iface.span);
+                for method in &iface.methods {
+                    // Get parameter types, skipping 'self' parameter for instance methods
+                    let param_types: Vec<Type> = method
+                        .params
+                        .iter()
+                        .filter(|p| p.name.name != "self")
+                        .map(|p| self.resolve_type(&p.ty))
+                        .collect();
+
+                    let return_type = method
+                        .return_type
+                        .as_ref()
+                        .map(|t| self.resolve_type(t))
+                        .unwrap_or_else(Type::unit);
+
+                    def.add_method(InterfaceMethodDef::new(
+                        method.name.name.clone(),
+                        method.is_static,
+                        param_types,
+                        return_type,
+                        method.span,
+                    ));
+                }
+                if let Err(err) = self
+                    .scopes
+                    .global_mut()
+                    .define_interface(iface.name.name.clone(), def)
+                {
+                    self.error(err, iface.name.span);
+                }
             }
         }
     }
@@ -331,13 +390,16 @@ impl Resolver {
                 self.resolve_block(&t.body);
                 self.scopes.pop();
             }
-            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) => {
+            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) | ItemKind::Interface(_) => {
                 // Already handled in declare_item
             }
             ItemKind::Use(_) => {
                 // Use statements are handled during loading
             }
             ItemKind::Impl(impl_def) => {
+                // Set current impl target for Self resolution
+                self.current_impl_target = Some(impl_def.target.name.clone());
+
                 // Resolve each method's body
                 for method in &impl_def.methods {
                     self.scopes.push();
@@ -356,6 +418,9 @@ impl Resolver {
 
                     self.scopes.pop();
                 }
+
+                // Clear current impl target
+                self.current_impl_target = None;
             }
         }
     }
@@ -585,6 +650,21 @@ impl Resolver {
             parser::ExprKind::MethodCall { receiver, args, .. } => {
                 // Resolve receiver and arguments
                 self.resolve_expr(receiver);
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+            }
+            parser::ExprKind::TypeStaticCall { args, .. } => {
+                // Type-qualified static calls - just resolve arguments
+                // The type parameter will be resolved during monomorphization
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+            }
+            parser::ExprKind::GenericCall { func, args, .. } => {
+                // Generic function calls - resolve function and arguments
+                // Type arguments will be validated during monomorphization
+                self.resolve_expr(func);
                 for arg in args {
                     self.resolve_expr(arg);
                 }

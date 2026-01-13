@@ -151,6 +151,13 @@ fn main() -> ExitCode {
                             algoc::parser::ItemKind::Impl(i) => {
                                 println!("  impl {} ({} methods)", i.target.name, i.methods.len());
                             }
+                            algoc::parser::ItemKind::Interface(i) => {
+                                println!(
+                                    "  interface {} ({} methods)",
+                                    i.name.name,
+                                    i.methods.len()
+                                );
+                            }
                         }
                     }
                     ExitCode::SUCCESS
