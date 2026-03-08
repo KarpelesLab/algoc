@@ -1210,8 +1210,6 @@ impl SwiftGenerator {
                     }
                 }
 
-                self.write("(");
-                self.generate_expr(left);
                 let op_str = match op {
                     BinaryOp::Add => " &+ ",
                     BinaryOp::Sub => " &- ",
@@ -1232,21 +1230,77 @@ impl SwiftGenerator {
                     BinaryOp::And => " && ",
                     BinaryOp::Or => " || ",
                 };
-                self.write(op_str);
-                self.generate_expr(right);
-                self.write(")");
+                // Swift requires matching integer types for binary operators.
+                // Shifts and boolean operators are exempt.
+                let needs_matching = !matches!(
+                    op,
+                    BinaryOp::Shl | BinaryOp::Shr | BinaryOp::And | BinaryOp::Or
+                );
+                if needs_matching {
+                    let lt = self.infer_swift_int_type(left);
+                    let rt = self.infer_swift_int_type(right);
+                    let (cl, cr) = match (&lt, &rt) {
+                        // Both known and different: cast narrower to wider
+                        (Some(l), Some(r)) if l != r => {
+                            let w = self.wider_uint_type(l, r).to_string();
+                            (
+                                if *l != w { Some(w.clone()) } else { None },
+                                if *r != w { Some(w) } else { None },
+                            )
+                        }
+                        // One known, other unknown (loop var / untracked):
+                        // cast the unknown side to the known type so Swift
+                        // is guaranteed matching operands.
+                        (Some(l), None) if !matches!(right.kind, ExprKind::Integer(_)) => {
+                            (None, Some(l.clone()))
+                        }
+                        (None, Some(r)) if !matches!(left.kind, ExprKind::Integer(_)) => {
+                            (Some(r.clone()), None)
+                        }
+                        _ => (None, None),
+                    };
+                    self.write("(");
+                    if let Some(ref ct) = cl {
+                        self.write(&format!("{}(truncatingIfNeeded: ", ct));
+                        self.generate_expr(left);
+                        self.write(")");
+                    } else {
+                        self.generate_expr(left);
+                    }
+                    self.write(op_str);
+                    if let Some(ref ct) = cr {
+                        self.write(&format!("{}(truncatingIfNeeded: ", ct));
+                        self.generate_expr(right);
+                        self.write(")");
+                    } else {
+                        self.generate_expr(right);
+                    }
+                    self.write(")");
+                } else {
+                    self.write("(");
+                    self.generate_expr(left);
+                    self.write(op_str);
+                    self.generate_expr(right);
+                    self.write(")");
+                }
             }
-            ExprKind::Unary { op, operand } => {
-                let op_str = match op {
-                    UnaryOp::Neg => "-",
-                    UnaryOp::Not => "!",
-                    UnaryOp::BitNot => "~",
-                };
-                self.write(op_str);
-                self.write("(");
-                self.generate_expr(operand);
-                self.write(")");
-            }
+            ExprKind::Unary { op, operand } => match op {
+                UnaryOp::Neg => {
+                    self.write("(0 &- ");
+                    self.generate_expr(operand);
+                    self.write(")");
+                }
+                UnaryOp::Not => {
+                    self.write("!(");
+                    self.generate_expr(operand);
+                    self.write(")");
+                }
+                UnaryOp::BitNot => {
+                    self.write("~(");
+                    self.generate_expr(operand);
+                    self.write(")");
+                }
+            },
             ExprKind::Index { array, index } => {
                 self.generate_expr(array);
                 self.write("[Int(");
@@ -2024,6 +2078,82 @@ impl SwiftGenerator {
             }
             _ => None,
         }
+    }
+
+    /// Infer the Swift integer type of an expression, if possible.
+    fn infer_swift_int_type(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(ident) => self
+                .var_prim_types
+                .get(&ident.name)
+                .map(|p| self.swift_primitive_type(*p))
+                .filter(|t| t != "Bool"),
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    let t = self.swift_primitive_type(p.to_native());
+                    if t != "Bool" {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            ExprKind::Integer(_) => None,
+            ExprKind::Binary { left, right, .. } => {
+                let lt = self.infer_swift_int_type(left);
+                let rt = self.infer_swift_int_type(right);
+                match (lt, rt) {
+                    (Some(l), Some(r)) => Some(self.wider_uint_type(&l, &r).to_string()),
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
+            }
+            ExprKind::Paren(inner) | ExprKind::Deref(inner) | ExprKind::Ref(inner) => {
+                self.infer_swift_int_type(inner)
+            }
+            ExprKind::Unary { operand, .. } => self.infer_swift_int_type(operand),
+            ExprKind::Field { object, field } => {
+                if let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name
+                            && let crate::parser::TypeKind::Primitive(p) = &f.ty.kind
+                        {
+                            let t = self.swift_primitive_type(*p);
+                            if t != "Bool" {
+                                return Some(t);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::Call { func, .. } => {
+                if let ExprKind::Field { field, .. } = &func.kind
+                    && field.name == "len"
+                {
+                    return Some("UInt64".to_string());
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the wider of two unsigned integer type strings.
+    fn wider_uint_type<'a>(&self, a: &'a str, b: &'a str) -> &'a str {
+        let rank = |t: &str| -> u8 {
+            match t {
+                "UInt8" => 1,
+                "UInt16" => 2,
+                "UInt32" => 3,
+                "UInt64" => 4,
+                _ => 0,
+            }
+        };
+        if rank(a) >= rank(b) { a } else { b }
     }
 }
 

@@ -228,7 +228,7 @@ impl CGenerator {
         }
     }
 
-    /// Look up a struct field's fixed array size.
+    /// Look up a struct field's fixed array size (element count).
     /// Returns Some(size) if the field is a fixed-size array, None otherwise.
     fn get_struct_field_array_size(&self, object: &Expr, field_name: &str) -> Option<u64> {
         // Determine the struct type from var_types
@@ -241,6 +241,60 @@ impl CGenerator {
         let fields = self.struct_defs.get(&struct_name)?;
         let field_info = fields.iter().find(|f| f.name == field_name)?;
         Self::get_array_size(&field_info.ty)
+    }
+
+    /// Get byte size for a primitive type
+    fn primitive_byte_size(prim: &crate::parser::PrimitiveType) -> u64 {
+        use crate::parser::PrimitiveType;
+        match prim {
+            PrimitiveType::U8 | PrimitiveType::I8 | PrimitiveType::Bool => 1,
+            PrimitiveType::U16
+            | PrimitiveType::I16
+            | PrimitiveType::U16Be
+            | PrimitiveType::I16Be
+            | PrimitiveType::U16Le
+            | PrimitiveType::I16Le => 2,
+            PrimitiveType::U32
+            | PrimitiveType::I32
+            | PrimitiveType::U32Be
+            | PrimitiveType::I32Be
+            | PrimitiveType::U32Le
+            | PrimitiveType::I32Le => 4,
+            PrimitiveType::U64
+            | PrimitiveType::I64
+            | PrimitiveType::U64Be
+            | PrimitiveType::I64Be
+            | PrimitiveType::U64Le
+            | PrimitiveType::I64Le => 8,
+            PrimitiveType::U128
+            | PrimitiveType::I128
+            | PrimitiveType::U128Be
+            | PrimitiveType::I128Be
+            | PrimitiveType::U128Le
+            | PrimitiveType::I128Le => 16,
+        }
+    }
+
+    /// Look up a struct field's total byte count (element_count * element_byte_size).
+    /// Returns Some(bytes) if the field is a fixed-size array, None otherwise.
+    fn get_struct_field_byte_count(&self, object: &Expr, field_name: &str) -> Option<u64> {
+        use crate::parser::TypeKind;
+        let struct_name = if let ExprKind::Ident(ident) = &object.kind {
+            self.var_types.get(&ident.name)?.clone()
+        } else {
+            return None;
+        };
+        let fields = self.struct_defs.get(&struct_name)?;
+        let field_info = fields.iter().find(|f| f.name == field_name)?;
+        if let TypeKind::Array { element, size } = &field_info.ty.kind {
+            if let TypeKind::Primitive(prim) = &element.kind {
+                Some(size * Self::primitive_byte_size(prim))
+            } else {
+                Some(*size)
+            }
+        } else {
+            None
+        }
     }
 
     /// Get the return type string for a function
@@ -1010,6 +1064,21 @@ impl CGenerator {
             if let Some(size) = Self::get_fixed_array_param_size(&param.ty) {
                 self.fixed_array_vars.insert(param.name.name.clone(), size);
             }
+            // Track struct types for parameters (Named, &Named, &mut Named)
+            let struct_name = match &param.ty.kind {
+                crate::parser::TypeKind::Named(ident) => Some(ident.name.clone()),
+                crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) => {
+                    if let crate::parser::TypeKind::Named(ident) = &inner.kind {
+                        Some(ident.name.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(sn) = struct_name {
+                self.var_types.insert(param.name.name.clone(), sn);
+            }
         }
     }
 
@@ -1155,6 +1224,11 @@ impl CGenerator {
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
+        self.pointer_vars.clear();
+        self.slice_vars.clear();
+        self.fixed_array_vars.clear();
+        self.len_param_names.clear();
+        self.var_renames.clear();
         self.writeln(&format!("static void test_{}(void) {{", test.name.name));
         self.indent();
         self.generate_block(&test.body);
@@ -1484,15 +1558,47 @@ impl CGenerator {
                 TypeKind::Slice { element } => {
                     // Slices: pointer + length
                     let elem_ty = self.type_to_c(element);
-                    self.write_indent();
-                    if let Some(init) = init {
+                    // Check if init is a read_chunk call (needs out_len parameter)
+                    let is_read_chunk = init.is_some_and(|e| {
+                        if let ExprKind::MethodCall { method_name, .. } = &e.kind {
+                            method_name == "read_chunk"
+                        } else if let ExprKind::Call { func, .. } = &e.kind {
+                            if let ExprKind::Field { field, .. } = &func.kind {
+                                field.name == "read_chunk"
+                            } else if let ExprKind::Ident(ident) = &func.kind {
+                                ident.name.contains("read_chunk")
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    });
+                    if is_read_chunk {
+                        // Declare _len first, then call with &name_len
+                        self.writeln(&format!("size_t {}_len = 0;", name_str));
+                        self.write_indent();
                         self.write(&format!("{}* {} = ({}*)", elem_ty, name_str, elem_ty));
-                        self.generate_expr(init);
+                        if let Some(init) = init {
+                            self.generate_read_chunk_call(init, name_str);
+                        }
                         self.write(";\n");
                     } else {
-                        self.write(&format!("{}* {} = NULL;\n", elem_ty, name_str));
+                        self.write_indent();
+                        if let Some(init) = init {
+                            self.write(&format!("{}* {} = ({}*)", elem_ty, name_str, elem_ty));
+                            self.generate_expr(init);
+                            self.write(";\n");
+                            // Initialize _len from the init expression
+                            self.write_indent();
+                            self.write(&format!("size_t {}_len = ", name_str));
+                            self.generate_arg_len_expr(init);
+                            self.write(";\n");
+                        } else {
+                            self.write(&format!("{}* {} = NULL;\n", elem_ty, name_str));
+                            self.writeln(&format!("size_t {}_len = 0;", name_str));
+                        }
                     }
-                    self.writeln(&format!("size_t {}_len = 0;", name_str));
                     self.slice_vars.insert(name.name.clone());
                 }
                 TypeKind::Named(ident) => {
@@ -1511,20 +1617,52 @@ impl CGenerator {
                     match &inner.kind {
                         TypeKind::Slice { element } => {
                             let elem_ty = self.type_to_c(element);
-                            self.write_indent();
-                            if matches!(ty.kind, crate::parser::TypeKind::Ref(_)) {
-                                self.write("const ");
-                            }
-                            self.write(&format!("{}* {}", elem_ty, name_str));
-                            if let Some(init) = init {
-                                self.write(" = ");
-                                self.generate_expr(init);
+                            let is_const = matches!(ty.kind, crate::parser::TypeKind::Ref(_));
+                            // Check if init is a read_chunk call
+                            let is_read_chunk = init.is_some_and(|e| {
+                                if let ExprKind::MethodCall { method_name, .. } = &e.kind {
+                                    method_name == "read_chunk"
+                                } else if let ExprKind::Call { func, .. } = &e.kind {
+                                    if let ExprKind::Ident(ident) = &func.kind {
+                                        ident.name.contains("read_chunk")
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            });
+                            if is_read_chunk {
+                                // Declare _len first, then call with &name_len
+                                self.writeln(&format!("size_t {}_len = 0;", name_str));
+                                self.write_indent();
+                                if is_const {
+                                    self.write("const ");
+                                }
+                                self.write(&format!("{}* {} = ({}*)", elem_ty, name_str, elem_ty));
+                                if let Some(init) = init {
+                                    self.generate_read_chunk_call(init, name_str);
+                                }
+                                self.write(";\n");
                             } else {
-                                self.write(" = NULL");
+                                self.write_indent();
+                                if is_const {
+                                    self.write("const ");
+                                }
+                                self.write(&format!("{}* {}", elem_ty, name_str));
+                                if let Some(init) = init {
+                                    self.write(" = ");
+                                    self.generate_expr(init);
+                                    self.write(";\n");
+                                    self.write_indent();
+                                    self.write(&format!("size_t {}_len = ", name_str));
+                                    self.generate_arg_len_expr(init);
+                                    self.write(";\n");
+                                } else {
+                                    self.write(" = NULL;\n");
+                                    self.writeln(&format!("size_t {}_len = 0;", name_str));
+                                }
                             }
-                            self.write(";\n");
-                            // Length companion for slices
-                            self.writeln(&format!("size_t {}_len = 0;", name_str));
                             self.slice_vars.insert(name.name.clone());
                         }
                         TypeKind::Array { element, .. } => {
@@ -1604,17 +1742,141 @@ impl CGenerator {
             None => {
                 // No type annotation - infer from init
                 if let Some(init) = init {
-                    // Try to infer the type
-                    let inferred_ty = self.infer_c_type(init);
-                    self.write_indent();
-                    self.write(&format!("{} {} = ", inferred_ty, name_str));
-                    self.generate_expr(init);
-                    self.write(";\n");
+                    match &init.kind {
+                        ExprKind::Hex(h) => {
+                            let byte_count = h.len() / 2;
+                            let bytes: Vec<u8> = (0..h.len())
+                                .step_by(2)
+                                .filter_map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok())
+                                .collect();
+                            self.write_indent();
+                            self.write(&format!("const uint8_t {}[{}] = {{", name_str, byte_count));
+                            for (i, b) in bytes.iter().enumerate() {
+                                if i > 0 {
+                                    self.write(", ");
+                                }
+                                self.write(&format!("0x{:02X}", b));
+                            }
+                            self.write("};\n");
+                            self.fixed_array_vars
+                                .insert(name.name.clone(), byte_count as u64);
+                        }
+                        ExprKind::Bytes(s) => {
+                            let byte_count = s.len();
+                            self.write_indent();
+                            self.write(&format!("const uint8_t {}[{}] = {{", name_str, byte_count));
+                            for (i, b) in s.as_bytes().iter().enumerate() {
+                                if i > 0 {
+                                    self.write(", ");
+                                }
+                                self.write(&format!("0x{:02X}", b));
+                            }
+                            self.write("};\n");
+                            self.fixed_array_vars
+                                .insert(name.name.clone(), byte_count as u64);
+                        }
+                        ExprKind::String(s) => {
+                            let byte_count = s.len();
+                            self.write_indent();
+                            self.write(&format!("const uint8_t {}[{}] = {{", name_str, byte_count));
+                            for (i, b) in s.as_bytes().iter().enumerate() {
+                                if i > 0 {
+                                    self.write(", ");
+                                }
+                                self.write(&format!("0x{:02X}", b));
+                            }
+                            self.write("};\n");
+                            self.fixed_array_vars
+                                .insert(name.name.clone(), byte_count as u64);
+                        }
+                        ExprKind::Slice { .. } => {
+                            // Slice expression like data[offset..offset+64] - treat as const uint8_t*
+                            self.write_indent();
+                            self.write(&format!("const uint8_t* {} = ", name_str));
+                            self.generate_expr(init);
+                            self.write(";\n");
+                            self.write_indent();
+                            self.write(&format!("size_t {}_len = ", name_str));
+                            self.generate_arg_len_expr(init);
+                            self.write(";\n");
+                            self.slice_vars.insert(name.name.clone());
+                        }
+                        _ => {
+                            let inferred_ty = self.infer_c_type(init);
+                            self.write_indent();
+                            self.write(&format!("{} {} = ", inferred_ty, name_str));
+                            self.generate_expr(init);
+                            self.write(";\n");
+                        }
+                    }
                 } else {
                     // No type, no init - default to int
                     self.write_indent();
                     self.write(&format!("int {} = 0;\n", name_str));
                 }
+            }
+        }
+    }
+
+    /// Generate a read_chunk call with an extra &name_len out parameter
+    fn generate_read_chunk_call(&mut self, init: &Expr, name_str: &str) {
+        match &init.kind {
+            ExprKind::MethodCall {
+                receiver,
+                method_name: mname,
+                mangled_name,
+                args,
+            } => {
+                let func_name = if !mangled_name.is_empty() {
+                    mangled_name.clone()
+                } else if let ExprKind::Ident(obj_ident) = &receiver.kind {
+                    if let Some(sn) = self.var_types.get(&obj_ident.name).cloned() {
+                        format!("{}__{}", sn, mname)
+                    } else {
+                        format!("{}_{}", obj_ident.name, mname)
+                    }
+                } else {
+                    mname.clone()
+                };
+                self.write(&format!("{}(", func_name));
+                self.write("&");
+                self.generate_expr(receiver);
+                for arg in args {
+                    self.write(", ");
+                    self.generate_expr(arg);
+                }
+                self.write(&format!(", &{}_len)", name_str));
+            }
+            ExprKind::Call { func, args } => {
+                // For reader.read_chunk() calls, func is Field { object, field: read_chunk }
+                if let ExprKind::Field { object, field } = &func.kind {
+                    // Generate: Reader_read_chunk(&object, args..., &name_len)
+                    self.write(&format!("Reader_{}", field.name));
+                    self.write("(");
+                    let is_ptr = matches!(&object.kind, ExprKind::Ident(ident) if self.pointer_vars.contains(&ident.name));
+                    if !is_ptr {
+                        self.write("&");
+                    }
+                    self.generate_expr(object);
+                    for arg in args {
+                        self.write(", ");
+                        self.generate_expr(arg);
+                    }
+                    self.write(&format!(", &{}_len)", name_str));
+                } else {
+                    self.generate_expr(func);
+                    self.write("(");
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expr(arg);
+                    }
+                    self.write(&format!(", &{}_len)", name_str));
+                }
+            }
+            _ => {
+                self.generate_expr(init);
             }
         }
     }
@@ -1639,6 +1901,25 @@ impl CGenerator {
             ExprKind::Paren(inner) => self.infer_c_type(inner),
             ExprKind::Cast { ty, .. } => self.type_to_c(ty),
             ExprKind::StructLit { name, .. } => name.name.clone(),
+            ExprKind::TypeStaticCall {
+                type_name,
+                method_name,
+                ..
+            } => {
+                if method_name.name == "new" {
+                    type_name.name.clone()
+                } else {
+                    "uint64_t".to_string()
+                }
+            }
+            ExprKind::Call { func, .. } => {
+                if let ExprKind::Ident(ident) = &func.kind
+                    && let Some(idx) = ident.name.find("__new")
+                {
+                    return ident.name[..idx].to_string();
+                }
+                "uint32_t".to_string()
+            }
             _ => "uint32_t".to_string(),
         }
     }
@@ -1677,9 +1958,9 @@ impl CGenerator {
             }
             ExprKind::Field { object, field } => {
                 // Check if this field is a fixed-size array in the struct definition
-                if let Some(size) = self.get_struct_field_array_size(object, &field.name) {
-                    // Fixed-size array field: use the known compile-time size
-                    self.write(&format!("{}", size));
+                // Use byte count (element_count * element_size) for secure_zero etc.
+                if let Some(byte_count) = self.get_struct_field_byte_count(object, &field.name) {
+                    self.write(&format!("{}", byte_count));
                 } else {
                     // struct.field - use struct.field_len
                     let accessor = if let ExprKind::Ident(ident) = &object.kind
@@ -2199,8 +2480,8 @@ impl CGenerator {
             ExprKind::Cast { expr: inner, ty } => {
                 self.generate_cast(inner, ty);
             }
-            ExprKind::Ref(inner) => {
-                // & in C: take address
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) => {
+                // &/&mut in C: take address
                 // But for fixed-size arrays, the name already decays to a pointer
                 match &inner.kind {
                     ExprKind::Ident(ident)
@@ -2209,26 +2490,39 @@ impl CGenerator {
                     {
                         self.generate_expr(inner);
                     }
-                    ExprKind::Ident(_) | ExprKind::Field { .. } => {
-                        self.write("&");
-                        self.generate_expr(inner);
+                    ExprKind::Field { object, field } => {
+                        // Check if this struct field is a fixed-size array
+                        // If so, it already decays to a pointer in C (no & needed)
+                        // For non-u8 arrays, we also need a (uint8_t*) cast
+                        use crate::parser::{PrimitiveType, TypeKind};
+                        let field_array_info: Option<(u64, bool)> = (|| {
+                            let struct_name = if let ExprKind::Ident(ident) = &object.kind {
+                                self.var_types.get(&ident.name)?.clone()
+                            } else {
+                                return None;
+                            };
+                            let fields = self.struct_defs.get(&struct_name)?;
+                            let fi = fields.iter().find(|f| f.name == field.name)?;
+                            if let TypeKind::Array { element, size } = &fi.ty.kind {
+                                let is_u8 =
+                                    matches!(element.kind, TypeKind::Primitive(PrimitiveType::U8));
+                                Some((*size, is_u8))
+                            } else {
+                                None
+                            }
+                        })();
+                        if let Some((_size, is_u8)) = field_array_info {
+                            // Array field: already decays to pointer, no & needed
+                            if !is_u8 {
+                                self.write("(uint8_t*)");
+                            }
+                            self.generate_expr(inner);
+                        } else {
+                            self.write("&");
+                            self.generate_expr(inner);
+                        }
                     }
-                    _ => {
-                        self.generate_expr(inner);
-                    }
-                }
-            }
-            ExprKind::MutRef(inner) => {
-                // &mut in C: take address (same as &)
-                // But for fixed-size arrays, the name already decays to a pointer
-                match &inner.kind {
-                    ExprKind::Ident(ident)
-                        if self.fixed_array_vars.contains_key(&ident.name)
-                            || self.slice_vars.contains(&ident.name) =>
-                    {
-                        self.generate_expr(inner);
-                    }
-                    ExprKind::Ident(_) | ExprKind::Field { .. } => {
+                    ExprKind::Ident(_) => {
                         self.write("&");
                         self.generate_expr(inner);
                     }
@@ -2439,8 +2733,9 @@ impl CGenerator {
             }
             ExprKind::Field { object, field } => {
                 // Check if this field is a fixed-size array in the struct definition
-                if let Some(size) = self.get_struct_field_array_size(object, &field.name) {
-                    self.write(&format!("{}", size));
+                // Use byte count (element_count * element_size)
+                if let Some(byte_count) = self.get_struct_field_byte_count(object, &field.name) {
+                    self.write(&format!("{}", byte_count));
                 } else {
                     // Try object.field_len (use -> for pointer vars)
                     let accessor = if let ExprKind::Ident(ident) = &object.kind

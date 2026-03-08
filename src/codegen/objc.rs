@@ -24,6 +24,13 @@ struct StructFieldInfo {
 /// Struct method info (method name -> mangled function name)
 type MethodMap = HashMap<String, String>;
 
+/// Info about a function parameter for ObjC code generation
+#[derive(Clone)]
+#[allow(dead_code)]
+struct FuncParamInfo {
+    needs_len: bool,
+}
+
 /// Objective-C code generator
 pub struct ObjCGenerator {
     /// Current indentation level
@@ -40,6 +47,23 @@ pub struct ObjCGenerator {
     var_types: HashMap<String, String>,
     /// Variables that are pointers (from &mut / & parameters), needing -> instead of .
     pointer_vars: HashSet<String>,
+    /// Function signatures: func_name -> list of param info (for generating correct call args)
+    #[allow(dead_code)]
+    func_signatures: HashMap<String, Vec<FuncParamInfo>>,
+    /// Variables that are slices/arrays (need _len companion when passed to functions)
+    #[allow(dead_code)]
+    slice_vars: HashSet<String>,
+    /// Variables that are fixed-size arrays (decay to pointers, no & needed)
+    /// Maps variable name to known array size.
+    #[allow(dead_code)]
+    fixed_array_vars: HashMap<String, u64>,
+    /// Generated `_len` companion parameter names (e.g., "data_len" from param `data: &[u8]`).
+    /// Used to detect local variable name conflicts.
+    #[allow(dead_code)]
+    len_param_names: HashSet<String>,
+    /// Mapping from original variable name to renamed variable (to avoid _len conflicts).
+    #[allow(dead_code)]
+    var_renames: HashMap<String, String>,
 }
 
 impl ObjCGenerator {
@@ -52,6 +76,11 @@ impl ObjCGenerator {
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
             pointer_vars: HashSet::new(),
+            func_signatures: HashMap::new(),
+            slice_vars: HashSet::new(),
+            fixed_array_vars: HashMap::new(),
+            len_param_names: HashSet::new(),
+            var_renames: HashMap::new(),
         }
     }
 
@@ -174,12 +203,274 @@ impl ObjCGenerator {
         }
     }
 
-    /// Populate pointer_vars from function parameters
+    /// Check if a parameter type requires a companion _len argument.
+    fn param_needs_len(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Slice { .. } => true,
+            TypeKind::ArrayRef { .. } => true,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                matches!(inner.kind, TypeKind::Slice { .. })
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if a struct field type is a slice-like type that needs a companion _len field
+    fn is_slice_field_type(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Slice { .. } => true,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                matches!(inner.kind, TypeKind::Slice { .. })
+            }
+            _ => false,
+        }
+    }
+
+    /// Get array size from a type if it's an array
+    #[allow(dead_code)]
+    fn get_array_size(ty: &ParserType) -> Option<u64> {
+        if let crate::parser::TypeKind::Array { size, .. } = &ty.kind {
+            Some(*size)
+        } else {
+            None
+        }
+    }
+
+    /// Get the fixed array size from a parameter type, if it's a fixed-size array (or ref to one).
+    fn get_fixed_array_param_size(ty: &ParserType) -> Option<u64> {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Array { size, .. } => Some(*size),
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                if let TypeKind::Array { size, .. } = &inner.kind {
+                    Some(*size)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Look up a struct field's fixed array size.
+    #[allow(dead_code)]
+    fn get_struct_field_array_size(&self, object: &Expr, field_name: &str) -> Option<u64> {
+        let struct_name = if let ExprKind::Ident(ident) = &object.kind {
+            self.var_types.get(&ident.name)?.clone()
+        } else {
+            return None;
+        };
+        let fields = self.struct_defs.get(&struct_name)?;
+        let field_info = fields.iter().find(|f| f.name == field_name)?;
+        Self::get_array_size(&field_info.ty)
+    }
+
+    /// Generate a parameter declaration with companion _len for slices
+    fn generate_param_decl(&mut self, param: &crate::parser::Param) {
+        use crate::parser::TypeKind;
+
+        match &param.ty.kind {
+            TypeKind::Array { .. } => {
+                let base = self.type_to_c_base(&param.ty);
+                self.write(&format!("{}* {}", base, param.name.name));
+            }
+            TypeKind::Slice { element } => {
+                let elem_ty = self.type_to_c(element);
+                self.write(&format!("{}* {}", elem_ty, param.name.name));
+                self.write(&format!(", size_t {}_len", param.name.name));
+            }
+            TypeKind::ArrayRef { element, .. } => {
+                let elem_ty = self.type_to_c(element);
+                self.write(&format!("{}* {}", elem_ty, param.name.name));
+                self.write(&format!(", size_t {}_len", param.name.name));
+            }
+            TypeKind::MutRef(inner) => match &inner.kind {
+                TypeKind::Slice { element } => {
+                    let elem_ty = self.type_to_c(element);
+                    self.write(&format!("{}* {}", elem_ty, param.name.name));
+                    self.write(&format!(", size_t {}_len", param.name.name));
+                }
+                TypeKind::Array { .. } => {
+                    let base = self.type_to_c_base(inner);
+                    self.write(&format!("{}* {}", base, param.name.name));
+                }
+                TypeKind::Named(ident) => {
+                    self.write(&format!("struct {}* {}", ident.name, param.name.name));
+                }
+                _ => {
+                    let ty_str = self.type_to_c(inner);
+                    self.write(&format!("{}* {}", ty_str, param.name.name));
+                }
+            },
+            TypeKind::Ref(inner) => match &inner.kind {
+                TypeKind::Slice { element } => {
+                    let elem_ty = self.type_to_c(element);
+                    self.write(&format!("const {}* {}", elem_ty, param.name.name));
+                    self.write(&format!(", size_t {}_len", param.name.name));
+                }
+                TypeKind::Array { .. } => {
+                    let base = self.type_to_c_base(inner);
+                    self.write(&format!("const {}* {}", base, param.name.name));
+                }
+                TypeKind::Named(ident) => {
+                    self.write(&format!("const struct {}* {}", ident.name, param.name.name));
+                }
+                _ => {
+                    let ty_str = self.type_to_c(inner);
+                    self.write(&format!("const {}* {}", ty_str, param.name.name));
+                }
+            },
+            TypeKind::Named(ident) => {
+                self.write(&format!("struct {} {}", ident.name, param.name.name));
+            }
+            _ => {
+                let ty_str = self.type_to_c(&param.ty);
+                self.write(&format!("{} {}", ty_str, param.name.name));
+            }
+        }
+    }
+
+    /// Populate pointer_vars, slice_vars, fixed_array_vars, and len_param_names from function parameters
     fn collect_pointer_params(&mut self, func: &Function) {
         self.pointer_vars.clear();
+        self.slice_vars.clear();
+        self.fixed_array_vars.clear();
+        self.len_param_names.clear();
+        self.var_renames.clear();
         for param in &func.params {
             if Self::is_pointer_param(&param.ty) {
                 self.pointer_vars.insert(param.name.name.clone());
+            }
+            if Self::param_needs_len(&param.ty) {
+                self.slice_vars.insert(param.name.name.clone());
+                self.len_param_names
+                    .insert(format!("{}_len", param.name.name));
+            }
+            if let Some(size) = Self::get_fixed_array_param_size(&param.ty) {
+                self.fixed_array_vars.insert(param.name.name.clone(), size);
+            }
+        }
+    }
+
+    /// Generate a function call argument, and if the corresponding parameter
+    /// needs a companion _len argument, emit that too.
+    #[allow(dead_code)]
+    fn generate_call_arg(&mut self, arg: &Expr, needs_len: bool) {
+        self.generate_expr(arg);
+        if needs_len {
+            self.write(", ");
+            self.generate_arg_len_expr(arg);
+        }
+    }
+
+    /// Generate the length expression for an argument being passed to a slice/array parameter.
+    #[allow(dead_code)]
+    fn generate_arg_len_expr(&mut self, arg: &Expr) {
+        match &arg.kind {
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) => {
+                self.generate_arg_len_expr(inner);
+            }
+            ExprKind::Ident(ident) => {
+                if let Some(&size) = self.fixed_array_vars.get(&ident.name) {
+                    self.write(&format!("{}", size));
+                } else {
+                    let effective = self
+                        .var_renames
+                        .get(&ident.name)
+                        .cloned()
+                        .unwrap_or_else(|| ident.name.clone());
+                    self.write(&format!("{}_len", effective));
+                }
+            }
+            ExprKind::Field { object, field } => {
+                if let Some(size) = self.get_struct_field_array_size(object, &field.name) {
+                    self.write(&format!("{}", size));
+                } else {
+                    let accessor = if let ExprKind::Ident(ident) = &object.kind
+                        && self.pointer_vars.contains(&ident.name)
+                    {
+                        "->"
+                    } else {
+                        "."
+                    };
+                    self.generate_expr(object);
+                    self.write(&format!("{}{}_len", accessor, field.name));
+                }
+            }
+            ExprKind::Slice {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                self.write("(");
+                self.generate_expr(end);
+                if *inclusive {
+                    self.write(" + 1");
+                }
+                self.write(" - ");
+                self.generate_expr(start);
+                self.write(")");
+            }
+            ExprKind::Bytes(s) => {
+                self.write(&format!("{}", s.len()));
+            }
+            ExprKind::Hex(h) => {
+                self.write(&format!("{}", h.len() / 2));
+            }
+            ExprKind::String(s) => {
+                self.write(&format!("{}", s.len()));
+            }
+            ExprKind::Array(elements) => {
+                self.write(&format!("{}", elements.len()));
+            }
+            ExprKind::Paren(inner) => {
+                self.generate_arg_len_expr(inner);
+            }
+            _ => {
+                self.write("0");
+            }
+        }
+    }
+
+    /// Generate function call arguments, looking up the function signature to
+    /// determine which arguments need companion _len parameters.
+    #[allow(dead_code)]
+    fn generate_call_args(&mut self, func_name: &str, args: &[Expr]) {
+        if let Some(params) = self.func_signatures.get(func_name).cloned() {
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                let needs_len = params.get(i).is_some_and(|p| p.needs_len);
+                self.generate_call_arg(arg, needs_len);
+            }
+        } else {
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.generate_expr(arg);
+            }
+        }
+    }
+
+    /// Generate function call arguments for a method call, where the first C parameter
+    /// is the self/receiver (already emitted), and the remaining args map to params[1..].
+    #[allow(dead_code)]
+    fn generate_method_call_args(&mut self, func_name: &str, args: &[Expr]) {
+        if let Some(params) = self.func_signatures.get(func_name).cloned() {
+            for (i, arg) in args.iter().enumerate() {
+                self.write(", ");
+                let needs_len = params.get(i + 1).is_some_and(|p| p.needs_len);
+                self.generate_call_arg(arg, needs_len);
+            }
+        } else {
+            for arg in args {
+                self.write(", ");
+                self.generate_expr(arg);
             }
         }
     }
@@ -601,41 +892,7 @@ impl ObjCGenerator {
                     self.write("void* self");
                 }
             } else {
-                let base_type = self.type_to_c_base(&param.ty);
-                let arr_suffix = self.type_array_suffix(&param.ty);
-                if arr_suffix.is_empty() {
-                    match &param.ty.kind {
-                        crate::parser::TypeKind::Slice { element }
-                        | crate::parser::TypeKind::ArrayRef { element, .. } => {
-                            let elem_type = self.type_to_c(element);
-                            self.write(&format!("{}* {}", elem_type, param.name.name));
-                        }
-                        crate::parser::TypeKind::MutRef(inner)
-                        | crate::parser::TypeKind::Ref(inner) => match &inner.kind {
-                            crate::parser::TypeKind::Slice { element }
-                            | crate::parser::TypeKind::ArrayRef { element, .. } => {
-                                let elem_type = self.type_to_c(element);
-                                self.write(&format!("{}* {}", elem_type, param.name.name));
-                            }
-                            crate::parser::TypeKind::Array { .. } => {
-                                let base = self.type_to_c_base(inner);
-                                self.write(&format!("{}* {}", base, param.name.name));
-                            }
-                            _ => {
-                                let inner_type = self.type_to_c(inner);
-                                self.write(&format!("{}* {}", inner_type, param.name.name));
-                            }
-                        },
-                        crate::parser::TypeKind::Named(ident) => {
-                            self.write(&format!("struct {} {}", ident.name, param.name.name));
-                        }
-                        _ => {
-                            self.write(&format!("{} {}", base_type, param.name.name));
-                        }
-                    }
-                } else {
-                    self.write(&format!("{}* {}", base_type, param.name.name));
-                }
+                self.generate_param_decl(param);
             }
         }
 
@@ -656,79 +913,33 @@ impl ObjCGenerator {
             "void".to_string()
         };
 
-        // Check if return type is an array type (needs special handling)
-        let ret_is_array = if let Some(ref rt) = func.return_type {
-            matches!(rt.kind, crate::parser::TypeKind::Array { .. })
-        } else {
-            false
-        };
-
         self.write_indent();
-        if ret_is_array {
-            // Can't return arrays directly in C; for now emit the base type
-            // In practice the transpiler likely doesn't produce functions returning arrays
-            self.write(&format!("{} {}(", ret_type, func.name.name));
-        } else {
-            self.write(&format!("{} {}(", ret_type, func.name.name));
-        }
+        self.write(&format!("{} {}(", ret_type, func.name.name));
 
         // Parameters
-        if func.params.is_empty() {
-            self.write("void");
-        } else {
-            for (i, param) in func.params.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                let base_type = self.type_to_c_base(&param.ty);
-                let arr_suffix = self.type_array_suffix(&param.ty);
-                if arr_suffix.is_empty() {
-                    // Check if the param type is a reference/slice → pass as pointer
-                    match &param.ty.kind {
-                        crate::parser::TypeKind::Slice { element }
-                        | crate::parser::TypeKind::ArrayRef { element, .. } => {
-                            let elem_type = self.type_to_c(element);
-                            self.write(&format!("{}* {}", elem_type, param.name.name));
-                        }
-                        crate::parser::TypeKind::MutRef(inner)
-                        | crate::parser::TypeKind::Ref(inner) => {
-                            // For references to slices/arrays, inner already maps to a pointer type
-                            // (e.g. &mut [u8] -> Slice{u8} -> "uint8_t*"), so don't add another "*"
-                            match &inner.kind {
-                                crate::parser::TypeKind::Slice { element }
-                                | crate::parser::TypeKind::ArrayRef { element, .. } => {
-                                    let elem_type = self.type_to_c(element);
-                                    self.write(&format!("{}* {}", elem_type, param.name.name));
-                                }
-                                crate::parser::TypeKind::Array { .. } => {
-                                    let base = self.type_to_c_base(inner);
-                                    self.write(&format!("{}* {}", base, param.name.name));
-                                }
-                                _ => {
-                                    let inner_type = self.type_to_c(inner);
-                                    self.write(&format!("{}* {}", inner_type, param.name.name));
-                                }
-                            }
-                            // Track struct type for mutable/immutable references
-                            if let crate::parser::TypeKind::Named(ident) = &inner.kind {
-                                self.var_types
-                                    .insert(param.name.name.clone(), ident.name.clone());
-                            }
-                        }
-                        crate::parser::TypeKind::Named(ident) => {
-                            self.write(&format!("struct {} {}", ident.name, param.name.name));
-                            self.var_types
-                                .insert(param.name.name.clone(), ident.name.clone());
-                        }
-                        _ => {
-                            self.write(&format!("{} {}", base_type, param.name.name));
-                        }
-                    }
-                } else {
-                    // Array parameters decay to pointers in C
-                    self.write(&format!("{}* {}", base_type, param.name.name));
-                }
+        let mut first = true;
+        for param in &func.params {
+            if !first {
+                self.write(", ");
             }
+            first = false;
+            self.generate_param_decl(param);
+            // Track struct type for references
+            if let crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) =
+                &param.ty.kind
+                && let crate::parser::TypeKind::Named(ident) = &inner.kind
+            {
+                self.var_types
+                    .insert(param.name.name.clone(), ident.name.clone());
+            }
+            if let crate::parser::TypeKind::Named(ident) = &param.ty.kind {
+                self.var_types
+                    .insert(param.name.name.clone(), ident.name.clone());
+            }
+        }
+
+        if first {
+            self.write("void");
         }
 
         self.write(") {\n");
@@ -762,67 +973,34 @@ impl ObjCGenerator {
         self.write_indent();
         self.write(&format!("{} {}(", ret_type, mangled_name));
 
-        // Parameters: first param is self (pointer to struct)
-        let mut param_idx = 0;
-        for (i, param) in func.params.iter().enumerate() {
-            if i > 0 {
+        // Parameters
+        let mut first = true;
+        for param in &func.params {
+            if !first {
                 self.write(", ");
             }
-            // 'self' parameter → pointer to struct
+            first = false;
+
             if param.name.name == "self" {
                 self.write(&format!("struct {}* self", struct_name));
             } else {
-                let base_type = self.type_to_c_base(&param.ty);
-                let arr_suffix = self.type_array_suffix(&param.ty);
-                if arr_suffix.is_empty() {
-                    match &param.ty.kind {
-                        crate::parser::TypeKind::Slice { element }
-                        | crate::parser::TypeKind::ArrayRef { element, .. } => {
-                            let elem_type = self.type_to_c(element);
-                            self.write(&format!("{}* {}", elem_type, param.name.name));
-                        }
-                        crate::parser::TypeKind::MutRef(inner)
-                        | crate::parser::TypeKind::Ref(inner) => {
-                            // For references to slices/arrays, inner already maps to a pointer type
-                            // (e.g. &mut [u8] -> Slice{u8} -> "uint8_t*"), so don't add another "*"
-                            match &inner.kind {
-                                crate::parser::TypeKind::Slice { element }
-                                | crate::parser::TypeKind::ArrayRef { element, .. } => {
-                                    let elem_type = self.type_to_c(element);
-                                    self.write(&format!("{}* {}", elem_type, param.name.name));
-                                }
-                                crate::parser::TypeKind::Array { .. } => {
-                                    let base = self.type_to_c_base(inner);
-                                    self.write(&format!("{}* {}", base, param.name.name));
-                                }
-                                _ => {
-                                    let inner_type = self.type_to_c(inner);
-                                    self.write(&format!("{}* {}", inner_type, param.name.name));
-                                }
-                            }
-                            // Track struct type for mutable/immutable references
-                            if let crate::parser::TypeKind::Named(ident) = &inner.kind {
-                                self.var_types
-                                    .insert(param.name.name.clone(), ident.name.clone());
-                            }
-                        }
-                        crate::parser::TypeKind::Named(ident) => {
-                            self.write(&format!("struct {} {}", ident.name, param.name.name));
-                            self.var_types
-                                .insert(param.name.name.clone(), ident.name.clone());
-                        }
-                        _ => {
-                            self.write(&format!("{} {}", base_type, param.name.name));
-                        }
-                    }
-                } else {
-                    self.write(&format!("{}* {}", base_type, param.name.name));
+                self.generate_param_decl(param);
+                // Track struct type for references
+                if let crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) =
+                    &param.ty.kind
+                    && let crate::parser::TypeKind::Named(ident) = &inner.kind
+                {
+                    self.var_types
+                        .insert(param.name.name.clone(), ident.name.clone());
+                }
+                if let crate::parser::TypeKind::Named(ident) = &param.ty.kind {
+                    self.var_types
+                        .insert(param.name.name.clone(), ident.name.clone());
                 }
             }
-            param_idx += 1;
         }
 
-        if param_idx == 0 {
+        if first {
             self.write("void");
         }
 
@@ -839,6 +1017,11 @@ impl ObjCGenerator {
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
         self.var_types.clear();
+        self.pointer_vars.clear();
+        self.slice_vars.clear();
+        self.fixed_array_vars.clear();
+        self.len_param_names.clear();
+        self.var_renames.clear();
         self.writeln(&format!("static void test_{}(void) {{", test.name.name));
         self.indent();
         self.generate_block(&test.body);
@@ -878,6 +1061,10 @@ impl ObjCGenerator {
             let base_type = self.type_to_c_base(&field.ty);
             let arr_suffix = self.type_array_suffix(&field.ty);
             self.writeln(&format!("{} {}{};", base_type, field.name.name, arr_suffix));
+            // Emit companion _len field for slice-like struct fields
+            if Self::is_slice_field_type(&field.ty) {
+                self.writeln(&format!("size_t {}_len;", field.name.name));
+            }
         }
         self.dedent();
         self.writeln(&format!("}} {};", s.name.name));
@@ -892,6 +1079,10 @@ impl ObjCGenerator {
             let base_type = self.type_to_c_base(&field.ty);
             let arr_suffix = self.type_array_suffix(&field.ty);
             self.writeln(&format!("{} {}{};", base_type, field.name.name, arr_suffix));
+            // Emit companion _len field for slice-like struct fields
+            if Self::is_slice_field_type(&field.ty) {
+                self.writeln(&format!("size_t {}_len;", field.name.name));
+            }
         }
         self.dedent();
         self.writeln(&format!("}} {};", l.name.name));
@@ -996,87 +1187,7 @@ impl ObjCGenerator {
                     }
                 }
 
-                if let Some(ty) = ty {
-                    let base_type = self.type_to_c_base(ty);
-                    let arr_suffix = self.type_array_suffix(ty);
-
-                    if !arr_suffix.is_empty() {
-                        // Array declaration
-                        self.write_indent();
-                        self.write(&format!("{} {}{}", base_type, name.name, arr_suffix));
-                        if let Some(init) = init {
-                            self.write(" = ");
-                            self.generate_expr(init);
-                        } else {
-                            self.write(" = {0}");
-                        }
-                        self.write(";\n");
-                    } else {
-                        match &ty.kind {
-                            crate::parser::TypeKind::Named(ident) => {
-                                // Struct type
-                                self.write_indent();
-                                self.write(&format!("struct {} {}", ident.name, name.name));
-                                if let Some(init) = init {
-                                    self.write(" = ");
-                                    self.generate_expr(init);
-                                } else {
-                                    self.write(" = {0}");
-                                }
-                                self.write(";\n");
-                            }
-                            crate::parser::TypeKind::Slice { element }
-                            | crate::parser::TypeKind::ArrayRef { element, .. } => {
-                                let elem_type = self.type_to_c(element);
-                                self.write_indent();
-                                self.write(&format!("{}* {}", elem_type, name.name));
-                                if let Some(init) = init {
-                                    self.write(" = ");
-                                    self.generate_expr(init);
-                                } else {
-                                    self.write(" = NULL");
-                                }
-                                self.write(";\n");
-                            }
-                            crate::parser::TypeKind::MutRef(inner)
-                            | crate::parser::TypeKind::Ref(inner) => {
-                                let inner_type = self.type_to_c(inner);
-                                self.write_indent();
-                                self.write(&format!("{}* {}", inner_type, name.name));
-                                if let Some(init) = init {
-                                    self.write(" = ");
-                                    self.generate_expr(init);
-                                } else {
-                                    self.write(" = NULL");
-                                }
-                                self.write(";\n");
-                            }
-                            _ => {
-                                self.write_indent();
-                                self.write(&format!("{} {}", base_type, name.name));
-                                if let Some(init) = init {
-                                    self.write(" = ");
-                                    self.generate_expr(init);
-                                } else {
-                                    self.write(&format!(" = {}", self.default_value_for_type(ty)));
-                                }
-                                self.write(";\n");
-                            }
-                        }
-                    }
-                } else if let Some(init) = init {
-                    // No type annotation - use auto (C23) or infer
-                    // For C compatibility, try to infer the type from the init expression
-                    self.write_indent();
-                    let inferred_type = self.infer_expr_c_type(init);
-                    self.write(&format!("{} {} = ", inferred_type, name.name));
-                    self.generate_expr(init);
-                    self.write(";\n");
-                } else {
-                    // No type, no init - use int as fallback
-                    self.write_indent();
-                    self.write(&format!("int {} = 0;\n", name.name));
-                }
+                self.generate_let_stmt(name, ty.as_ref(), init.as_ref());
             }
             StmtKind::Expr(expr) => {
                 self.write_indent();
@@ -1341,6 +1452,300 @@ impl ObjCGenerator {
         }
     }
 
+    fn generate_let_stmt(
+        &mut self,
+        name: &crate::parser::Ident,
+        ty: Option<&ParserType>,
+        init: Option<&Expr>,
+    ) {
+        use crate::parser::TypeKind;
+
+        // Check for _len name conflicts
+        let effective_name = if self.len_param_names.contains(&name.name) {
+            let renamed = format!("_local_{}", name.name);
+            self.var_renames.insert(name.name.clone(), renamed.clone());
+            renamed
+        } else {
+            name.name.clone()
+        };
+        let name_str = &effective_name;
+
+        match ty {
+            Some(ty) => match &ty.kind {
+                TypeKind::Array { size, .. } => {
+                    let base_ty = self.type_to_c_base(ty);
+                    self.write_indent();
+                    self.write(&format!("{} {}[{}]", base_ty, name_str, size));
+
+                    if let Some(init) = init {
+                        match &init.kind {
+                            ExprKind::ArrayRepeat { value, .. } => {
+                                if matches!(value.kind, ExprKind::Integer(0)) {
+                                    self.write(" = {0}");
+                                } else {
+                                    self.write(";\n");
+                                    self.write_indent();
+                                    self.write(&format!(
+                                        "for (size_t __i = 0; __i < {}; __i++) {}[__i] = ",
+                                        size, name_str
+                                    ));
+                                    self.generate_expr(value);
+                                }
+                            }
+                            ExprKind::Array(elements) => {
+                                self.write(" = {");
+                                for (ei, elem) in elements.iter().enumerate() {
+                                    if ei > 0 {
+                                        self.write(", ");
+                                    }
+                                    self.generate_expr(elem);
+                                }
+                                self.write("}");
+                            }
+                            ExprKind::Bytes(s) => {
+                                self.write(" = {");
+                                for (bi, b) in s.bytes().enumerate() {
+                                    if bi > 0 {
+                                        self.write(", ");
+                                    }
+                                    self.write(&format!("0x{:02X}", b));
+                                }
+                                self.write("}");
+                            }
+                            ExprKind::Hex(h) => {
+                                self.write(" = {");
+                                let hex_bytes: Vec<u8> = (0..h.len())
+                                    .step_by(2)
+                                    .filter_map(|j| u8::from_str_radix(&h[j..j + 2], 16).ok())
+                                    .collect();
+                                for (bi, b) in hex_bytes.iter().enumerate() {
+                                    if bi > 0 {
+                                        self.write(", ");
+                                    }
+                                    self.write(&format!("0x{:02X}", b));
+                                }
+                                self.write("}");
+                            }
+                            _ => {
+                                self.write(";\n");
+                                self.write_indent();
+                                self.write(&format!("memcpy({}, ", name_str));
+                                self.generate_expr(init);
+                                self.write(&format!(", sizeof({}))", name_str));
+                            }
+                        }
+                    } else {
+                        self.write(" = {0}");
+                    }
+                    self.write(";\n");
+                    self.fixed_array_vars.insert(name.name.clone(), *size);
+                }
+                TypeKind::Slice { element } => {
+                    let elem_ty = self.type_to_c(element);
+                    // Check for read_chunk special case: need to declare _len first
+                    // and pass &name_len as extra arg
+                    let is_read_chunk = if let Some(init) = init
+                        && let ExprKind::Call { func, .. } = &init.kind
+                        && let ExprKind::Field { field, .. } = &func.kind
+                    {
+                        field.name == "read_chunk"
+                    } else {
+                        false
+                    };
+                    if is_read_chunk {
+                        // Declare _len first so we can pass &name_len to read_chunk
+                        self.writeln(&format!("size_t {}_len = 0;", name_str));
+                        self.write_indent();
+                        self.write(&format!("{}* {} = ", elem_ty, name_str));
+                        // Generate the read_chunk call manually with the extra &name_len arg
+                        if let Some(init) = init
+                            && let ExprKind::Call { func, args } = &init.kind
+                            && let ExprKind::Field { object, .. } = &func.kind
+                        {
+                            self.write("Reader_read_chunk(&");
+                            self.generate_expr(object);
+                            for arg in args {
+                                self.write(", ");
+                                self.generate_expr(arg);
+                            }
+                            self.write(&format!(", &{}_len)", name_str));
+                        }
+                        self.write(";\n");
+                    } else {
+                        self.write_indent();
+                        self.write(&format!("{}* {}", elem_ty, name_str));
+                        if let Some(init) = init {
+                            self.write(" = ");
+                            self.generate_expr(init);
+                        } else {
+                            self.write(" = NULL");
+                        }
+                        self.write(";\n");
+                        self.write_indent();
+                        self.write(&format!("size_t {}_len = ", name_str));
+                        if let Some(init) = init {
+                            self.generate_arg_len_expr(init);
+                        } else {
+                            self.write("0");
+                        }
+                        self.write(";\n");
+                    }
+                    self.slice_vars.insert(name.name.clone());
+                }
+                TypeKind::ArrayRef { element, size } => {
+                    let elem_ty = self.type_to_c(element);
+                    self.write_indent();
+                    self.write(&format!("{}* {}", elem_ty, name_str));
+                    if let Some(init) = init {
+                        self.write(" = ");
+                        self.generate_expr(init);
+                    } else {
+                        self.write(" = NULL");
+                    }
+                    self.write(";\n");
+                    self.writeln(&format!("size_t {}_len = {};", name_str, size));
+                    self.slice_vars.insert(name.name.clone());
+                }
+                TypeKind::Named(ident) => {
+                    self.write_indent();
+                    self.write(&format!("struct {} {}", ident.name, name_str));
+                    if let Some(init) = init {
+                        self.write(" = ");
+                        self.generate_expr(init);
+                    } else {
+                        self.write(" = {0}");
+                    }
+                    self.write(";\n");
+                }
+                TypeKind::MutRef(inner) | TypeKind::Ref(inner) => match &inner.kind {
+                    TypeKind::Slice { element } => {
+                        let elem_ty = self.type_to_c(element);
+                        let is_read_chunk = if let Some(init) = init
+                            && let ExprKind::Call { func, .. } = &init.kind
+                            && let ExprKind::Field { field, .. } = &func.kind
+                        {
+                            field.name == "read_chunk"
+                        } else {
+                            false
+                        };
+                        if is_read_chunk {
+                            self.writeln(&format!("size_t {}_len = 0;", name_str));
+                            self.write_indent();
+                            self.write(&format!("{}* {} = ", elem_ty, name_str));
+                            if let Some(init) = init
+                                && let ExprKind::Call { func, args } = &init.kind
+                                && let ExprKind::Field { object, .. } = &func.kind
+                            {
+                                self.write("Reader_read_chunk(&");
+                                self.generate_expr(object);
+                                for arg in args {
+                                    self.write(", ");
+                                    self.generate_expr(arg);
+                                }
+                                self.write(&format!(", &{}_len)", name_str));
+                            }
+                            self.write(";\n");
+                        } else {
+                            self.write_indent();
+                            self.write(&format!("{}* {}", elem_ty, name_str));
+                            if let Some(init) = init {
+                                self.write(" = ");
+                                self.generate_expr(init);
+                            } else {
+                                self.write(" = NULL");
+                            }
+                            self.write(";\n");
+                            self.write_indent();
+                            self.write(&format!("size_t {}_len = ", name_str));
+                            if let Some(init) = init {
+                                self.generate_arg_len_expr(init);
+                            } else {
+                                self.write("0");
+                            }
+                            self.write(";\n");
+                        }
+                        self.slice_vars.insert(name.name.clone());
+                    }
+                    TypeKind::Array { .. } => {
+                        let base = self.type_to_c_base(inner);
+                        self.write_indent();
+                        self.write(&format!("{}* {}", base, name_str));
+                        if let Some(init) = init {
+                            self.write(" = ");
+                            self.generate_expr(init);
+                        } else {
+                            self.write(" = NULL");
+                        }
+                        self.write(";\n");
+                    }
+                    TypeKind::Named(ident) => {
+                        self.write_indent();
+                        self.write(&format!("struct {}* {}", ident.name, name_str));
+                        if let Some(init) = init {
+                            self.write(" = ");
+                            self.generate_expr(init);
+                        } else {
+                            self.write(" = NULL");
+                        }
+                        self.write(";\n");
+                    }
+                    _ => {
+                        let inner_ty = self.type_to_c(inner);
+                        self.write_indent();
+                        self.write(&format!("{}* {}", inner_ty, name_str));
+                        if let Some(init) = init {
+                            self.write(" = ");
+                            self.generate_expr(init);
+                        } else {
+                            self.write(" = NULL");
+                        }
+                        self.write(";\n");
+                    }
+                },
+                _ => {
+                    let ty_str = self.type_to_c(ty);
+                    self.write_indent();
+                    self.write(&format!("{} {}", ty_str, name_str));
+                    if let Some(init) = init {
+                        self.write(" = ");
+                        self.generate_expr(init);
+                    } else {
+                        self.write(&format!(" = {}", self.default_value_for_type(ty)));
+                    }
+                    self.write(";\n");
+                }
+            },
+            None => {
+                if let Some(init) = init {
+                    let inferred_type = self.infer_expr_c_type(init);
+                    self.write_indent();
+                    self.write(&format!("{} {} = ", inferred_type, name_str));
+                    self.generate_expr(init);
+                    self.write(";\n");
+                    // Track fixed arrays from Hex/Bytes/String literals
+                    match &init.kind {
+                        ExprKind::Hex(h) => {
+                            self.fixed_array_vars
+                                .insert(name.name.clone(), (h.len() / 2) as u64);
+                        }
+                        ExprKind::Bytes(s) => {
+                            self.fixed_array_vars
+                                .insert(name.name.clone(), s.len() as u64);
+                        }
+                        ExprKind::String(s) => {
+                            self.fixed_array_vars
+                                .insert(name.name.clone(), s.len() as u64);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    self.write_indent();
+                    self.write(&format!("int {} = 0;\n", name_str));
+                }
+            }
+        }
+    }
+
     fn generate_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Integer(n) => {
@@ -1387,7 +1792,11 @@ impl ObjCGenerator {
                 ));
             }
             ExprKind::Ident(ident) => {
-                self.write(&ident.name);
+                if let Some(renamed) = self.var_renames.get(&ident.name).cloned() {
+                    self.write(&renamed);
+                } else {
+                    self.write(&ident.name);
+                }
             }
             ExprKind::Binary { left, op, right } => {
                 // Check for array comparisons using constant_time_eq
@@ -1402,10 +1811,11 @@ impl ObjCGenerator {
                         self.write("constant_time_eq(");
                         self.generate_expr(left);
                         self.write(", ");
+                        self.generate_arg_len_expr(left);
+                        self.write(", ");
                         self.generate_expr(right);
                         self.write(", ");
-                        // Try to determine length
-                        self.generate_array_len(left, right);
+                        self.generate_arg_len_expr(right);
                         self.write(")");
                         return;
                     }
@@ -1483,7 +1893,7 @@ impl ObjCGenerator {
                             if i > 0 {
                                 self.write(", ");
                             }
-                            self.generate_expr(arg);
+                            self.generate_call_arg(arg, true);
                         }
                         self.write(")");
                         return;
@@ -1494,7 +1904,7 @@ impl ObjCGenerator {
                             if i > 0 {
                                 self.write(", ");
                             }
-                            self.generate_expr(arg);
+                            self.generate_call_arg(arg, true);
                         }
                         self.write(")");
                         return;
@@ -1521,11 +1931,41 @@ impl ObjCGenerator {
                 if let ExprKind::Field { object, field } = &func.kind {
                     // .len() -> sizeof or stored length
                     if field.name == "len" && args.is_empty() {
-                        // In C, we can use sizeof for fixed arrays, but for slices
-                        // we'd need a separate length. For now, use sizeof/element size
-                        self.write("sizeof(");
-                        self.generate_expr(object);
-                        self.write(")");
+                        // Convert .len() to companion _len variable or fixed array size
+                        if let ExprKind::Ident(ident) = &object.kind {
+                            if let Some(&size) = self.fixed_array_vars.get(&ident.name) {
+                                self.write(&format!("{}", size));
+                            } else {
+                                let effective = self
+                                    .var_renames
+                                    .get(&ident.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| ident.name.clone());
+                                self.write(&format!("{}_len", effective));
+                            }
+                        } else if let ExprKind::Field {
+                            object: inner_obj,
+                            field: inner_field,
+                        } = &object.kind
+                        {
+                            if let Some(size) =
+                                self.get_struct_field_array_size(inner_obj, &inner_field.name)
+                            {
+                                self.write(&format!("{}", size));
+                            } else {
+                                let accessor = if let ExprKind::Ident(ident) = &inner_obj.kind
+                                    && self.pointer_vars.contains(&ident.name)
+                                {
+                                    "->"
+                                } else {
+                                    "."
+                                };
+                                self.generate_expr(inner_obj);
+                                self.write(&format!("{}{}_len", accessor, inner_field.name));
+                            }
+                        } else {
+                            self.write("/* .len() */ 0");
+                        }
                         return;
                     }
 
@@ -1650,23 +2090,29 @@ impl ObjCGenerator {
                             self.write(&format!("{}(&", mangled_name));
                         }
                         self.generate_expr(object);
-                        for arg in args {
-                            self.write(", ");
-                            self.generate_expr(arg);
-                        }
+                        self.generate_method_call_args(&mangled_name, args);
                         self.write(")");
                         return;
                     }
                 }
 
                 // Regular function call
+                let func_name = if let ExprKind::Ident(ident) = &func.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
                 self.generate_expr(func);
                 self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
+                if let Some(ref fn_name) = func_name {
+                    self.generate_call_args(fn_name, args);
+                } else {
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expr(arg);
                     }
-                    self.generate_expr(arg);
                 }
                 self.write(")");
             }
@@ -1701,21 +2147,53 @@ impl ObjCGenerator {
             }
             ExprKind::Ref(inner) => {
                 // Reference: take address in C
-                // But for arrays, they already decay to pointers
-                if is_array_like_expr(inner) {
-                    self.generate_expr(inner);
-                } else {
-                    self.write("&");
-                    self.generate_expr(inner);
+                // But for fixed-size arrays, the name already decays to a pointer
+                match &inner.kind {
+                    ExprKind::Ident(ident)
+                        if self.fixed_array_vars.contains_key(&ident.name)
+                            || self.slice_vars.contains(&ident.name) =>
+                    {
+                        self.generate_expr(inner);
+                    }
+                    ExprKind::Field { object, field }
+                        if self
+                            .get_struct_field_array_size(object, &field.name)
+                            .is_some() =>
+                    {
+                        self.generate_expr(inner);
+                    }
+                    ExprKind::Ident(_) | ExprKind::Field { .. } => {
+                        self.write("&");
+                        self.generate_expr(inner);
+                    }
+                    _ => {
+                        self.generate_expr(inner);
+                    }
                 }
             }
             ExprKind::MutRef(inner) => {
                 // Mutable reference: same as ref in C
-                if is_array_like_expr(inner) {
-                    self.generate_expr(inner);
-                } else {
-                    self.write("&");
-                    self.generate_expr(inner);
+                match &inner.kind {
+                    ExprKind::Ident(ident)
+                        if self.fixed_array_vars.contains_key(&ident.name)
+                            || self.slice_vars.contains(&ident.name) =>
+                    {
+                        self.generate_expr(inner);
+                    }
+                    ExprKind::Field { object, field }
+                        if self
+                            .get_struct_field_array_size(object, &field.name)
+                            .is_some() =>
+                    {
+                        self.generate_expr(inner);
+                    }
+                    ExprKind::Ident(_) | ExprKind::Field { .. } => {
+                        self.write("&");
+                        self.generate_expr(inner);
+                    }
+                    _ => {
+                        self.generate_expr(inner);
+                    }
                 }
             }
             ExprKind::Deref(inner) => {
@@ -1735,12 +2213,22 @@ impl ObjCGenerator {
             ExprKind::StructLit { name, fields } => {
                 // C struct literal (compound literal)
                 self.write(&format!("(struct {}){{", name.name));
+                let struct_fields = self.struct_defs.get(&name.name).cloned();
                 for (i, (field_name, value)) in fields.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
                     self.write(&format!(".{} = ", field_name.name));
                     self.generate_expr(value);
+                    // If this field has a companion _len field in the struct,
+                    // also emit it based on the value expression
+                    if let Some(ref sfields) = struct_fields
+                        && let Some(field_info) = sfields.iter().find(|f| f.name == field_name.name)
+                        && Self::is_slice_field_type(&field_info.ty)
+                    {
+                        self.write(&format!(", .{}_len = ", field_name.name));
+                        self.generate_arg_len_expr(value);
+                    }
                 }
                 self.write("}");
             }
@@ -1820,10 +2308,7 @@ impl ObjCGenerator {
                 // Generate: mangled_name(&receiver, args...)
                 self.write(&format!("{}(&", mangled_name));
                 self.generate_expr(receiver);
-                for arg in args {
-                    self.write(", ");
-                    self.generate_expr(arg);
-                }
+                self.generate_method_call_args(mangled_name, args);
                 self.write(")");
             }
             ExprKind::TypeStaticCall {
@@ -1832,25 +2317,30 @@ impl ObjCGenerator {
                 args,
             } => {
                 // Resolved by monomorphization
-                self.write(&format!("{}__{}", type_name.name, method_name.name));
+                let mangled = format!("{}__{}", type_name.name, method_name.name);
+                self.write(&mangled);
                 self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.generate_expr(arg);
-                }
+                self.generate_call_args(&mangled, args);
                 self.write(")");
             }
             ExprKind::GenericCall { func, args, .. } => {
                 // Resolved by monomorphization - generate as regular call
+                let gfunc_name = if let ExprKind::Ident(ident) = &func.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
                 self.generate_expr(func);
                 self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
+                if let Some(ref gname) = gfunc_name {
+                    self.generate_call_args(gname, args);
+                } else {
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expr(arg);
                     }
-                    self.generate_expr(arg);
                 }
                 self.write(")");
             }
@@ -2120,66 +2610,6 @@ impl ObjCGenerator {
         }
     }
 
-    /// Try to determine the length of an array-like expression for comparisons
-    fn generate_array_len(&mut self, left: &Expr, right: &Expr) {
-        // Try to get length from hex literals
-        if let ExprKind::Hex(h) = &left.kind {
-            self.write(&format!("{}", h.len() / 2));
-            return;
-        }
-        if let ExprKind::Hex(h) = &right.kind {
-            self.write(&format!("{}", h.len() / 2));
-            return;
-        }
-        // Try from array literal
-        if let ExprKind::Array(elems) = &left.kind {
-            self.write(&format!("{}", elems.len()));
-            return;
-        }
-        if let ExprKind::Array(elems) = &right.kind {
-            self.write(&format!("{}", elems.len()));
-            return;
-        }
-        // Try from string/bytes
-        if let ExprKind::String(s) = &left.kind {
-            self.write(&format!("{}", s.len()));
-            return;
-        }
-        if let ExprKind::Bytes(s) = &left.kind {
-            self.write(&format!("{}", s.len()));
-            return;
-        }
-        if let ExprKind::String(s) = &right.kind {
-            self.write(&format!("{}", s.len()));
-            return;
-        }
-        if let ExprKind::Bytes(s) = &right.kind {
-            self.write(&format!("{}", s.len()));
-            return;
-        }
-        // Try from slice
-        if let ExprKind::Slice { start, end, .. } = &left.kind {
-            self.write("(");
-            self.generate_expr(end);
-            self.write(" - ");
-            self.generate_expr(start);
-            self.write(")");
-            return;
-        }
-        if let ExprKind::Slice { start, end, .. } = &right.kind {
-            self.write("(");
-            self.generate_expr(end);
-            self.write(" - ");
-            self.generate_expr(start);
-            self.write(")");
-            return;
-        }
-        // Fallback: use sizeof on the left operand
-        self.write("sizeof(");
-        self.generate_expr(left);
-        self.write(")");
-    }
-
     /// Get the Reader C function name for reading a field type
     fn get_read_method_for_type(&self, ty: &ParserType) -> Option<String> {
         use crate::parser::{Endianness, PrimitiveType, TypeKind};
@@ -2283,6 +2713,19 @@ impl ObjCGenerator {
             ExprKind::Array(_) | ExprKind::ArrayRepeat { .. } => "uint8_t*".to_string(),
             ExprKind::Binary { left, .. } => self.infer_expr_c_type(left),
             ExprKind::Paren(inner) => self.infer_expr_c_type(inner),
+            ExprKind::Slice { .. } => "uint8_t*".to_string(),
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) => {
+                format!("{}*", self.infer_expr_c_type(inner))
+            }
+            ExprKind::Ident(ident) => {
+                if self.slice_vars.contains(&ident.name)
+                    || self.fixed_array_vars.contains_key(&ident.name)
+                {
+                    "uint8_t*".to_string()
+                } else {
+                    "uint32_t".to_string()
+                }
+            }
             _ => "uint32_t".to_string(),
         }
     }
@@ -2344,8 +2787,10 @@ impl CodeGenerator for ObjCGenerator {
         self.output.clear();
         self.struct_defs.clear();
         self.struct_methods.clear();
+        self.var_types.clear();
+        self.func_signatures.clear();
 
-        // Pre-pass: collect struct definitions and method info
+        // Pre-pass: collect struct definitions, method info, and function signatures
         for item in &ast.ast.items {
             match &item.kind {
                 ItemKind::Struct(s) => {
@@ -2374,10 +2819,29 @@ impl CodeGenerator for ObjCGenerator {
                     let mut methods = HashMap::new();
                     for method in &impl_def.methods {
                         let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
-                        methods.insert(method.name.name.clone(), mangled);
+                        methods.insert(method.name.name.clone(), mangled.clone());
+                        // Collect method signatures under mangled name
+                        let params: Vec<FuncParamInfo> = method
+                            .params
+                            .iter()
+                            .map(|p| FuncParamInfo {
+                                needs_len: Self::param_needs_len(&p.ty),
+                            })
+                            .collect();
+                        self.func_signatures.insert(mangled, params);
                     }
                     self.struct_methods
                         .insert(impl_def.target.name.clone(), methods);
+                }
+                ItemKind::Function(func) => {
+                    let params: Vec<FuncParamInfo> = func
+                        .params
+                        .iter()
+                        .map(|p| FuncParamInfo {
+                            needs_len: Self::param_needs_len(&p.ty),
+                        })
+                        .collect();
+                    self.func_signatures.insert(func.name.name.clone(), params);
                 }
                 _ => {}
             }

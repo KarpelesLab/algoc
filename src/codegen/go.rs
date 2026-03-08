@@ -287,6 +287,11 @@ impl GoGenerator {
                 {
                     return name.clone();
                 }
+                // Reader and Writer are always pointer types in Go
+                // (NewReader/NewWriter return *Reader/*Writer)
+                if ident.name == "Reader" || ident.name == "Writer" {
+                    return format!("*{}", ident.name);
+                }
                 ident.name.clone()
             }
             TypeKind::SelfType => {
@@ -1420,6 +1425,12 @@ impl GoGenerator {
                     (Some(t), Some(v)) if t != v && is_go_int_type(t) && is_go_int_type(v) => {
                         Some(t.clone())
                     }
+                    // Untyped int value assigned to a typed target
+                    (Some(t), None)
+                        if is_go_int_type(t) && !matches!(value.kind, ExprKind::Integer(_)) =>
+                    {
+                        Some(t.clone())
+                    }
                     _ => None,
                 };
 
@@ -1445,6 +1456,14 @@ impl GoGenerator {
                         if t != v
                             && is_go_int_type(t)
                             && is_go_int_type(v)
+                            && !matches!(op, BinaryOp::Shl | BinaryOp::Shr) =>
+                    {
+                        Some(t.clone())
+                    }
+                    // Untyped int value in compound assignment to a typed target
+                    (Some(t), None)
+                        if is_go_int_type(t)
+                            && !matches!(value.kind, ExprKind::Integer(_))
                             && !matches!(op, BinaryOp::Shl | BinaryOp::Shr) =>
                     {
                         Some(t.clone())
@@ -1660,10 +1679,26 @@ impl GoGenerator {
                         if matches!(op, BinaryOp::Ne) {
                             self.write("!");
                         }
+                        // When passing a fixed-size array to constant_time_eq
+                        // (which expects slices), append [:] to convert to slice.
+                        let left_is_fixed = self
+                            .infer_expr_go_type(left)
+                            .as_deref()
+                            .is_some_and(is_fixed_array_go_type);
+                        let right_is_fixed = self
+                            .infer_expr_go_type(right)
+                            .as_deref()
+                            .is_some_and(is_fixed_array_go_type);
                         self.write("constant_time_eq(");
                         self.generate_expr(left);
+                        if left_is_fixed {
+                            self.write("[:]");
+                        }
                         self.write(", ");
                         self.generate_expr(right);
+                        if right_is_fixed {
+                            self.write("[:]");
+                        }
                         self.write(")");
                         return;
                     }
@@ -1965,8 +2000,29 @@ impl GoGenerator {
                         && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
                         && let Some(mangled_name) = methods.get(&field.name)
                     {
-                        // Generate: StructName__method(object, args...)
+                        // Check if the first parameter expects a pointer
+                        let needs_addr = if let Some(sig) =
+                            self.func_signatures.get(mangled_name.as_str())
+                            && let Some(first_param) = sig.first()
+                        {
+                            if first_param.starts_with('*') {
+                                let recv_ty = self
+                                    .param_go_types
+                                    .get(&obj_ident.name)
+                                    .or_else(|| self.var_go_types.get(&obj_ident.name));
+                                !recv_ty.is_some_and(|t| t.starts_with('*'))
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        // Generate: StructName__method(&object, args...)
                         self.write(&format!("{}(", mangled_name));
+                        if needs_addr {
+                            self.write("&");
+                        }
                         self.generate_expr(object);
                         for arg in args {
                             self.write(", ");
@@ -1993,24 +2049,53 @@ impl GoGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    // If the argument is a cast and the expected param type differs,
-                    // cast to the expected type instead
                     if let Some(ref ptypes) = param_types
                         && i < ptypes.len()
-                        && let ExprKind::Cast { expr: inner, .. } = &arg.kind
                     {
-                        let arg_go_type = self.infer_expr_go_type(arg);
                         let expected = &ptypes[i];
-                        if let Some(ref actual) = arg_go_type
-                            && actual != expected
-                            && is_go_int_type(actual)
-                            && is_go_int_type(expected)
-                        {
-                            // Re-cast to the expected parameter type
-                            self.write(&format!("{}(", expected));
-                            self.generate_expr(inner);
-                            self.write(")");
-                            continue;
+                        // If the argument is a cast and the expected param type differs,
+                        // cast to the expected type instead
+                        if let ExprKind::Cast { expr: inner, .. } = &arg.kind {
+                            let arg_go_type = self.infer_expr_go_type(arg);
+                            if let Some(ref actual) = arg_go_type
+                                && actual != expected
+                                && is_go_int_type(actual)
+                                && is_go_int_type(expected)
+                            {
+                                // Re-cast to the expected parameter type
+                                self.write(&format!("{}(", expected));
+                                self.generate_expr(inner);
+                                self.write(")");
+                                continue;
+                            }
+                        }
+
+                        // For non-cast args: if arg is untyped (None, i.e. int) and
+                        // expected is a specific uint type, wrap in a cast.
+                        // Skip integer literals since Go handles those implicitly.
+                        if is_go_int_type(expected) && !matches!(arg.kind, ExprKind::Integer(_)) {
+                            let arg_go_type = self.infer_expr_go_type(arg);
+                            let needs_cast = match &arg_go_type {
+                                None => true, // untyped int -> specific type
+                                Some(actual) => actual != expected && is_go_int_type(actual),
+                            };
+                            if needs_cast {
+                                self.write(&format!("{}(", expected));
+                                self.generate_expr(arg);
+                                self.write(")");
+                                continue;
+                            }
+                        }
+
+                        // If the expected type is a slice but the arg is a
+                        // fixed-size array, append [:] to convert
+                        if expected.starts_with("[]") {
+                            let arg_go_type = self.infer_expr_go_type(arg);
+                            if arg_go_type.as_deref().is_some_and(is_fixed_array_go_type) {
+                                self.generate_expr(arg);
+                                self.write("[:]");
+                                continue;
+                            }
                         }
                     }
                     self.generate_expr(arg);
@@ -2217,10 +2302,60 @@ impl GoGenerator {
                 ..
             } => {
                 // Generate: mangled_name(receiver, args...)
+                // Check if the first parameter expects a pointer but receiver is a value
+                let receiver_needs_addr = if let Some(sig) = self.func_signatures.get(mangled_name)
+                    && let Some(first_param) = sig.first()
+                {
+                    if first_param.starts_with('*') {
+                        // Check if receiver is already a pointer
+                        let recv_ty = self.infer_expr_go_type(receiver);
+                        !recv_ty.as_ref().is_some_and(|t| t.starts_with('*'))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
                 self.write(&format!("{}(", mangled_name));
+                if receiver_needs_addr {
+                    self.write("&");
+                }
                 self.generate_expr(receiver);
-                for arg in args {
+                // Apply call-site coercion for remaining args
+                let param_types = self.func_signatures.get(mangled_name).cloned();
+                for (idx, arg) in args.iter().enumerate() {
                     self.write(", ");
+                    // param index is idx+1 since first param is the receiver
+                    let param_idx = idx + 1;
+                    if let Some(ref ptypes) = param_types
+                        && param_idx < ptypes.len()
+                    {
+                        let expected = &ptypes[param_idx];
+                        // Fixed array to slice conversion
+                        if expected.starts_with("[]") {
+                            let arg_go_type = self.infer_expr_go_type(arg);
+                            if arg_go_type.as_deref().is_some_and(is_fixed_array_go_type) {
+                                self.generate_expr(arg);
+                                self.write("[:]");
+                                continue;
+                            }
+                        }
+                        // Int type coercion
+                        if is_go_int_type(expected) && !matches!(arg.kind, ExprKind::Integer(_)) {
+                            let arg_go_type = self.infer_expr_go_type(arg);
+                            let needs_cast = match &arg_go_type {
+                                None => true,
+                                Some(actual) => actual != expected && is_go_int_type(actual),
+                            };
+                            if needs_cast {
+                                self.write(&format!("{}(", expected));
+                                self.generate_expr(arg);
+                                self.write(")");
+                                continue;
+                            }
+                        }
+                    }
                     self.generate_expr(arg);
                 }
                 self.write(")");

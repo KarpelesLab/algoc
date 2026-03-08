@@ -58,6 +58,8 @@ pub struct JavaGenerator {
     /// Variables known to be non-u8 arrays (e.g., int[], long[])
     #[allow(dead_code)]
     non_u8_array_vars: HashSet<String>,
+    /// Depth counter for nested struct literals (used to generate unique temp var names)
+    struct_lit_depth: usize,
 }
 
 impl JavaGenerator {
@@ -78,6 +80,7 @@ impl JavaGenerator {
             loop_var_renames: HashMap::new(),
             current_struct_name: None,
             non_u8_array_vars: HashSet::new(),
+            struct_lit_depth: 0,
         }
     }
 
@@ -656,12 +659,27 @@ impl JavaGenerator {
             self.byte_array_vars.insert(c.name.name.clone());
         }
         self.write_indent();
+        let needs_byte_cast =
+            Self::is_byte_primitive(&c.ty) && Self::expr_may_widen_to_int(&c.value);
+        let needs_short_cast = !needs_byte_cast
+            && Self::is_short_primitive(&c.ty)
+            && Self::expr_may_widen_to_int(&c.value);
         self.write(&format!(
             "static final {} {} = ",
             self.java_type(&c.ty),
             c.name.name
         ));
-        self.generate_expr_with_type_hint(&c.value, Some(&c.ty));
+        if needs_byte_cast {
+            self.write("(byte)(");
+            self.generate_expr(&c.value);
+            self.write(")");
+        } else if needs_short_cast {
+            self.write("(short)(");
+            self.generate_expr(&c.value);
+            self.write(")");
+        } else {
+            self.generate_expr_with_type_hint(&c.value, Some(&c.ty));
+        }
         self.write(";\n\n");
     }
 
@@ -1773,17 +1791,23 @@ impl JavaGenerator {
                 // because when a field name matches a local variable name (e.g.,
                 // `data = data;`), the field shadows the local variable inside the
                 // anonymous class, causing the field to be assigned to itself (null).
-                // The lambda pattern avoids this by using a temporary `__s`.
+                // The lambda pattern avoids this by using a unique temporary variable.
+                // We use a depth counter (__s0, __s1, ...) to avoid shadowing when
+                // struct literals are nested (Java lambdas cannot shadow enclosing vars).
+                let depth = self.struct_lit_depth;
+                self.struct_lit_depth += 1;
+                let var_name = format!("__s{}", depth);
                 self.write(&format!(
-                    "((java.util.function.Supplier<{0}>)(() -> {{ {0} __s = new {0}(); ",
-                    name.name
+                    "((java.util.function.Supplier<{0}>)(() -> {{ {0} {1} = new {0}(); ",
+                    name.name, var_name
                 ));
                 for (field_name, value) in fields {
-                    self.write(&format!("__s.{} = ", field_name.name));
+                    self.write(&format!("{}.{} = ", var_name, field_name.name));
                     self.generate_expr(value);
                     self.write("; ");
                 }
-                self.write("return __s; })).get()");
+                self.write(&format!("return {}; }})).get()", var_name));
+                self.struct_lit_depth -= 1;
             }
             ExprKind::Conditional {
                 condition,
@@ -2007,10 +2031,9 @@ impl JavaGenerator {
                 if is_byte_sequence_expr(expr) {
                     match native {
                         PrimitiveType::U16 | PrimitiveType::I16 => {
-                            self.write("((int)(() -> { byte[] __b = ");
-                            // Can't do lambdas inline cleanly, use block helper
-                            // Instead, generate inline byte reading
-                            self.write("/* u16 from bytes */ ((java.util.function.Supplier<Integer>)(() -> { byte[] __b = ");
+                            self.write(
+                                "((java.util.function.Supplier<Integer>)(() -> { byte[] __b = ",
+                            );
                             self.generate_expr(expr);
                             if little_endian {
                                 self.write(
@@ -2156,6 +2179,11 @@ impl JavaGenerator {
         match &ty.kind {
             TypeKind::Primitive(p) => {
                 let native = p.to_native();
+                // When widening from a byte-producing expression to a wider
+                // unsigned type, mask with & 0xFF to get unsigned semantics.
+                // Java bytes are signed (-128..127), so (int)byte sign-extends,
+                // but AlgoC u8-to-u32 casts expect zero-extension.
+                let source_is_byte = self.expr_produces_byte(expr);
                 match native {
                     PrimitiveType::U8 | PrimitiveType::I8 => {
                         self.write("((byte)(");
@@ -2163,22 +2191,40 @@ impl JavaGenerator {
                         self.write("))");
                     }
                     PrimitiveType::U16 | PrimitiveType::I16 => {
-                        self.write("((short)(");
-                        self.generate_expr(expr);
-                        self.write("))");
+                        if source_is_byte {
+                            self.write("((short)(");
+                            self.generate_expr(expr);
+                            self.write(" & 0xFF))");
+                        } else {
+                            self.write("((short)(");
+                            self.generate_expr(expr);
+                            self.write("))");
+                        }
                     }
                     PrimitiveType::U32 | PrimitiveType::I32 => {
-                        self.write("((int)(");
-                        self.generate_expr(expr);
-                        self.write("))");
+                        if source_is_byte {
+                            self.write("(");
+                            self.generate_expr(expr);
+                            self.write(" & 0xFF)");
+                        } else {
+                            self.write("((int)(");
+                            self.generate_expr(expr);
+                            self.write("))");
+                        }
                     }
                     PrimitiveType::U64
                     | PrimitiveType::I64
                     | PrimitiveType::U128
                     | PrimitiveType::I128 => {
-                        self.write("((long)(");
-                        self.generate_expr(expr);
-                        self.write("))");
+                        if source_is_byte {
+                            self.write("((long)(");
+                            self.generate_expr(expr);
+                            self.write(" & 0xFF))");
+                        } else {
+                            self.write("((long)(");
+                            self.generate_expr(expr);
+                            self.write("))");
+                        }
                     }
                     PrimitiveType::Bool => {
                         self.write("((");
@@ -2381,17 +2427,15 @@ impl JavaGenerator {
                 {
                     return true;
                 }
-                // Check struct field byte arrays
+                // Check struct field byte arrays (including &[u8], &mut [u8], etc.)
                 if let ExprKind::Field { object, field } = &array.kind
                     && let ExprKind::Ident(obj_ident) = &object.kind
                     && let Some(struct_name) = self.var_types.get(&obj_ident.name)
                     && let Some(fields) = self.struct_defs.get(struct_name)
                 {
                     for f in fields {
-                        if f.name == field.name
-                            && let crate::parser::TypeKind::Array { element, .. } = &f.ty.kind
-                        {
-                            return Self::is_byte_primitive(element);
+                        if f.name == field.name && Self::is_byte_array_type(&f.ty) {
+                            return true;
                         }
                     }
                 }
