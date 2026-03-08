@@ -49,8 +49,6 @@ pub struct GoGenerator {
     needs_cond_uint64: bool,
     needs_cond_bool: bool,
     needs_cond_bytes: bool,
-    /// Whether we need the constant_time_eq helper
-    needs_constant_time_eq: bool,
 }
 
 impl GoGenerator {
@@ -71,7 +69,6 @@ impl GoGenerator {
             needs_cond_uint64: false,
             needs_cond_bool: false,
             needs_cond_bytes: false,
-            needs_constant_time_eq: false,
         }
     }
 
@@ -464,26 +461,6 @@ impl GoGenerator {
             self.writeln("");
         }
 
-        if self.needs_constant_time_eq {
-            self.writeln("func constant_time_eq(a, b []byte) bool {");
-            self.indent();
-            self.writeln("if len(a) != len(b) {");
-            self.indent();
-            self.writeln("return false");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("var v byte");
-            self.writeln("for i := range a {");
-            self.indent();
-            self.writeln("v |= a[i] ^ b[i]");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("return v == 0");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("");
-        }
-
         // Conditional helper functions (Go has no ternary operator)
         if self.needs_cond_uint8 {
             self.writeln("func __cond_uint8(c bool, a, b uint8) uint8 {");
@@ -667,17 +644,9 @@ impl GoGenerator {
                     self.needed_imports.insert("encoding/binary".to_string());
                 }
             }
-            ExprKind::Binary { left, op, right } => {
+            ExprKind::Binary { left, right, .. } => {
                 self.pre_scan_expr(left);
                 self.pre_scan_expr(right);
-                // Array equality comparisons need __bytes_equal or constant_time_eq
-                if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
-                    let left_is_array = is_array_like_expr(left);
-                    let right_is_array = is_array_like_expr(right);
-                    if left_is_array || right_is_array {
-                        self.needs_constant_time_eq = true;
-                    }
-                }
             }
             ExprKind::Unary { operand, .. } => self.pre_scan_expr(operand),
             ExprKind::Index { array, index } => {
@@ -2088,7 +2057,6 @@ impl CodeGenerator for GoGenerator {
         self.needs_cond_uint64 = false;
         self.needs_cond_bool = false;
         self.needs_cond_bytes = false;
-        self.needs_constant_time_eq = false;
 
         // Pre-pass: collect struct definitions and method mappings
         for item in &ast.ast.items {

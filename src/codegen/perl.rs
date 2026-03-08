@@ -115,22 +115,6 @@ impl PerlGenerator {
         self.writeln("sub _u64 { return $_[0] & 0xFFFFFFFFFFFFFFFF; }");
         self.writeln("");
 
-        // constant_time_eq for array comparison
-        self.writeln("sub constant_time_eq {");
-        self.indent();
-        self.writeln("my ($a, $b) = @_;");
-        self.writeln("return 0 if scalar(@$a) != scalar(@$b);");
-        self.writeln("my $result = 0;");
-        self.writeln("for my $i (0 .. $#$a) {");
-        self.indent();
-        self.writeln("$result |= ($a->[$i] ^ $b->[$i]);");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return ($result == 0) ? 1 : 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
         // Reader package for streaming byte input
         self.writeln("{");
         self.indent();
@@ -1757,6 +1741,7 @@ impl CodeGenerator for PerlGenerator {
         self.writeln("");
         self.writeln("use strict;");
         self.writeln("use warnings;");
+        self.writeln("no warnings 'portable';");
         self.writeln("");
 
         self.generate_runtime();

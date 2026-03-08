@@ -100,45 +100,6 @@ impl CppGenerator {
         self.writeln("// AlgoC Runtime Helpers");
         self.writeln("");
 
-        // constant_time_eq for comparing byte sequences
-        self.writeln("static bool constant_time_eq(std::span<const uint8_t> a, std::span<const uint8_t> b) {");
-        self.indent();
-        self.writeln("if (a.size() != b.size()) return false;");
-        self.writeln("uint8_t diff = 0;");
-        self.writeln("for (size_t i = 0; i < a.size(); i++) {");
-        self.indent();
-        self.writeln("diff |= a[i] ^ b[i];");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return diff == 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Overload for vector == span comparisons
-        self.writeln("static bool constant_time_eq(const std::vector<uint8_t>& a, std::span<const uint8_t> b) {");
-        self.indent();
-        self.writeln("return constant_time_eq(std::span<const uint8_t>(a), b);");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        self.writeln("static bool constant_time_eq(std::span<const uint8_t> a, const std::vector<uint8_t>& b) {");
-        self.indent();
-        self.writeln("return constant_time_eq(a, std::span<const uint8_t>(b));");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        self.writeln("static bool constant_time_eq(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {");
-        self.indent();
-        self.writeln(
-            "return constant_time_eq(std::span<const uint8_t>(a), std::span<const uint8_t>(b));",
-        );
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
         // Helper to create vector from initializer list
         self.writeln("static std::vector<uint8_t> make_bytes(std::initializer_list<uint8_t> il) {");
         self.indent();
@@ -287,7 +248,7 @@ impl CppGenerator {
         self.writeln("uint16_t read_u16be() {");
         self.indent();
         self.writeln("if (pos + 2 > len) throw std::runtime_error(\"EOF\");");
-        self.writeln("uint16_t v = read_u16be(data + pos); pos += 2; return v;");
+        self.writeln("uint16_t v = ::read_u16be(data + pos); pos += 2; return v;");
         self.dedent();
         self.writeln("}");
         self.writeln("uint16_t read_u16le() {");

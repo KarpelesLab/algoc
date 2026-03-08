@@ -131,25 +131,27 @@ impl SwiftGenerator {
         self.swift_primitive_type(p)
     }
 
+    /// Check if an identifier is a Swift keyword and needs escaping
+    fn swift_safe_ident(name: &str) -> String {
+        match name {
+            "repeat" | "class" | "func" | "var" | "let" | "in" | "for" | "while" | "return"
+            | "break" | "continue" | "self" | "Self" | "true" | "false" | "nil" | "is" | "as"
+            | "default" | "where" | "case" | "switch" | "do" | "try" | "catch" | "throw"
+            | "defer" | "guard" | "import" | "if" | "else" | "struct" | "enum" | "protocol"
+            | "extension" | "typealias" | "associatedtype" | "init" | "deinit" | "subscript"
+            | "operator" | "precedencegroup" | "static" | "override" | "private" | "public"
+            | "internal" | "open" | "fileprivate" | "mutating" | "nonmutating" | "inout"
+            | "throws" | "rethrows" | "super" | "Any" | "Type" => {
+                format!("{}_", name)
+            }
+            _ => name.to_string(),
+        }
+    }
+
     /// Generate the runtime helper functions
     fn generate_runtime(&mut self) {
         self.writeln("// AlgoC Runtime Helpers");
         self.writeln("import Foundation");
-        self.writeln("");
-
-        // constant_time_eq for array comparison
-        self.writeln("func constant_time_eq(_ a: [UInt8], _ b: [UInt8]) -> Bool {");
-        self.indent();
-        self.writeln("guard a.count == b.count else { return false }");
-        self.writeln("var result: UInt8 = 0");
-        self.writeln("for i in 0..<a.count {");
-        self.indent();
-        self.writeln("result |= a[i] ^ b[i]");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return result == 0");
-        self.dedent();
-        self.writeln("}");
         self.writeln("");
 
         // Reader class for streaming byte input
@@ -439,20 +441,17 @@ impl SwiftGenerator {
             if i > 0 {
                 self.write(", ");
             }
+            let safe_param = Self::swift_safe_ident(&param.name.name);
             let is_mutable_ref = self.is_mutable_ref_type(&param.ty);
             if is_mutable_ref {
                 self.inout_params.insert(param.name.name.clone());
                 self.write(&format!(
                     "_ {}: inout {}",
-                    param.name.name,
+                    safe_param,
                     self.swift_inner_type(&param.ty)
                 ));
             } else {
-                self.write(&format!(
-                    "_ {}: {}",
-                    param.name.name,
-                    self.swift_type(&param.ty)
-                ));
+                self.write(&format!("_ {}: {}", safe_param, self.swift_type(&param.ty)));
             }
         }
 
@@ -466,7 +465,8 @@ impl SwiftGenerator {
         // Shadow immutable array parameters as var so they can be subscript-assigned
         for param in &func.params {
             if !self.is_mutable_ref_type(&param.ty) && self.is_array_type(&param.ty) {
-                self.writeln(&format!("var {} = {}", param.name.name, param.name.name));
+                let safe_param = Self::swift_safe_ident(&param.name.name);
+                self.writeln(&format!("var {} = {}", safe_param, safe_param));
             }
         }
 
@@ -492,18 +492,24 @@ impl SwiftGenerator {
         self.write_indent();
         // Try to provide a type annotation for the constant
         let type_str = self.swift_type(&c.ty);
-        self.write(&format!("let {}: {} = ", c.name.name, type_str));
+        self.write(&format!(
+            "let {}: {} = ",
+            Self::swift_safe_ident(&c.name.name),
+            type_str
+        ));
         self.generate_expr(&c.value);
         self.write("\n\n");
     }
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
-        self.writeln(&format!("struct {} {{", s.name.name));
+        let safe_struct = Self::swift_safe_ident(&s.name.name);
+        self.writeln(&format!("struct {} {{", safe_struct));
         self.indent();
         for field in &s.fields {
             let ty_str = self.swift_type(&field.ty);
             let init = self.default_value_for_type(&field.ty);
-            self.writeln(&format!("var {}: {} = {}", field.name.name, ty_str, init));
+            let safe_field = Self::swift_safe_ident(&field.name.name);
+            self.writeln(&format!("var {}: {} = {}", safe_field, ty_str, init));
         }
         self.dedent();
         self.writeln("}");
@@ -512,17 +518,18 @@ impl SwiftGenerator {
         // Generate a factory function matching the pattern used by the JS generator
         self.writeln(&format!(
             "func create_{}() -> {} {{",
-            s.name.name, s.name.name
+            safe_struct, safe_struct
         ));
         self.indent();
-        self.writeln(&format!("return {}()", s.name.name));
+        self.writeln(&format!("return {}()", safe_struct));
         self.dedent();
         self.writeln("}");
         self.writeln("");
     }
 
     fn generate_layout(&mut self, l: &crate::parser::LayoutDef) {
-        self.writeln(&format!("struct {} {{", l.name.name));
+        let safe_layout = Self::swift_safe_ident(&l.name.name);
+        self.writeln(&format!("struct {} {{", safe_layout));
         self.indent();
         for field in &l.fields {
             let ty_str = self.swift_type(&field.ty);
@@ -604,28 +611,26 @@ impl SwiftGenerator {
     fn generate_function(&mut self, func: &Function) {
         self.inout_params.clear();
 
+        let func_safe_name = Self::swift_safe_ident(&func.name.name);
         self.write_indent();
-        self.write(&format!("func {}(", func.name.name));
+        self.write(&format!("func {}(", func_safe_name));
 
         // Parameters
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
             }
+            let safe_param = Self::swift_safe_ident(&param.name.name);
             let is_mutable_ref = self.is_mutable_ref_type(&param.ty);
             if is_mutable_ref {
                 self.inout_params.insert(param.name.name.clone());
                 self.write(&format!(
                     "_ {}: inout {}",
-                    param.name.name,
+                    safe_param,
                     self.swift_inner_type(&param.ty)
                 ));
             } else {
-                self.write(&format!(
-                    "_ {}: {}",
-                    param.name.name,
-                    self.swift_type(&param.ty)
-                ));
+                self.write(&format!("_ {}: {}", safe_param, self.swift_type(&param.ty)));
             }
         }
 
@@ -639,7 +644,8 @@ impl SwiftGenerator {
         // Shadow immutable array parameters as var so they can be subscript-assigned
         for param in &func.params {
             if !self.is_mutable_ref_type(&param.ty) && self.is_array_type(&param.ty) {
-                self.writeln(&format!("var {} = {}", param.name.name, param.name.name));
+                let safe_param = Self::swift_safe_ident(&param.name.name);
+                self.writeln(&format!("var {} = {}", safe_param, safe_param));
             }
         }
 
@@ -728,7 +734,8 @@ impl SwiftGenerator {
 
                 self.write_indent();
                 let keyword = if *mutable { "var" } else { "let" };
-                self.write(&format!("{} {}", keyword, name.name));
+                let safe_name = Self::swift_safe_ident(&name.name);
+                self.write(&format!("{} {}", keyword, safe_name));
 
                 // Add type annotation if we have one
                 if let Some(ty) = ty {
@@ -854,7 +861,7 @@ impl SwiftGenerator {
                 body,
             } => {
                 self.write_indent();
-                self.write(&format!("for {} in ", var.name));
+                self.write(&format!("for {} in ", Self::swift_safe_ident(&var.name)));
                 self.generate_expr(start);
                 self.write(if *inclusive { "..." } else { "..<" });
                 self.generate_expr(end);
@@ -934,7 +941,7 @@ impl SwiftGenerator {
                 self.write(&format!("[UInt8](arrayLiteral: {})", bytes.join(", ")));
             }
             ExprKind::Ident(ident) => {
-                self.write(&ident.name);
+                self.write(&Self::swift_safe_ident(&ident.name));
             }
             ExprKind::Binary { left, op, right } => {
                 // For array comparisons, use constant_time_eq

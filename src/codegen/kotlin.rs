@@ -86,22 +86,6 @@ impl KotlinGenerator {
         self.writeln("// AlgoC Runtime Helpers");
         self.writeln("");
 
-        // Constant-time equality comparison for byte arrays
-        self.writeln("@OptIn(ExperimentalUnsignedTypes::class)");
-        self.writeln("fun constantTimeEq(a: UByteArray, b: UByteArray): Boolean {");
-        self.indent();
-        self.writeln("if (a.size != b.size) return false");
-        self.writeln("var result: UByte = 0u");
-        self.writeln("for (i in a.indices) {");
-        self.indent();
-        self.writeln("result = result or (a[i] xor b[i])");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return result == (0u).toUByte()");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
         // Reader class
         self.writeln("@OptIn(ExperimentalUnsignedTypes::class)");
         self.writeln("class Reader(data: UByteArray) {");
@@ -907,7 +891,7 @@ impl KotlinGenerator {
                         if matches!(op, BinaryOp::Ne) {
                             self.write("!");
                         }
-                        self.write("constantTimeEq(");
+                        self.write("constant_time_eq(");
                         self.generate_expr(left);
                         self.write(", ");
                         self.generate_expr(right);
@@ -967,6 +951,37 @@ impl KotlinGenerator {
                         self.generate_expr(right);
                         self.write(")");
                     }
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge => {
+                        let op_str = match op {
+                            BinaryOp::Eq => " == ",
+                            BinaryOp::Ne => " != ",
+                            BinaryOp::Lt => " < ",
+                            BinaryOp::Le => " <= ",
+                            BinaryOp::Gt => " > ",
+                            BinaryOp::Ge => " >= ",
+                            _ => unreachable!(),
+                        };
+                        // Kotlin unsigned types (UByte, UShort, UInt, ULong) cannot
+                        // be compared across types. Convert both sides to ULong to
+                        // ensure compatible types, unless either side is boolean.
+                        let needs_cast = !is_bool_like_expr(left) && !is_bool_like_expr(right);
+                        self.write("(");
+                        self.generate_expr(left);
+                        if needs_cast {
+                            self.write(".toULong()");
+                        }
+                        self.write(op_str);
+                        self.generate_expr(right);
+                        if needs_cast {
+                            self.write(".toULong()");
+                        }
+                        self.write(")");
+                    }
                     _ => {
                         let op_str = match op {
                             BinaryOp::Add => " + ",
@@ -974,12 +989,6 @@ impl KotlinGenerator {
                             BinaryOp::Mul => " * ",
                             BinaryOp::Div => " / ",
                             BinaryOp::Rem => " % ",
-                            BinaryOp::Eq => " == ",
-                            BinaryOp::Ne => " != ",
-                            BinaryOp::Lt => " < ",
-                            BinaryOp::Le => " <= ",
-                            BinaryOp::Gt => " > ",
-                            BinaryOp::Ge => " >= ",
                             _ => unreachable!(),
                         };
                         self.write("(");
@@ -1905,6 +1914,29 @@ fn is_byte_sequence_expr(expr: &Expr) -> bool {
         }
         ExprKind::Ident(_) => true,
         ExprKind::Field { .. } => true,
+        _ => false,
+    }
+}
+
+/// Check if an expression is a boolean (not numeric), used to avoid .toULong() on booleans
+fn is_bool_like_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Bool(_) => true,
+        ExprKind::Binary { op, .. } => matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or
+        ),
+        ExprKind::Unary {
+            op: UnaryOp::Not, ..
+        } => true,
+        ExprKind::Paren(inner) => is_bool_like_expr(inner),
         _ => false,
     }
 }

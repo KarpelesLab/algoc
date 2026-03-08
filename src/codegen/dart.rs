@@ -288,21 +288,6 @@ impl DartGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
-
-        // constant_time_eq helper
-        self.writeln("bool constant_time_eq(List<int> a, List<int> b) {");
-        self.indent();
-        self.writeln("if (a.length != b.length) return false;");
-        self.writeln("var result = 0;");
-        self.writeln("for (var i = 0; i < a.length; i++) {");
-        self.indent();
-        self.writeln("result |= a[i] ^ b[i];");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return result == 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
     }
 
     /// Generate test runtime helpers (only when include_tests is true)

@@ -169,22 +169,6 @@ impl ObjCGenerator {
         self.writeln("}");
         self.writeln("");
 
-        // constant_time_eq helper for byte array comparisons
-        self.writeln(
-            "static bool constant_time_eq(const uint8_t *a, const uint8_t *b, size_t len) {",
-        );
-        self.indent();
-        self.writeln("uint8_t diff = 0;");
-        self.writeln("for (size_t i = 0; i < len; i++) {");
-        self.indent();
-        self.writeln("diff |= a[i] ^ b[i];");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return diff == 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
         // Reader struct and functions
         self.writeln("typedef struct {");
         self.indent();

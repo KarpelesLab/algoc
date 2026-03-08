@@ -116,21 +116,6 @@ impl PhpGenerator {
         self.writeln("}");
         self.writeln("");
 
-        // constant_time_eq
-        self.writeln("function constant_time_eq($a, $b) {");
-        self.indent();
-        self.writeln("if (count($a) !== count($b)) return false;");
-        self.writeln("$result = 0;");
-        self.writeln("for ($i = 0; $i < count($a); $i++) {");
-        self.indent();
-        self.writeln("$result |= $a[$i] ^ $b[$i];");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return $result === 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
         // Reader class
         self.writeln("class Reader {");
         self.indent();

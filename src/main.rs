@@ -147,7 +147,7 @@ fn run_interpreted_test(code: &str, interpreter: &str, flag: &str, suffix: &str)
 /// Run a test for a compiled target
 fn run_compiled_test(code: &str, ext: &str, target: &str) -> ExitCode {
     let temp_dir = env::temp_dir();
-    let source_path = temp_dir.join(format!("algoc_test.{}", ext));
+    let source_path = temp_dir.join(format!("algoc_run.{}", ext));
     let binary_path = temp_dir.join("algoc_test_bin");
 
     // Write source file
@@ -369,23 +369,22 @@ fn run_compiled_test(code: &str, ext: &str, target: &str) -> ExitCode {
             let work_dir = temp_dir.join("algoc_vhdl_work");
             let _ = fs::create_dir_all(&work_dir);
             let analyze = Command::new("ghdl")
-                .args(["--workdir=."])
-                .current_dir(&work_dir)
                 .arg("-a")
+                .arg(format!("--workdir={}", work_dir.display()))
                 .arg(&source_path)
                 .status();
             let result = match analyze {
                 Ok(s) if s.success() => {
                     let elab = Command::new("ghdl")
-                        .args(["--workdir=."])
-                        .current_dir(&work_dir)
-                        .args(["-e", "testbench"])
+                        .arg("-e")
+                        .arg(format!("--workdir={}", work_dir.display()))
+                        .arg("testbench")
                         .status();
                     match elab {
                         Ok(s) if s.success() => Command::new("ghdl")
-                            .args(["--workdir=."])
-                            .current_dir(&work_dir)
-                            .args(["-r", "testbench"])
+                            .arg("-r")
+                            .arg(format!("--workdir={}", work_dir.display()))
+                            .arg("testbench")
                             .status(),
                         other => other,
                     }

@@ -298,21 +298,6 @@ impl RustGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
-
-        // Constant-time equality comparison
-        self.writeln("fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {");
-        self.indent();
-        self.writeln("if a.len() != b.len() { return false; }");
-        self.writeln("let mut diff = 0u8;");
-        self.writeln("for i in 0..a.len() {");
-        self.indent();
-        self.writeln("diff |= a[i] ^ b[i];");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("diff == 0");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
     }
 
     /// Generate test runtime helpers (only when include_tests is true)
@@ -431,72 +416,102 @@ impl RustGenerator {
     }
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
+        let needs_lifetime = s.fields.iter().any(|f| Self::type_needs_lifetime(&f.ty));
         self.writeln("#[derive(Clone)]");
-        self.writeln(&format!("struct {} {{", s.name.name));
+        if needs_lifetime {
+            self.writeln(&format!("struct {}<'a> {{", s.name.name));
+        } else {
+            self.writeln(&format!("struct {} {{", s.name.name));
+        }
         self.indent();
         for field in &s.fields {
-            self.writeln(&format!(
-                "{}: {},",
-                field.name.name,
-                Self::rust_type(&field.ty)
-            ));
+            if needs_lifetime {
+                self.writeln(&format!(
+                    "{}: {},",
+                    field.name.name,
+                    Self::rust_type_with_lifetime(&field.ty)
+                ));
+            } else {
+                self.writeln(&format!(
+                    "{}: {},",
+                    field.name.name,
+                    Self::rust_type(&field.ty)
+                ));
+            }
         }
         self.dedent();
         self.writeln("}");
         self.writeln("");
 
-        // Generate a factory function for the struct (create_Name)
-        self.writeln(&format!(
-            "fn create_{}() -> {} {{",
-            s.name.name, s.name.name
-        ));
-        self.indent();
-        self.writeln(&format!("{} {{", s.name.name));
-        self.indent();
-        for field in &s.fields {
-            let init = Self::default_value_for_type(&field.ty);
-            self.writeln(&format!("{}: {},", field.name.name, init));
+        // Generate a factory function for the struct (create_Name) - only if no lifetime needed
+        if !needs_lifetime {
+            self.writeln(&format!(
+                "fn create_{}() -> {} {{",
+                s.name.name, s.name.name
+            ));
+            self.indent();
+            self.writeln(&format!("{} {{", s.name.name));
+            self.indent();
+            for field in &s.fields {
+                let init = Self::default_value_for_type(&field.ty);
+                self.writeln(&format!("{}: {},", field.name.name, init));
+            }
+            self.dedent();
+            self.writeln("}");
+            self.dedent();
+            self.writeln("}");
+            self.writeln("");
         }
-        self.dedent();
-        self.writeln("}");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
     }
 
     fn generate_layout(&mut self, l: &crate::parser::LayoutDef) {
+        let needs_lifetime = l.fields.iter().any(|f| Self::type_needs_lifetime(&f.ty));
         // Layouts are similar to structs in Rust
         self.writeln("#[derive(Clone)]");
-        self.writeln(&format!("struct {} {{", l.name.name));
+        if needs_lifetime {
+            self.writeln(&format!("struct {}<'a> {{", l.name.name));
+        } else {
+            self.writeln(&format!("struct {} {{", l.name.name));
+        }
         self.indent();
         for field in &l.fields {
-            self.writeln(&format!(
-                "{}: {},",
-                field.name.name,
-                Self::rust_type(&field.ty)
-            ));
+            if needs_lifetime {
+                self.writeln(&format!(
+                    "{}: {},",
+                    field.name.name,
+                    Self::rust_type_with_lifetime(&field.ty)
+                ));
+            } else {
+                self.writeln(&format!(
+                    "{}: {},",
+                    field.name.name,
+                    Self::rust_type(&field.ty)
+                ));
+            }
         }
         self.dedent();
         self.writeln("}");
         self.writeln("");
 
-        // Generate a factory function
-        self.writeln(&format!(
-            "fn create_{}() -> {} {{",
-            l.name.name, l.name.name
-        ));
-        self.indent();
-        self.writeln(&format!("{} {{", l.name.name));
-        self.indent();
-        for field in &l.fields {
-            let init = Self::default_value_for_type(&field.ty);
-            self.writeln(&format!("{}: {},", field.name.name, init));
+        // Generate a factory function - only if no lifetime needed
+        if !needs_lifetime {
+            self.writeln(&format!(
+                "fn create_{}() -> {} {{",
+                l.name.name, l.name.name
+            ));
+            self.indent();
+            self.writeln(&format!("{} {{", l.name.name));
+            self.indent();
+            for field in &l.fields {
+                let init = Self::default_value_for_type(&field.ty);
+                self.writeln(&format!("{}: {},", field.name.name, init));
+            }
+            self.dedent();
+            self.writeln("}");
+            self.dedent();
+            self.writeln("}");
+            self.writeln("");
         }
-        self.dedent();
-        self.writeln("}");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
     }
 
     fn generate_enum(&mut self, e: &crate::parser::EnumDef) {
@@ -871,7 +886,7 @@ impl RustGenerator {
                         }
                     })
                     .collect();
-                self.write(&format!("vec![{}]", bytes.join(", ")));
+                self.write(&format!("[{}]", bytes.join(", ")));
             }
             ExprKind::Ident(ident) => {
                 // Rename 'self' to 'self_' to avoid keyword conflict
@@ -903,31 +918,36 @@ impl RustGenerator {
                 match op {
                     // Wrapping arithmetic
                     BinaryOp::Add => {
-                        self.generate_expr(left);
+                        let suffix = Self::infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, suffix);
                         self.write(".wrapping_add(");
-                        self.generate_expr(right);
+                        self.generate_typed_expr(right, suffix);
                         self.write(")");
                     }
                     BinaryOp::Sub => {
-                        self.generate_expr(left);
+                        let suffix = Self::infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, suffix);
                         self.write(".wrapping_sub(");
-                        self.generate_expr(right);
+                        self.generate_typed_expr(right, suffix);
                         self.write(")");
                     }
                     BinaryOp::Mul => {
-                        self.generate_expr(left);
+                        let suffix = Self::infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, suffix);
                         self.write(".wrapping_mul(");
-                        self.generate_expr(right);
+                        self.generate_typed_expr(right, suffix);
                         self.write(")");
                     }
                     BinaryOp::Shl => {
-                        self.generate_expr(left);
+                        let suffix = Self::infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, suffix);
                         self.write(".wrapping_shl(");
                         self.generate_expr(right);
                         self.write(" as u32)");
                     }
                     BinaryOp::Shr => {
-                        self.generate_expr(left);
+                        let suffix = Self::infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, suffix);
                         self.write(".wrapping_shr(");
                         self.generate_expr(right);
                         self.write(" as u32)");
@@ -1014,8 +1034,9 @@ impl RustGenerator {
                 // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
+                        self.write("(");
                         self.generate_expr(object);
-                        self.write(".len()");
+                        self.write(".len() as u64)");
                         return;
                     }
 
@@ -1217,18 +1238,14 @@ impl RustGenerator {
                 self.generate_builtin(*name, args);
             }
             ExprKind::Array(elements) => {
-                if elements.is_empty() {
-                    self.write("vec![]");
-                } else {
-                    self.write("vec![");
-                    for (i, elem) in elements.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
-                        }
-                        self.generate_expr(elem);
+                self.write("[");
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
                     }
-                    self.write("]");
+                    self.generate_expr(elem);
                 }
+                self.write("]");
             }
             ExprKind::ArrayRepeat { value, count } => {
                 // Check if count is a compile-time constant
@@ -1720,13 +1737,136 @@ impl RustGenerator {
                 format!("&[{}; {}]", Self::rust_type(element), size)
             }
             TypeKind::MutRef(inner) => {
-                format!("&mut {}", Self::rust_type(inner))
+                // Handle MutRef(Slice(T)) => &mut [T] (not &mut &[T])
+                if let TypeKind::Slice { element } = &inner.kind {
+                    format!("&mut [{}]", Self::rust_type(element))
+                } else {
+                    format!("&mut {}", Self::rust_type(inner))
+                }
             }
             TypeKind::Ref(inner) => {
-                format!("&{}", Self::rust_type(inner))
+                // Handle Ref(Slice(T)) => &[T] (not &&[T])
+                if let TypeKind::Slice { element } = &inner.kind {
+                    format!("&[{}]", Self::rust_type(element))
+                } else {
+                    format!("&{}", Self::rust_type(inner))
+                }
             }
             TypeKind::Named(ident) => ident.name.clone(),
             TypeKind::SelfType => "Self".to_string(),
+        }
+    }
+
+    /// Try to infer a Rust integer type suffix from an expression.
+    /// Returns a suffix like "u32", "u64", or "" if unknown.
+    fn infer_int_type_suffix(expr: &Expr) -> &'static str {
+        match &expr.kind {
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    match p.to_native() {
+                        crate::parser::PrimitiveType::U8 => "u8",
+                        crate::parser::PrimitiveType::U16 => "u16",
+                        crate::parser::PrimitiveType::U32 => "u32",
+                        crate::parser::PrimitiveType::U64 => "u64",
+                        crate::parser::PrimitiveType::U128 => "u128",
+                        crate::parser::PrimitiveType::I8 => "i8",
+                        crate::parser::PrimitiveType::I16 => "i16",
+                        crate::parser::PrimitiveType::I32 => "i32",
+                        crate::parser::PrimitiveType::I64 => "i64",
+                        crate::parser::PrimitiveType::I128 => "i128",
+                        _ => "",
+                    }
+                } else {
+                    ""
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                let l = Self::infer_int_type_suffix(left);
+                if !l.is_empty() {
+                    return l;
+                }
+                Self::infer_int_type_suffix(right)
+            }
+            ExprKind::Paren(inner) => Self::infer_int_type_suffix(inner),
+            ExprKind::Unary { operand, .. } => Self::infer_int_type_suffix(operand),
+            _ => "",
+        }
+    }
+
+    /// Determine the type suffix needed for wrapping operations.
+    /// If either operand is an integer literal, we need a suffix to avoid ambiguity.
+    /// Returns the suffix to apply to integer literals (empty string if no literals present).
+    fn infer_wrapping_suffix(left: &Expr, right: &Expr) -> &'static str {
+        let left_is_lit = matches!(left.kind, ExprKind::Integer(_));
+        let right_is_lit = matches!(right.kind, ExprKind::Integer(_));
+
+        if !left_is_lit && !right_is_lit {
+            // Neither side is a literal, no suffix needed
+            return "";
+        }
+
+        // Try to infer from the non-literal side
+        if left_is_lit && !right_is_lit {
+            let s = Self::infer_int_type_suffix(right);
+            if !s.is_empty() {
+                return s;
+            }
+        }
+        if right_is_lit && !left_is_lit {
+            let s = Self::infer_int_type_suffix(left);
+            if !s.is_empty() {
+                return s;
+            }
+        }
+
+        // Both are literals or we couldn't infer - default to u64
+        // (most common integer type in crypto code)
+        "u64"
+    }
+
+    /// Generate an integer literal with an explicit type suffix if needed.
+    /// `suffix` is the type suffix to add (e.g., "u32", "u64").
+    fn generate_typed_expr(&mut self, expr: &Expr, suffix: &str) {
+        if let ExprKind::Integer(n) = &expr.kind {
+            if !suffix.is_empty() {
+                self.write(&format!("{}{}", n, suffix));
+            } else {
+                self.write(&format!("{}", n));
+            }
+        } else {
+            self.generate_expr(expr);
+        }
+    }
+
+    /// Check if a type contains any references that need a lifetime annotation
+    fn type_needs_lifetime(ty: &crate::parser::Type) -> bool {
+        use crate::parser::TypeKind;
+        matches!(
+            &ty.kind,
+            TypeKind::Slice { .. }
+                | TypeKind::Ref(_)
+                | TypeKind::MutRef(_)
+                | TypeKind::ArrayRef { .. }
+        )
+    }
+
+    /// Convert a parser type to a Rust type string, adding lifetime 'a to references
+    fn rust_type_with_lifetime(ty: &crate::parser::Type) -> String {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Slice { element } => {
+                format!("&'a [{}]", Self::rust_type(element))
+            }
+            TypeKind::Ref(inner) => {
+                format!("&'a {}", Self::rust_type(inner))
+            }
+            TypeKind::MutRef(inner) => {
+                format!("&'a mut {}", Self::rust_type(inner))
+            }
+            TypeKind::ArrayRef { element, size } => {
+                format!("&'a [{}; {}]", Self::rust_type(element), size)
+            }
+            _ => Self::rust_type(ty),
         }
     }
 
@@ -1832,13 +1972,15 @@ impl CodeGenerator for RustGenerator {
             }
         }
 
-        self.writeln("// Generated by AlgoC");
-        self.writeln("// DO NOT EDIT - This file is auto-generated");
-        self.writeln("");
         self.writeln(
             "#![allow(unused, non_snake_case, non_upper_case_globals, non_camel_case_types)]",
         );
         self.writeln("#![allow(arithmetic_overflow, overflowing_literals)]");
+        self.writeln("");
+        self.writeln("// Generated by AlgoC");
+        self.writeln("// DO NOT EDIT - This file is auto-generated");
+        self.writeln("");
+        self.writeln("use std::convert::TryInto;");
         self.writeln("");
 
         self.generate_runtime();

@@ -216,24 +216,6 @@ impl CGenerator {
         self.writeln("#include <stdio.h>");
         self.writeln("");
 
-        // constant_time_eq helper
-        self.writeln("// Constant-time byte array comparison");
-        self.writeln(
-            "static bool constant_time_eq(const uint8_t* a, size_t a_len, const uint8_t* b, size_t b_len) {",
-        );
-        self.indent();
-        self.writeln("if (a_len != b_len) return false;");
-        self.writeln("uint8_t diff = 0;");
-        self.writeln("for (size_t i = 0; i < a_len; i++) {");
-        self.indent();
-        self.writeln("diff |= a[i] ^ b[i];");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return diff == 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
         // Endian conversion helpers
         self.writeln("// Endian conversion helpers");
 

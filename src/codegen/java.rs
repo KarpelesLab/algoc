@@ -170,64 +170,6 @@ impl JavaGenerator {
 
     /// Generate the runtime helper methods inside the class.
     fn generate_runtime(&mut self) {
-        // constant_time_eq for byte arrays
-        self.writeln("static boolean constant_time_eq(byte[] a, byte[] b) {");
-        self.indent();
-        self.writeln("if (a.length != b.length) return false;");
-        self.writeln("int diff = 0;");
-        self.writeln("for (int i = 0; i < a.length; i++) {");
-        self.indent();
-        self.writeln("diff |= (a[i] ^ b[i]);");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return diff == 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        // Overloads for int[] and long[]
-        self.writeln("static boolean constant_time_eq(int[] a, int[] b) {");
-        self.indent();
-        self.writeln("if (a.length != b.length) return false;");
-        self.writeln("int diff = 0;");
-        self.writeln("for (int i = 0; i < a.length; i++) {");
-        self.indent();
-        self.writeln("diff |= (a[i] ^ b[i]);");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return diff == 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        self.writeln("static boolean constant_time_eq(long[] a, long[] b) {");
-        self.indent();
-        self.writeln("if (a.length != b.length) return false;");
-        self.writeln("long diff = 0;");
-        self.writeln("for (int i = 0; i < a.length; i++) {");
-        self.indent();
-        self.writeln("diff |= (a[i] ^ b[i]);");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return diff == 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
-        self.writeln("static boolean constant_time_eq(short[] a, short[] b) {");
-        self.indent();
-        self.writeln("if (a.length != b.length) return false;");
-        self.writeln("int diff = 0;");
-        self.writeln("for (int i = 0; i < a.length; i++) {");
-        self.indent();
-        self.writeln("diff |= (a[i] ^ b[i]);");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("return diff == 0;");
-        self.dedent();
-        self.writeln("}");
-        self.writeln("");
-
         // Reader inner class
         self.writeln("static class Reader {");
         self.indent();
