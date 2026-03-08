@@ -438,7 +438,7 @@ impl CppGenerator {
         self.writeln("static std::string __test_name;");
         self.writeln("");
 
-        self.writeln("static void __assert(bool condition) {");
+        self.writeln("static void algoc_assert(bool condition) {");
         self.indent();
         self.writeln("if (!condition) {");
         self.indent();
@@ -527,10 +527,11 @@ impl CppGenerator {
         let cpp_ty = self.type_to_cpp(&c.ty);
         // For array types, use constexpr or static const
         match &c.ty.kind {
-            crate::parser::TypeKind::Array { .. } => {
+            crate::parser::TypeKind::Array { element, .. } => {
                 self.write_indent();
                 self.write(&format!("static const {} {} = ", cpp_ty, c.name.name));
-                self.generate_expr(&c.value);
+                // Generate array literal as brace-init list instead of vector construction
+                self.generate_array_init(&c.value, element);
                 self.write(";\n\n");
             }
             _ => {
@@ -538,6 +539,26 @@ impl CppGenerator {
                 self.write(&format!("constexpr {} {} = ", cpp_ty, c.name.name));
                 self.generate_expr(&c.value);
                 self.write(";\n\n");
+            }
+        }
+    }
+
+    /// Generate an array initializer as a brace-init list (for std::array constants)
+    fn generate_array_init(&mut self, expr: &Expr, _element_ty: &ParserType) {
+        match &expr.kind {
+            ExprKind::Array(elements) => {
+                self.write("{");
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_expr(elem);
+                }
+                self.write("}");
+            }
+            _ => {
+                // Fallback: generate the expression as-is
+                self.generate_expr(expr);
             }
         }
     }
@@ -671,6 +692,23 @@ impl CppGenerator {
         }
     }
 
+    /// Check if a type is slice-like (would map to std::span in C++)
+    /// Used to decide when to use `auto` for local variables to avoid
+    /// rvalue vector-to-span conversion issues.
+    fn type_is_slice_like(ty: &ParserType) -> bool {
+        match &ty.kind {
+            crate::parser::TypeKind::Slice { .. } => true,
+            crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) => {
+                matches!(
+                    inner.kind,
+                    crate::parser::TypeKind::Slice { .. } | crate::parser::TypeKind::Array { .. }
+                )
+            }
+            crate::parser::TypeKind::ArrayRef { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Convert a parser type to C++ type string
     fn type_to_cpp(&self, ty: &ParserType) -> String {
         match &ty.kind {
@@ -680,22 +718,53 @@ impl CppGenerator {
                 format!("std::array<{}, {}>", elem, size)
             }
             crate::parser::TypeKind::Slice { element } => {
+                // Bare Slice (without MutRef) is an immutable borrow (&[T]) in the parser.
+                // Map to std::span<const T> for const-correctness.
+                // Only MutRef(Slice{T}) maps to std::span<T> (mutable).
                 let elem = self.type_to_cpp(element);
-                format!("std::span<{}>", elem)
+                format!("std::span<const {}>", elem)
             }
-            crate::parser::TypeKind::ArrayRef { element, size } => {
+            crate::parser::TypeKind::ArrayRef { element, .. } => {
+                // &[T; N] -> std::span<const T> (span is a lightweight view, pass by value)
                 let elem = self.type_to_cpp(element);
-                format!("std::array<{}, {}>&", elem, size)
+                format!("std::span<const {}>", elem)
             }
             crate::parser::TypeKind::MutRef(inner) => {
+                // &mut [T] -> std::span<T> (by value, not reference - span already acts as a reference)
+                if let crate::parser::TypeKind::Slice { element } = &inner.kind {
+                    let elem = self.type_to_cpp(element);
+                    return format!("std::span<{}>", elem);
+                }
+                // &mut [T; N] -> std::span<T> (span by value)
+                if let crate::parser::TypeKind::Array { element, .. } = &inner.kind {
+                    let elem = self.type_to_cpp(element);
+                    return format!("std::span<{}>", elem);
+                }
                 let inner_cpp = self.type_to_cpp(inner);
                 format!("{}&", inner_cpp)
             }
             crate::parser::TypeKind::Ref(inner) => {
+                // &[T] -> std::span<const T> (by value)
+                if let crate::parser::TypeKind::Slice { element } = &inner.kind {
+                    let elem = self.type_to_cpp(element);
+                    return format!("std::span<const {}>", elem);
+                }
+                // &[T; N] -> std::span<const T> (span by value)
+                if let crate::parser::TypeKind::Array { element, .. } = &inner.kind {
+                    let elem = self.type_to_cpp(element);
+                    return format!("std::span<const {}>", elem);
+                }
                 let inner_cpp = self.type_to_cpp(inner);
                 format!("const {}&", inner_cpp)
             }
-            crate::parser::TypeKind::Named(ident) => ident.name.clone(),
+            crate::parser::TypeKind::Named(ident) => {
+                // Handle "Self" as auto (may come through as Named instead of SelfType)
+                if ident.name == "Self" {
+                    "auto".to_string()
+                } else {
+                    ident.name.clone()
+                }
+            }
             crate::parser::TypeKind::SelfType => "auto".to_string(),
         }
     }
@@ -704,16 +773,43 @@ impl CppGenerator {
     fn param_type_to_cpp(&self, ty: &ParserType) -> String {
         match &ty.kind {
             crate::parser::TypeKind::MutRef(inner) => {
+                // &mut [T] -> std::span<T> (by value, not reference)
+                if let crate::parser::TypeKind::Slice { element } = &inner.kind {
+                    let elem = self.type_to_cpp(element);
+                    return format!("std::span<{}>", elem);
+                }
+                // &mut [T; N] -> std::span<T> (span by value)
+                if let crate::parser::TypeKind::Array { element, .. } = &inner.kind {
+                    let elem = self.type_to_cpp(element);
+                    return format!("std::span<{}>", elem);
+                }
                 let inner_cpp = self.type_to_cpp(inner);
                 format!("{}&", inner_cpp)
             }
             crate::parser::TypeKind::Ref(inner) => {
+                // &[T] -> std::span<const T> (by value)
+                if let crate::parser::TypeKind::Slice { element } = &inner.kind {
+                    let elem = self.type_to_cpp(element);
+                    return format!("std::span<const {}>", elem);
+                }
+                // &[T; N] -> std::span<const T> (span by value)
+                if let crate::parser::TypeKind::Array { element, .. } = &inner.kind {
+                    let elem = self.type_to_cpp(element);
+                    return format!("std::span<const {}>", elem);
+                }
                 let inner_cpp = self.type_to_cpp(inner);
                 format!("const {}&", inner_cpp)
             }
-            crate::parser::TypeKind::Slice { element } => {
+            crate::parser::TypeKind::ArrayRef { element, .. } => {
+                // &[T; N] -> std::span<const T> (span by value)
                 let elem = self.type_to_cpp(element);
-                format!("std::span<{}>", elem)
+                format!("std::span<const {}>", elem)
+            }
+            crate::parser::TypeKind::Slice { element } => {
+                // Bare slice parameter is read-only: std::span<const T>
+                // Use MutRef(Slice) for mutable access
+                let elem = self.type_to_cpp(element);
+                format!("std::span<const {}>", elem)
             }
             crate::parser::TypeKind::Array { element, size } => {
                 let elem = self.type_to_cpp(element);
@@ -814,8 +910,16 @@ impl CppGenerator {
 
                 self.write_indent();
                 if let Some(ty) = ty {
-                    let cpp_ty = self.type_to_cpp(ty);
-                    self.write(&format!("{} {}", cpp_ty, name.name));
+                    // For slice types with an initializer, use auto to avoid
+                    // vector-to-span conversion issues (rvalue vector can't
+                    // convert to std::span in C++20)
+                    let use_auto = init.is_some() && Self::type_is_slice_like(ty);
+                    if use_auto {
+                        self.write(&format!("auto {}", name.name));
+                    } else {
+                        let cpp_ty = self.type_to_cpp(ty);
+                        self.write(&format!("{} {}", cpp_ty, name.name));
+                    }
                 } else if let Some(init) = init {
                     // Use auto when type is not specified
                     let _ = init;
@@ -826,7 +930,33 @@ impl CppGenerator {
 
                 if let Some(init) = init {
                     self.write(" = ");
-                    self.generate_expr(init);
+                    // Use brace-init for array types to avoid vector-to-array conversion
+                    if let Some(ty) = ty
+                        && let crate::parser::TypeKind::Array { element, .. } = &ty.kind
+                        && matches!(init.kind, ExprKind::Array(_))
+                    {
+                        self.generate_array_init(init, element);
+                    } else if let Some(ty) = ty
+                        && let crate::parser::TypeKind::Array { element, size } = &ty.kind
+                        && let ExprKind::ArrayRepeat { value, .. } = &init.kind
+                    {
+                        // For array repeat like [0; N], generate brace-init with default value
+                        // Use value-initialization: std::array<T, N>{} for zero, or fill
+                        if matches!(&value.kind, ExprKind::Integer(0)) {
+                            self.write("{}");
+                        } else {
+                            let elem_ty = self.type_to_cpp(element);
+                            // Use a lambda to fill the array
+                            self.write(&format!(
+                                "[]() {{ std::array<{}, {}> a; a.fill(",
+                                elem_ty, size
+                            ));
+                            self.generate_expr(value);
+                            self.write("); return a; }()");
+                        }
+                    } else {
+                        self.generate_expr(init);
+                    }
                 } else if let Some(ty) = ty {
                     // Default initialize
                     let init_val = self.default_value_for_type(ty);
@@ -1108,8 +1238,9 @@ impl CppGenerator {
             ExprKind::Slice {
                 array, start, end, ..
             } => {
-                // Generate a span view of the subrange
-                self.write("std::span<uint8_t>(");
+                // Generate a span view of the subrange using CTAD
+                // (deduces const from the source pointer type)
+                self.write("std::span(");
                 self.generate_expr(array);
                 self.write(".data() + ");
                 self.generate_expr(start);
@@ -1555,7 +1686,7 @@ impl CppGenerator {
     fn generate_builtin(&mut self, name: BuiltinFunc, args: &[Expr]) {
         match name {
             BuiltinFunc::Assert => {
-                self.write("__assert(");
+                self.write("algoc_assert(");
                 self.generate_expr(&args[0]);
                 self.write(")");
             }

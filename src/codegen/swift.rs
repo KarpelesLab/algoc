@@ -19,6 +19,15 @@ struct StructFieldInfo {
     ty: ParserType,
 }
 
+/// Info about a single function parameter for call-site code generation
+#[derive(Clone)]
+struct FuncParamInfo {
+    /// Whether the parameter is `inout` (from `&mut` / `ArrayRef`)
+    is_inout: bool,
+    /// The Swift type string for this parameter (e.g. "UInt64", "[UInt8]", "BitReader")
+    swift_type: String,
+}
+
 /// Struct method info (method name -> mangled function name)
 type MethodMap = HashMap<String, String>;
 
@@ -38,6 +47,8 @@ pub struct SwiftGenerator {
     var_types: HashMap<String, String>,
     /// Set of names that are mutable parameters (inout)
     inout_params: std::collections::HashSet<String>,
+    /// Function signatures: function name -> Vec<FuncParamInfo>
+    func_param_info: HashMap<String, Vec<FuncParamInfo>>,
 }
 
 impl SwiftGenerator {
@@ -50,6 +61,7 @@ impl SwiftGenerator {
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
             inout_params: std::collections::HashSet::new(),
+            func_param_info: HashMap::new(),
         }
     }
 
@@ -686,6 +698,78 @@ impl SwiftGenerator {
         }
     }
 
+    /// Generate a function argument, adding `&` prefix if the parameter is inout
+    /// and the argument is not already an explicit MutRef expression.
+    /// Also wraps with UInt64/UInt32/etc. cast if the parameter type is an unsigned int
+    /// and the argument might be an Int (e.g., from a loop variable).
+    fn generate_call_arg(&mut self, arg: &Expr, param_info: Option<&FuncParamInfo>) {
+        let is_inout = param_info.is_some_and(|p| p.is_inout);
+        match &arg.kind {
+            ExprKind::MutRef(inner) => {
+                // Explicit &mut in source - always emit &
+                self.write("&");
+                self.generate_expr(inner);
+            }
+            ExprKind::Ref(inner) => {
+                // Immutable reference - pass directly (or with & if target is inout)
+                if is_inout {
+                    self.write("&");
+                }
+                self.generate_expr(inner);
+            }
+            _ => {
+                if is_inout {
+                    self.write("&");
+                }
+                // Wrap with type cast if the parameter expects a specific UInt type
+                // and the argument might be a Swift Int (loop variable, etc.)
+                let needs_uint_cast = param_info
+                    .map(|p| {
+                        let ty = &p.swift_type;
+                        !p.is_inout
+                            && (ty == "UInt64" || ty == "UInt32" || ty == "UInt16" || ty == "UInt8")
+                            && self.expr_might_be_int(arg)
+                    })
+                    .unwrap_or(false);
+                if needs_uint_cast {
+                    let target_type = &param_info.unwrap().swift_type;
+                    self.write(&format!("{}(", target_type));
+                    self.generate_expr(arg);
+                    self.write(")");
+                } else {
+                    self.generate_expr(arg);
+                }
+            }
+        }
+    }
+
+    /// Check if an expression might produce a Swift `Int` value instead of a UInt type.
+    /// This covers loop variables (plain identifiers), .count results, and Int arithmetic.
+    #[allow(clippy::only_used_in_recursion)]
+    fn expr_might_be_int(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // Plain identifiers could be loop variables (which are Int in Swift)
+            ExprKind::Ident(_) => true,
+            // Binary expressions with Int operands produce Int
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_might_be_int(left) || self.expr_might_be_int(right)
+            }
+            // Parenthesized expressions
+            ExprKind::Paren(inner) => self.expr_might_be_int(inner),
+            // Integer literals are flexible in Swift (can be any integer type)
+            ExprKind::Integer(_) => false,
+            // Cast expressions produce the target type, not Int
+            ExprKind::Cast { .. } => false,
+            // Function calls return their declared type
+            ExprKind::Call { .. }
+            | ExprKind::MethodCall { .. }
+            | ExprKind::TypeStaticCall { .. } => false,
+            // Field access might produce Int but our .len() already wraps with UInt64
+            ExprKind::Field { .. } => false,
+            _ => false,
+        }
+    }
+
     /// Get the inner type of a reference/mutable reference type
     fn swift_inner_type(&self, ty: &ParserType) -> String {
         use crate::parser::TypeKind;
@@ -1044,9 +1128,11 @@ impl SwiftGenerator {
                 // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
-                        // Convert .len() to .count
+                        // Convert .len() to UInt64(.count) since AlgoC len() returns u64
+                        // and Swift's .count returns Int
+                        self.write("UInt64(");
                         self.generate_expr(object);
-                        self.write(".count");
+                        self.write(".count)");
                         return;
                     }
 
@@ -1130,11 +1216,30 @@ impl SwiftGenerator {
                     {
                         self.generate_expr(object);
                         self.write(&format!(".{}(", field.name));
+                        // Determine the cast needed for the argument based on method name
+                        let arg_cast = match field.name.as_str() {
+                            "read_bytes" | "read_chunk" => Some("Int"),
+                            "write_u8" => Some("UInt8"),
+                            "write_u16" | "write_u16be" | "write_u16le" => Some("UInt16"),
+                            "write_u32" | "write_u32be" | "write_u32le" => Some("UInt32"),
+                            "write_u64" | "write_u64be" | "write_u64le" => Some("UInt64"),
+                            _ => None,
+                        };
                         for (i, arg) in args.iter().enumerate() {
                             if i > 0 {
                                 self.write(", ");
                             }
-                            self.generate_expr(arg);
+                            if let Some(cast_type) = arg_cast {
+                                if self.expr_might_be_int(arg) {
+                                    self.write(&format!("{}(", cast_type));
+                                    self.generate_expr(arg);
+                                    self.write(")");
+                                } else {
+                                    self.generate_expr(arg);
+                                }
+                            } else {
+                                self.generate_expr(arg);
+                            }
                         }
                         self.write(")");
                         return;
@@ -1146,36 +1251,38 @@ impl SwiftGenerator {
                         && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
                         && let Some(mangled_name) = methods.get(&field.name)
                     {
+                        let mangled_name = mangled_name.clone();
+                        let param_info = self.func_param_info.get(&mangled_name).cloned();
                         // Generate: StructName__method(&object, args...)
                         self.write(&format!("{}(", mangled_name));
                         // Pass self as inout if it's a mutable method
                         self.write(&format!("&{}", Self::swift_safe_ident(&obj_ident.name)));
-                        for arg in args {
+                        for (i, arg) in args.iter().enumerate() {
                             self.write(", ");
-                            self.generate_expr(arg);
+                            // args[i] corresponds to params[i+1] (param 0 is self)
+                            let info = param_info.as_ref().and_then(|infos| infos.get(i + 1));
+                            self.generate_call_arg(arg, info);
                         }
                         self.write(")");
                         return;
                     }
                 }
 
-                // Check if calling with arguments that need & for inout
+                // Look up parameter info for the target function
+                let param_info = if let ExprKind::Ident(ident) = &func.kind {
+                    self.func_param_info.get(&ident.name).cloned()
+                } else {
+                    None
+                };
+
                 self.generate_expr(func);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
-                    // Check if arg is a MutRef - pass as &
-                    if let ExprKind::MutRef(inner) = &arg.kind {
-                        self.write("&");
-                        self.generate_expr(inner);
-                    } else if let ExprKind::Ref(inner) = &arg.kind {
-                        // Pass references directly (Swift handles pass-by-value for structs)
-                        self.generate_expr(inner);
-                    } else {
-                        self.generate_expr(arg);
-                    }
+                    let info = param_info.as_ref().and_then(|infos| infos.get(i));
+                    self.generate_call_arg(arg, info);
                 }
                 self.write(")");
             }
@@ -1299,11 +1406,14 @@ impl SwiftGenerator {
                 ..
             } => {
                 // Generate: mangled_name(&receiver, args...)
+                let param_info = self.func_param_info.get(mangled_name).cloned();
                 self.write(&format!("{}(&", mangled_name));
                 self.generate_expr(receiver);
-                for arg in args {
+                for (i, arg) in args.iter().enumerate() {
                     self.write(", ");
-                    self.generate_expr(arg);
+                    // args[i] corresponds to params[i+1] (param 0 is self/receiver)
+                    let info = param_info.as_ref().and_then(|infos| infos.get(i + 1));
+                    self.generate_call_arg(arg, info);
                 }
                 self.write(")");
             }
@@ -1312,25 +1422,35 @@ impl SwiftGenerator {
                 method_name,
                 args,
             } => {
-                self.write(&format!("{}__{}", type_name.name, method_name.name));
+                let mangled = format!("{}__{}", type_name.name, method_name.name);
+                let param_info = self.func_param_info.get(&mangled).cloned();
+                self.write(&mangled);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    let info = param_info.as_ref().and_then(|infos| infos.get(i));
+                    self.generate_call_arg(arg, info);
                 }
                 self.write(")");
             }
             ExprKind::GenericCall { func, args, .. } => {
                 // Should be resolved by monomorphization - generate as regular call
+                let param_info = if let ExprKind::Ident(ident) = &func.kind {
+                    self.func_param_info.get(&ident.name).cloned()
+                } else {
+                    None
+                };
+
                 self.generate_expr(func);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    let info = param_info.as_ref().and_then(|infos| infos.get(i));
+                    self.generate_call_arg(arg, info);
                 }
                 self.write(")");
             }
@@ -1730,10 +1850,31 @@ impl CodeGenerator for SwiftGenerator {
         self.struct_defs.clear();
         self.struct_methods.clear();
         self.var_types.clear();
+        self.func_param_info.clear();
 
-        // Pre-pass: collect struct field info and methods
+        // Pre-pass: collect struct field info, methods, and function signatures
         for item in &ast.ast.items {
             match &item.kind {
+                ItemKind::Function(func) => {
+                    let param_info: Vec<FuncParamInfo> = func
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let is_inout = self.is_mutable_ref_type(&p.ty);
+                            let swift_type = if is_inout {
+                                self.swift_inner_type(&p.ty)
+                            } else {
+                                self.swift_type(&p.ty)
+                            };
+                            FuncParamInfo {
+                                is_inout,
+                                swift_type,
+                            }
+                        })
+                        .collect();
+                    self.func_param_info
+                        .insert(func.name.name.clone(), param_info);
+                }
                 ItemKind::Struct(s) => {
                     let fields: Vec<StructFieldInfo> = s
                         .fields
@@ -1760,7 +1901,26 @@ impl CodeGenerator for SwiftGenerator {
                     let mut methods = HashMap::new();
                     for method in &impl_def.methods {
                         let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
-                        methods.insert(method.name.name.clone(), mangled);
+                        methods.insert(method.name.name.clone(), mangled.clone());
+
+                        // Also record param info for the mangled method name
+                        let param_info: Vec<FuncParamInfo> = method
+                            .params
+                            .iter()
+                            .map(|p| {
+                                let is_inout = self.is_mutable_ref_type(&p.ty);
+                                let swift_type = if is_inout {
+                                    self.swift_inner_type(&p.ty)
+                                } else {
+                                    self.swift_type(&p.ty)
+                                };
+                                FuncParamInfo {
+                                    is_inout,
+                                    swift_type,
+                                }
+                            })
+                            .collect();
+                        self.func_param_info.insert(mangled, param_info);
                     }
                     self.struct_methods
                         .insert(impl_def.target.name.clone(), methods);

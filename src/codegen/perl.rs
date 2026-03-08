@@ -429,7 +429,7 @@ impl PerlGenerator {
 
     fn generate_const(&mut self, c: &crate::parser::ConstDef) {
         // For array constants, use my @NAME = (...);
-        // For scalar constants, use use constant or my $NAME = ...;
+        // For other constants, use my $NAME = ...;
         match &c.value.kind {
             ExprKind::Array(_) => {
                 self.write_indent();
@@ -449,7 +449,7 @@ impl PerlGenerator {
             }
             _ => {
                 self.write_indent();
-                self.write(&format!("use constant {} => ", c.name.name));
+                self.write(&format!("my ${} = ", c.name.name));
                 self.generate_expr(&c.value);
                 self.write(";\n\n");
             }

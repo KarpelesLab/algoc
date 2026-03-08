@@ -42,6 +42,17 @@ pub struct JavaGenerator {
     byte_vars: HashSet<String>,
     /// Variables known to have byte[] (u8[]/i8[]) array type
     byte_array_vars: HashSet<String>,
+    /// Current function's return type (for byte cast on return statements)
+    current_return_type: Option<ParserType>,
+    /// Variables declared in the current function scope (for avoiding
+    /// duplicate `int i` declarations in for loops that shadow parameters)
+    declared_vars: HashSet<String>,
+    /// Function parameter types: func_name -> Vec<ParserType>
+    func_param_types: HashMap<String, Vec<ParserType>>,
+    /// Counter for generating unique loop variable names
+    loop_var_counter: usize,
+    /// Map from original loop variable names to renamed versions
+    loop_var_renames: HashMap<String, String>,
 }
 
 impl JavaGenerator {
@@ -55,6 +66,11 @@ impl JavaGenerator {
             var_types: HashMap::new(),
             byte_vars: HashSet::new(),
             byte_array_vars: HashSet::new(),
+            current_return_type: None,
+            declared_vars: HashSet::new(),
+            func_param_types: HashMap::new(),
+            loop_var_counter: 0,
+            loop_var_renames: HashMap::new(),
         }
     }
 
@@ -170,6 +186,16 @@ impl JavaGenerator {
         }
     }
 
+    /// Whether a type maps to Java `short`
+    fn is_short_primitive(ty: &ParserType) -> bool {
+        use crate::parser::{PrimitiveType, TypeKind};
+        if let TypeKind::Primitive(p) = &ty.kind {
+            matches!(p.to_native(), PrimitiveType::U16 | PrimitiveType::I16)
+        } else {
+            false
+        }
+    }
+
     /// Whether a type maps to Java `byte[]` (array/slice/ref of u8/i8)
     fn is_byte_array_type(ty: &ParserType) -> bool {
         use crate::parser::TypeKind;
@@ -197,6 +223,30 @@ impl JavaGenerator {
         )
     }
 
+    /// Extract the underlying object identifier name, looking through Deref/Ref/Paren.
+    fn extract_object_ident_name(expr: &Expr) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Ident(ident) => Some(&ident.name),
+            ExprKind::Deref(inner)
+            | ExprKind::Ref(inner)
+            | ExprKind::MutRef(inner)
+            | ExprKind::Paren(inner) => Self::extract_object_ident_name(inner),
+            _ => None,
+        }
+    }
+
+    /// Unwrap transparent expression wrappers (Deref, Ref, MutRef, Paren)
+    /// to find the underlying expression for pattern matching.
+    fn unwrap_transparent(expr: &Expr) -> &Expr {
+        match &expr.kind {
+            ExprKind::Deref(inner)
+            | ExprKind::Ref(inner)
+            | ExprKind::MutRef(inner)
+            | ExprKind::Paren(inner) => Self::unwrap_transparent(inner),
+            _ => expr,
+        }
+    }
+
     /// Check if an assignment target expression refers to a byte-typed location.
     /// Returns true if assigning to this target requires a `(byte)` cast on the value.
     fn target_is_byte(&self, target: &Expr) -> bool {
@@ -204,12 +254,17 @@ impl JavaGenerator {
             ExprKind::Ident(ident) => self.byte_vars.contains(&ident.name),
             ExprKind::Index { array, .. } => {
                 // Check if the array is a known byte array variable
-                if let ExprKind::Ident(ident) = &array.kind {
-                    self.byte_array_vars.contains(&ident.name)
-                } else if let ExprKind::Field { object, field } = &array.kind {
+                if let Some(ident_name) = Self::extract_object_ident_name(array)
+                    && self.byte_array_vars.contains(ident_name)
+                {
+                    return true;
+                }
+                // Unwrap derefs/refs/parens to find a Field expression
+                let inner_array = Self::unwrap_transparent(array);
+                if let ExprKind::Field { object, field } = &inner_array.kind {
                     // struct_field: check if the struct field is a byte array
-                    if let ExprKind::Ident(obj_ident) = &object.kind
-                        && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    if let Some(obj_name) = Self::extract_object_ident_name(object)
+                        && let Some(struct_name) = self.var_types.get(obj_name)
                         && let Some(fields) = self.struct_defs.get(struct_name)
                     {
                         for f in fields {
@@ -225,8 +280,8 @@ impl JavaGenerator {
             }
             ExprKind::Field { object, field } => {
                 // Check struct field type
-                if let ExprKind::Ident(obj_ident) = &object.kind
-                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                if let Some(obj_name) = Self::extract_object_ident_name(object)
+                    && let Some(struct_name) = self.var_types.get(obj_name)
                     && let Some(fields) = self.struct_defs.get(struct_name)
                 {
                     for f in fields {
@@ -241,14 +296,42 @@ impl JavaGenerator {
         }
     }
 
-    /// Register byte type tracking for function/method parameters
+    /// Register byte type tracking and struct type tracking for function/method parameters.
+    /// Also registers parameter names in `declared_vars` so that for-loop variable
+    /// declarations don't shadow them (which is a compile error in Java).
     fn register_param_byte_types(&mut self, params: &[crate::parser::Param]) {
         for param in params {
+            // Track declared variable names to avoid duplicate declarations in for loops
+            self.declared_vars.insert(param.name.name.clone());
+
             if Self::is_byte_primitive(&param.ty) {
                 self.byte_vars.insert(param.name.name.clone());
             } else if Self::is_byte_array_type(&param.ty) {
                 self.byte_array_vars.insert(param.name.name.clone());
             }
+            // Also register struct types in var_types (looking through refs)
+            Self::register_struct_type_for_param(&param.name.name, &param.ty, &mut self.var_types);
+        }
+    }
+
+    /// Register a struct type mapping for a parameter, looking through reference wrappers.
+    fn register_struct_type_for_param(
+        param_name: &str,
+        ty: &ParserType,
+        var_types: &mut HashMap<String, String>,
+    ) {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Named(ident) => {
+                var_types.insert(param_name.to_string(), ident.name.clone());
+            }
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                Self::register_struct_type_for_param(param_name, inner, var_types);
+            }
+            TypeKind::SelfType => {
+                // SelfType is handled by the caller which knows the struct name
+            }
+            _ => {}
         }
     }
 
@@ -395,13 +478,20 @@ impl JavaGenerator {
 
         self.write(") {\n");
         self.indent();
-        // Save and reset byte tracking for this function scope
+        // Save and reset tracking for this function scope
         let saved_byte_vars = std::mem::take(&mut self.byte_vars);
         let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
+        let saved_var_types_func = self.var_types.clone();
+        let saved_return_type = self.current_return_type.take();
+        let saved_declared_vars = std::mem::take(&mut self.declared_vars);
+        self.current_return_type = func.return_type.clone();
         self.register_param_byte_types(&func.params);
         self.generate_block(&func.body);
         self.byte_vars = saved_byte_vars;
         self.byte_array_vars = saved_byte_array_vars;
+        self.var_types = saved_var_types_func;
+        self.current_return_type = saved_return_type;
+        self.declared_vars = saved_declared_vars;
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -432,10 +522,30 @@ impl JavaGenerator {
         self.indent();
         let saved_byte_vars = std::mem::take(&mut self.byte_vars);
         let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
+        let saved_var_types_method = self.var_types.clone();
+        let saved_return_type = self.current_return_type.take();
+        let saved_declared_vars = std::mem::take(&mut self.declared_vars);
+        self.current_return_type = func.return_type.clone();
         self.register_param_byte_types(&func.params);
+        // For methods, register the self/receiver parameter (usually first) with the struct type
+        // so that field accesses like self.block[i] can be resolved.
+        if let Some(first_param) = func.params.first()
+            && matches!(
+                &first_param.ty.kind,
+                crate::parser::TypeKind::SelfType
+                    | crate::parser::TypeKind::MutRef(_)
+                    | crate::parser::TypeKind::Ref(_)
+            )
+        {
+            self.var_types
+                .insert(first_param.name.name.clone(), struct_name.to_string());
+        }
         self.generate_block(&func.body);
         self.byte_vars = saved_byte_vars;
         self.byte_array_vars = saved_byte_array_vars;
+        self.var_types = saved_var_types_method;
+        self.current_return_type = saved_return_type;
+        self.declared_vars = saved_declared_vars;
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -446,9 +556,13 @@ impl JavaGenerator {
         self.indent();
         let saved_byte_vars = std::mem::take(&mut self.byte_vars);
         let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
+        let saved_return_type = self.current_return_type.take();
+        let saved_declared_vars = std::mem::take(&mut self.declared_vars);
         self.generate_block(&test.body);
         self.byte_vars = saved_byte_vars;
         self.byte_array_vars = saved_byte_array_vars;
+        self.current_return_type = saved_return_type;
+        self.declared_vars = saved_declared_vars;
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -461,7 +575,7 @@ impl JavaGenerator {
             Self::java_type(&c.ty),
             c.name.name
         ));
-        self.generate_expr(&c.value);
+        self.generate_expr_with_type_hint(&c.value, Some(&c.ty));
         self.write(";\n\n");
     }
 
@@ -659,9 +773,14 @@ impl JavaGenerator {
                     }
                 }
 
+                // Track variable name as declared (for for-loop shadowing avoidance)
+                self.declared_vars.insert(name.name.clone());
+
                 self.write_indent();
                 // Determine Java type
                 let needs_byte_cast = ty.as_ref().is_some_and(Self::is_byte_primitive);
+                let needs_short_cast =
+                    !needs_byte_cast && ty.as_ref().is_some_and(Self::is_short_primitive);
                 if let Some(ty) = ty {
                     self.write(&format!("{} {} = ", Self::java_type(ty), name.name));
                     if let Some(init) = init {
@@ -669,8 +788,12 @@ impl JavaGenerator {
                             self.write("(byte)(");
                             self.generate_expr(init);
                             self.write(")");
-                        } else {
+                        } else if needs_short_cast && Self::expr_may_widen_to_int(init) {
+                            self.write("(short)(");
                             self.generate_expr(init);
+                            self.write(")");
+                        } else {
+                            self.generate_expr_with_type_hint(init, Some(ty));
                         }
                     } else {
                         self.write(&self.default_value_for_type(ty));
@@ -849,16 +972,60 @@ impl JavaGenerator {
                 let use_long = Self::expr_needs_long(start) || Self::expr_needs_long(end);
                 let type_str = if use_long { "long" } else { "int" };
                 let cmp = if *inclusive { "<=" } else { "<" };
+
+                // In Java, a for-loop variable declared with `for (int i = ...)`
+                // is in scope for the entire body. A nested for-loop using the same
+                // variable name would cause "variable i is already defined".
+                //
+                // Strategy: if the variable is already declared (as a parameter,
+                // let binding, or outer for-loop variable), just assign to it
+                // without re-declaring. Otherwise, declare it with a type.
+                //
+                // Either way, we must track it as declared while processing the
+                // body so that nested for-loops with the same name avoid re-declaring.
+                let already_declared = self.declared_vars.contains(&var.name);
+
+                // Rename the inner variable when it shadows an outer one.
+                let java_var_name = if already_declared {
+                    self.loop_var_counter += 1;
+                    format!("{}__{}", var.name, self.loop_var_counter)
+                } else {
+                    var.name.clone()
+                };
+                // Track as declared so nested loops get renamed too.
+                let was_new = self.declared_vars.insert(var.name.clone());
+                let old_rename = if already_declared {
+                    self.loop_var_renames
+                        .insert(var.name.clone(), java_var_name.clone())
+                } else {
+                    None
+                };
+
                 self.write_indent();
-                self.write(&format!("for ({} {} = ", type_str, var.name));
+                self.write(&format!("for ({} {} = ", type_str, java_var_name));
                 self.generate_expr(start);
-                self.write(&format!("; {} {} ", var.name, cmp));
+                self.write(&format!("; {} {} ", java_var_name, cmp));
                 self.generate_expr(end);
-                self.write(&format!("; {}++) {{\n", var.name));
+                self.write(&format!("; {}++) {{\n", java_var_name));
                 self.indent();
                 self.generate_block(body);
                 self.dedent();
                 self.writeln("}");
+
+                // Restore state
+                if already_declared {
+                    match old_rename {
+                        Some(prev) => {
+                            self.loop_var_renames.insert(var.name.clone(), prev);
+                        }
+                        None => {
+                            self.loop_var_renames.remove(&var.name);
+                        }
+                    }
+                }
+                if was_new {
+                    self.declared_vars.remove(&var.name);
+                }
             }
             StmtKind::While { condition, body } => {
                 self.write_indent();
@@ -886,9 +1053,31 @@ impl JavaGenerator {
             StmtKind::Return(expr) => {
                 self.write_indent();
                 if let Some(expr) = expr {
-                    self.write("return ");
-                    self.generate_expr(expr);
-                    self.write(";\n");
+                    // Check if we need a byte cast for the return value
+                    let needs_byte_cast = self
+                        .current_return_type
+                        .as_ref()
+                        .is_some_and(Self::is_byte_primitive)
+                        && Self::expr_may_widen_to_int(expr);
+                    let needs_short_cast = !needs_byte_cast
+                        && self
+                            .current_return_type
+                            .as_ref()
+                            .is_some_and(Self::is_short_primitive)
+                        && Self::expr_may_widen_to_int(expr);
+                    if needs_byte_cast {
+                        self.write("return (byte)(");
+                        self.generate_expr(expr);
+                        self.write(");\n");
+                    } else if needs_short_cast {
+                        self.write("return (short)(");
+                        self.generate_expr(expr);
+                        self.write(");\n");
+                    } else {
+                        self.write("return ");
+                        self.generate_expr(expr);
+                        self.write(";\n");
+                    }
                 } else {
                     self.write("return;\n");
                 }
@@ -906,6 +1095,91 @@ impl JavaGenerator {
     // -----------------------------------------------------------------------
     // Expressions
     // -----------------------------------------------------------------------
+
+    /// Generate an expression with an optional type hint from the declaration context.
+    /// This ensures array literals match the declared element type (byte[] vs int[]).
+    fn generate_expr_with_type_hint(&mut self, expr: &Expr, type_hint: Option<&ParserType>) {
+        use crate::parser::TypeKind;
+        if let Some(ty) = type_hint {
+            // Unwrap Ref/MutRef wrappers so that `&[u8]` and `&mut [u8]` are
+            // treated the same as `[u8]` for array type matching.
+            let inner_ty = match &ty.kind {
+                TypeKind::MutRef(inner) | TypeKind::Ref(inner) => inner.as_ref(),
+                _ => ty,
+            };
+            // Also unwrap the expression through Ref/MutRef
+            let inner_expr = match &expr.kind {
+                ExprKind::Ref(inner) | ExprKind::MutRef(inner) => inner.as_ref(),
+                _ => expr,
+            };
+            match (&inner_expr.kind, &inner_ty.kind) {
+                // Array literal with a declared array type - use the declared element type
+                (
+                    ExprKind::Array(elements),
+                    TypeKind::Array { element, .. }
+                    | TypeKind::Slice { element }
+                    | TypeKind::ArrayRef { element, .. },
+                ) => {
+                    let is_byte_el = Self::is_byte_primitive(element);
+                    if elements.is_empty() {
+                        if is_byte_el {
+                            self.write("new byte[0]");
+                        } else {
+                            self.write(&format!("new {}[0]", Self::java_type(element)));
+                        }
+                    } else if is_byte_el {
+                        self.write("new byte[]{");
+                        for (i, elem) in elements.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.write("(byte)");
+                            self.generate_expr(elem);
+                        }
+                        self.write("}");
+                    } else {
+                        let elem_type = Self::java_type(element);
+                        self.write(&format!("new {}[]{{", elem_type));
+                        for (i, elem) in elements.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_expr(elem);
+                        }
+                        self.write("}");
+                    }
+                    return;
+                }
+                // ArrayRepeat with a declared array type
+                (
+                    ExprKind::ArrayRepeat { value, count },
+                    TypeKind::Array { element, .. }
+                    | TypeKind::Slice { element }
+                    | TypeKind::ArrayRef { element, .. },
+                ) => {
+                    let is_byte_el = Self::is_byte_primitive(element);
+                    if is_byte_el {
+                        self.write("new byte[(int)(");
+                        self.generate_expr(count);
+                        self.write(")]");
+                    } else {
+                        let elem_type = Self::java_type(element);
+                        self.write(&format!("new {}[(int)(", elem_type));
+                        self.generate_expr(count);
+                        self.write(")]");
+                    }
+                    if !matches!(value.kind, ExprKind::Integer(0)) {
+                        self.write(" /* fill: ");
+                        self.generate_expr(value);
+                        self.write(" */");
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.generate_expr(expr);
+    }
 
     fn generate_expr(&mut self, expr: &Expr) {
         match &expr.kind {
@@ -943,7 +1217,12 @@ impl JavaGenerator {
                 self.write(&format!("new byte[]{{{}}}", bytes.join(", ")));
             }
             ExprKind::Ident(ident) => {
-                self.write(&ident.name);
+                // Use renamed loop variable if applicable
+                if let Some(renamed) = self.loop_var_renames.get(&ident.name).cloned() {
+                    self.write(&renamed);
+                } else {
+                    self.write(&ident.name);
+                }
             }
             ExprKind::Binary { left, op, right } => {
                 // For array/byte-array comparisons, use constant_time_eq
@@ -1161,11 +1440,27 @@ impl JavaGenerator {
                         && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
                         && let Some(mangled_name) = methods.get(&field.name)
                     {
+                        let method_param_types =
+                            self.func_param_types.get(mangled_name.as_str()).cloned();
                         self.write(&format!("{}(", mangled_name));
                         self.generate_expr(object);
-                        for arg in args {
+                        for (arg_idx, arg) in args.iter().enumerate() {
                             self.write(", ");
-                            self.generate_expr(arg);
+                            // Parameter index is arg_idx + 1 because first param is self/receiver
+                            let type_hint = method_param_types
+                                .as_ref()
+                                .and_then(|types| types.get(arg_idx + 1));
+                            if let Some(ty) = type_hint {
+                                if Self::is_byte_primitive(ty) && Self::expr_may_widen_to_int(arg) {
+                                    self.write("(byte)(");
+                                    self.generate_expr(arg);
+                                    self.write(")");
+                                } else {
+                                    self.generate_expr_with_type_hint(arg, Some(ty));
+                                }
+                            } else {
+                                self.generate_expr(arg);
+                            }
                         }
                         self.write(")");
                         return;
@@ -1173,13 +1468,36 @@ impl JavaGenerator {
                 }
 
                 // Normal function call
+                // Look up parameter types so we can generate correct array types
+                let func_name = if let ExprKind::Ident(ident) = &func.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
+                let param_types = func_name
+                    .as_deref()
+                    .and_then(|name| self.func_param_types.get(name))
+                    .cloned();
                 self.generate_expr(func);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    // Use type hint from parameter types if available
+                    let type_hint = param_types.as_ref().and_then(|types| types.get(i));
+                    if let Some(ty) = type_hint {
+                        if Self::is_byte_primitive(ty) && Self::expr_may_widen_to_int(arg) {
+                            // Argument needs (byte) cast for byte parameter
+                            self.write("(byte)(");
+                            self.generate_expr(arg);
+                            self.write(")");
+                        } else {
+                            self.generate_expr_with_type_hint(arg, Some(ty));
+                        }
+                    } else {
+                        self.generate_expr(arg);
+                    }
                 }
                 self.write(")");
             }
@@ -1337,11 +1655,26 @@ impl JavaGenerator {
                 args,
                 ..
             } => {
+                let method_param_types = self.func_param_types.get(mangled_name.as_str()).cloned();
                 self.write(&format!("{}(", mangled_name));
                 self.generate_expr(receiver);
-                for arg in args {
+                for (arg_idx, arg) in args.iter().enumerate() {
                     self.write(", ");
-                    self.generate_expr(arg);
+                    // Parameter index is arg_idx + 1 because first param is self/receiver
+                    let type_hint = method_param_types
+                        .as_ref()
+                        .and_then(|types| types.get(arg_idx + 1));
+                    if let Some(ty) = type_hint {
+                        if Self::is_byte_primitive(ty) && Self::expr_may_widen_to_int(arg) {
+                            self.write("(byte)(");
+                            self.generate_expr(arg);
+                            self.write(")");
+                        } else {
+                            self.generate_expr_with_type_hint(arg, Some(ty));
+                        }
+                    } else {
+                        self.generate_expr(arg);
+                    }
                 }
                 self.write(")");
             }
@@ -1350,13 +1683,26 @@ impl JavaGenerator {
                 method_name,
                 args,
             } => {
-                self.write(&format!("{}__{}", type_name.name, method_name.name));
+                let mangled = format!("{}__{}", type_name.name, method_name.name);
+                let static_param_types = self.func_param_types.get(mangled.as_str()).cloned();
+                self.write(&mangled);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    let type_hint = static_param_types.as_ref().and_then(|types| types.get(i));
+                    if let Some(ty) = type_hint {
+                        if Self::is_byte_primitive(ty) && Self::expr_may_widen_to_int(arg) {
+                            self.write("(byte)(");
+                            self.generate_expr(arg);
+                            self.write(")");
+                        } else {
+                            self.generate_expr_with_type_hint(arg, Some(ty));
+                        }
+                    } else {
+                        self.generate_expr(arg);
+                    }
                 }
                 self.write(")");
             }
@@ -1771,6 +2117,8 @@ impl JavaGenerator {
             ExprKind::Integer(n) => *n > 127,
             // Function calls - we don't know the return type, be conservative
             ExprKind::Call { .. } => true,
+            // Method calls - also produce int typically
+            ExprKind::MethodCall { .. } => true,
             // Parenthesized - check inner
             ExprKind::Paren(inner) => Self::expr_may_widen_to_int(inner),
             // Conditionals - check branches
@@ -1903,8 +2251,11 @@ impl CodeGenerator for JavaGenerator {
         self.var_types.clear();
         self.byte_vars.clear();
         self.byte_array_vars.clear();
+        self.func_param_types.clear();
+        self.current_return_type = None;
+        self.declared_vars.clear();
 
-        // Pre-pass: collect struct definitions and methods
+        // Pre-pass: collect struct definitions, methods, and function parameter types
         for item in &ast.ast.items {
             match &item.kind {
                 ItemKind::Struct(s) => {
@@ -1933,10 +2284,20 @@ impl CodeGenerator for JavaGenerator {
                     let mut methods = HashMap::new();
                     for method in &impl_def.methods {
                         let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
-                        methods.insert(method.name.name.clone(), mangled);
+                        methods.insert(method.name.name.clone(), mangled.clone());
+                        // Collect parameter types for method calls
+                        let param_types: Vec<ParserType> =
+                            method.params.iter().map(|p| p.ty.clone()).collect();
+                        self.func_param_types.insert(mangled, param_types);
                     }
                     self.struct_methods
                         .insert(impl_def.target.name.clone(), methods);
+                }
+                ItemKind::Function(func) => {
+                    let param_types: Vec<ParserType> =
+                        func.params.iter().map(|p| p.ty.clone()).collect();
+                    self.func_param_types
+                        .insert(func.name.name.clone(), param_types);
                 }
                 _ => {}
             }

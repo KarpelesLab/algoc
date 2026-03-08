@@ -36,6 +36,15 @@ pub struct RustGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Variable Rust primitive types (for type-aware code generation, e.g. "u32", "u64")
+    var_rust_types: HashMap<String, String>,
+    /// Function parameter Rust types
+    param_rust_types: HashMap<String, String>,
+    /// Function return types (function_name -> rust_type)
+    func_return_types: HashMap<String, String>,
+    /// Context type hint for expression generation (e.g., from let binding)
+    /// Used as fallback for wrapping suffix inference
+    type_hint: Option<String>,
 }
 
 impl RustGenerator {
@@ -47,6 +56,10 @@ impl RustGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            var_rust_types: HashMap::new(),
+            param_rust_types: HashMap::new(),
+            func_return_types: HashMap::new(),
+            type_hint: None,
         }
     }
 
@@ -364,6 +377,7 @@ impl RustGenerator {
         self.write(&format!("fn {}(", mangled_name));
 
         // Parameters - replace Self with the concrete struct name
+        // Use param types (converts &[T; N] -> &[T] and &mut [T; N] -> &mut [T])
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
@@ -372,13 +386,13 @@ impl RustGenerator {
             if param.name.name == "self" {
                 self.write(&format!(
                     "self_: {}",
-                    Self::rust_type_replacing_self(&param.ty, Some(struct_name))
+                    Self::rust_param_type(&param.ty, Some(struct_name))
                 ));
             } else {
                 self.write(&format!(
                     "{}: {}",
                     param.name.name,
-                    Self::rust_type_replacing_self(&param.ty, Some(struct_name))
+                    Self::rust_param_type(&param.ty, Some(struct_name))
                 ));
             }
         }
@@ -423,7 +437,10 @@ impl RustGenerator {
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
         let needs_lifetime = s.fields.iter().any(|f| Self::type_needs_lifetime(&f.ty));
-        self.writeln("#[derive(Clone)]");
+        let has_mut_ref = s.fields.iter().any(|f| Self::type_contains_mut_ref(&f.ty));
+        if !has_mut_ref {
+            self.writeln("#[derive(Clone)]");
+        }
         if needs_lifetime {
             self.writeln(&format!("struct {}<'a> {{", s.name.name));
         } else {
@@ -435,7 +452,7 @@ impl RustGenerator {
                 self.writeln(&format!(
                     "{}: {},",
                     field.name.name,
-                    Self::rust_type_with_lifetime(&field.ty)
+                    self.rust_type_with_lifetime(&field.ty)
                 ));
             } else {
                 self.writeln(&format!(
@@ -472,8 +489,11 @@ impl RustGenerator {
 
     fn generate_layout(&mut self, l: &crate::parser::LayoutDef) {
         let needs_lifetime = l.fields.iter().any(|f| Self::type_needs_lifetime(&f.ty));
+        let has_mut_ref = l.fields.iter().any(|f| Self::type_contains_mut_ref(&f.ty));
         // Layouts are similar to structs in Rust
-        self.writeln("#[derive(Clone)]");
+        if !has_mut_ref {
+            self.writeln("#[derive(Clone)]");
+        }
         if needs_lifetime {
             self.writeln(&format!("struct {}<'a> {{", l.name.name));
         } else {
@@ -485,7 +505,7 @@ impl RustGenerator {
                 self.writeln(&format!(
                     "{}: {},",
                     field.name.name,
-                    Self::rust_type_with_lifetime(&field.ty)
+                    self.rust_type_with_lifetime(&field.ty)
                 ));
             } else {
                 self.writeln(&format!(
@@ -574,31 +594,63 @@ impl RustGenerator {
     }
 
     fn generate_function(&mut self, func: &Function) {
+        // Clear per-function type tracking
+        self.var_rust_types.clear();
+        self.param_rust_types.clear();
+
         // Detect if this function was monomorphized from a method/generic
         // If the function name contains "__", the prefix is the struct name
         // Also check if any parameter or return type uses SelfType
         let self_replacement = Self::infer_self_type_name(&func.name.name, func);
 
+        // Pre-pass: collect return type for this function
+        if let Some(ret_ty) = &func.return_type {
+            let rust_ty = Self::rust_type_replacing_self(ret_ty, self_replacement.as_deref());
+            self.func_return_types
+                .insert(func.name.name.clone(), rust_ty);
+        }
+
+        // Check if function needs lifetime annotations:
+        // A function needs <'a> if it has both:
+        // 1. A parameter that is a &mut struct-with-lifetime (e.g., &mut BitReader)
+        // 2. A reference parameter that could be stored in that struct (&[u8], &mut [u8])
+        let needs_lifetime = self.function_needs_lifetime(func);
+
         self.write_indent();
-        self.write(&format!("fn {}(", func.name.name));
+        if needs_lifetime {
+            self.write(&format!("fn {}<'a>(", func.name.name));
+        } else {
+            self.write(&format!("fn {}(", func.name.name));
+        }
 
         // Parameters
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
             }
+            let rust_ty = if needs_lifetime {
+                self.rust_type_with_lifetime(&param.ty)
+            } else {
+                // Use param type (converts &[T; N] -> &[T] and &mut [T; N] -> &mut [T])
+                Self::rust_param_type(&param.ty, self_replacement.as_deref())
+            };
+            // Check if this parameter needs `mut` (e.g., Reader/Writer that have &mut self methods)
+            let needs_mut = matches!(&param.ty.kind,
+                crate::parser::TypeKind::Named(ident) if ident.name == "Reader" || ident.name == "Writer"
+            );
+
             // Handle self parameter
             if param.name.name == "self" {
-                self.write(&format!(
-                    "self_: {}",
-                    Self::rust_type_replacing_self(&param.ty, self_replacement.as_deref())
-                ));
+                self.write(&format!("self_: {}", rust_ty));
+                self.param_rust_types.insert("self_".to_string(), rust_ty);
+            } else if needs_mut {
+                self.write(&format!("mut {}: {}", param.name.name, rust_ty.clone()));
+                self.param_rust_types
+                    .insert(param.name.name.clone(), rust_ty);
             } else {
-                self.write(&format!(
-                    "{}: {}",
-                    param.name.name,
-                    Self::rust_type_replacing_self(&param.ty, self_replacement.as_deref())
-                ));
+                self.write(&format!("{}: {}", param.name.name, rust_ty.clone()));
+                self.param_rust_types
+                    .insert(param.name.name.clone(), rust_ty);
             }
         }
 
@@ -667,6 +719,12 @@ impl RustGenerator {
                         .insert(name.name.clone(), type_ident.name.clone());
                 }
 
+                // Track Rust primitive types for type-aware code generation
+                if let Some(ty) = ty {
+                    let rust_ty = Self::rust_type(ty);
+                    self.var_rust_types.insert(name.name.clone(), rust_ty);
+                }
+
                 // Also infer type from static method calls like TypeName__new()
                 if let Some(init_expr) = init {
                     if let ExprKind::Call { func, .. } = &init_expr.kind
@@ -689,6 +747,22 @@ impl RustGenerator {
                     }
                 }
 
+                // Determine if the declared type should be adjusted for the init expression
+                let skip_type_annotation = if let Some(ty) = ty
+                    && let Some(init_expr) = init
+                {
+                    // If the declared type is a slice (&[u8]) but the init returns Vec<u8>
+                    // (e.g., reader.read_chunk()), skip the type annotation to let Rust infer Vec<u8>
+                    Self::type_is_slice_or_ref(ty) && Self::expr_returns_vec(init_expr)
+                } else {
+                    false
+                };
+                if skip_type_annotation {
+                    // Track the variable as Vec<u8> so we can add & at call sites
+                    self.var_rust_types
+                        .insert(name.name.clone(), "Vec<u8>".to_string());
+                }
+
                 self.write_indent();
                 if *mutable {
                     self.write("let mut ");
@@ -697,14 +771,36 @@ impl RustGenerator {
                 }
                 self.write(&name.name);
 
-                // Type annotation
-                if let Some(ty) = ty {
+                // Type annotation (skip if it would cause a type mismatch with the init)
+                if let Some(ty) = ty
+                    && !skip_type_annotation
+                {
                     self.write(&format!(": {}", Self::rust_type(ty)));
                 }
 
                 self.write(" = ");
                 if let Some(init) = init {
+                    // Set type hint from declared type for wrapping suffix inference
+                    let old_hint = self.type_hint.take();
+                    if let Some(ty) = ty {
+                        let rust_ty = Self::rust_type(ty);
+                        self.type_hint = Some(rust_ty);
+                    }
+
+                    // If the declared type is a slice/ref and the init is an array/hex/bytes
+                    // literal, we need to add & to create a reference
+                    let needs_ref = if let Some(ty) = ty {
+                        Self::type_is_slice_or_ref(ty) && Self::expr_is_array_literal(init)
+                    } else {
+                        false
+                    };
+                    // Also need & when the init is a slice expression (produces unsized [T])
+                    let needs_slice_ref = matches!(&init.kind, ExprKind::Slice { .. });
+                    if needs_ref || needs_slice_ref {
+                        self.write("&");
+                    }
                     self.generate_expr(init);
+                    self.type_hint = old_hint;
                 } else if let Some(ty) = ty {
                     self.write(&Self::default_value_for_type(ty));
                 } else {
@@ -743,10 +839,12 @@ impl RustGenerator {
                 // For wrapping arithmetic, we need to expand compound assignments
                 match op {
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                        // Infer the target type for proper literal suffixes
+                        let suffix = self.infer_wrapping_suffix(target, value);
                         self.write_indent();
                         self.generate_expr(target);
                         self.write(" = ");
-                        self.generate_expr(target);
+                        self.generate_typed_expr(target, &suffix);
                         let method = match op {
                             BinaryOp::Add => ".wrapping_add(",
                             BinaryOp::Sub => ".wrapping_sub(",
@@ -754,7 +852,7 @@ impl RustGenerator {
                             _ => unreachable!(),
                         };
                         self.write(method);
-                        self.generate_expr(value);
+                        self.generate_typed_expr(value, &suffix);
                         self.write(");\n");
                     }
                     BinaryOp::Shl => {
@@ -819,15 +917,20 @@ impl RustGenerator {
                 inclusive,
                 body,
             } => {
+                // Track the loop variable as u64 (consistent with AlgoC semantics)
+                self.var_rust_types
+                    .insert(var.name.clone(), "u64".to_string());
+
                 self.write_indent();
                 self.write(&format!("for {} in ", var.name));
-                self.generate_expr(start);
+                // Add type suffix to integer literal bounds to avoid ambiguous type
+                self.generate_typed_expr(start, "u64");
                 if *inclusive {
                     self.write("..=");
                 } else {
                     self.write("..");
                 }
-                self.generate_expr(end);
+                self.generate_typed_expr(end, "u64");
                 self.write(" {\n");
                 self.indent();
                 self.generate_block(body);
@@ -935,36 +1038,36 @@ impl RustGenerator {
                 match op {
                     // Wrapping arithmetic
                     BinaryOp::Add => {
-                        let suffix = Self::infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, suffix);
+                        let suffix = self.infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, &suffix);
                         self.write(".wrapping_add(");
-                        self.generate_typed_expr(right, suffix);
+                        self.generate_typed_expr(right, &suffix);
                         self.write(")");
                     }
                     BinaryOp::Sub => {
-                        let suffix = Self::infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, suffix);
+                        let suffix = self.infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, &suffix);
                         self.write(".wrapping_sub(");
-                        self.generate_typed_expr(right, suffix);
+                        self.generate_typed_expr(right, &suffix);
                         self.write(")");
                     }
                     BinaryOp::Mul => {
-                        let suffix = Self::infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, suffix);
+                        let suffix = self.infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, &suffix);
                         self.write(".wrapping_mul(");
-                        self.generate_typed_expr(right, suffix);
+                        self.generate_typed_expr(right, &suffix);
                         self.write(")");
                     }
                     BinaryOp::Shl => {
-                        let suffix = Self::infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, suffix);
+                        let suffix = self.infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, &suffix);
                         self.write(".wrapping_shl(");
                         self.generate_expr(right);
                         self.write(" as u32)");
                     }
                     BinaryOp::Shr => {
-                        let suffix = Self::infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, suffix);
+                        let suffix = self.infer_wrapping_suffix(left, right);
+                        self.generate_typed_expr(left, &suffix);
                         self.write(".wrapping_shr(");
                         self.generate_expr(right);
                         self.write(" as u32)");
@@ -1043,6 +1146,9 @@ impl RustGenerator {
                             self.write(", ");
                         }
                         self.generate_expr(arg);
+                        // Reader/Writer::new takes Vec<u8>, but the argument may be &[u8]
+                        // Add .to_vec() to convert
+                        self.write(".to_vec()");
                     }
                     self.write(")");
                     return;
@@ -1246,6 +1352,10 @@ impl RustGenerator {
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
+                    }
+                    // Auto-borrow Vec arguments that will be passed to slice parameters
+                    if self.arg_needs_borrow(arg) {
+                        self.write("&");
                     }
                     self.generate_expr(arg);
                 }
@@ -1564,8 +1674,10 @@ impl RustGenerator {
             self.write("[0]");
         } else {
             // Use from_xx_bytes with a try_into for the array conversion
+            // Note: we generate expr directly (not as a slice ref) because from_xx_bytes
+            // takes an owned [u8; N], and try_into() on a slice produces the right type.
             self.write(&format!("{}::{}(", rust_ty, byte_method));
-            self.generate_slice_ref(expr);
+            self.generate_expr(expr);
             self.write(&format!("[..{}].try_into().unwrap())", byte_count));
         }
     }
@@ -1843,35 +1955,154 @@ impl RustGenerator {
         }
     }
 
+    /// Infer the Rust type of an expression from context (variable types, struct fields, etc.)
+    /// Returns a type string like "u32", "u64", "u8", or empty string if unknown.
+    fn infer_expr_rust_type(&self, expr: &Expr) -> String {
+        match &expr.kind {
+            ExprKind::Ident(ident) => {
+                let name = if ident.name == "self" {
+                    "self_"
+                } else {
+                    &ident.name
+                };
+                if let Some(ty) = self.var_rust_types.get(name) {
+                    return ty.clone();
+                }
+                if let Some(ty) = self.param_rust_types.get(name) {
+                    return ty.clone();
+                }
+                String::new()
+            }
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    return Self::rust_native_type(p.to_native());
+                }
+                String::new()
+            }
+            ExprKind::Field { object, field } => {
+                // Determine the struct type of the object
+                let struct_name = match &object.kind {
+                    ExprKind::Ident(ident) => {
+                        let name = if ident.name == "self" {
+                            "self_"
+                        } else {
+                            &ident.name
+                        };
+                        self.var_types.get(name).cloned()
+                    }
+                    _ => None,
+                };
+                if let Some(sname) = struct_name
+                    && let Some(fields) = self.struct_defs.get(&sname)
+                {
+                    for f in fields {
+                        if f.name == field.name {
+                            return Self::rust_type(&f.ty);
+                        }
+                    }
+                }
+                String::new()
+            }
+            ExprKind::Index { array, .. } => {
+                // If we index into an array/slice, the result is the element type
+                let array_type = self.infer_expr_rust_type(array);
+                if let Some(stripped) = array_type.strip_prefix('[') {
+                    // [u32; 8] -> u32
+                    if let Some(semi_pos) = stripped.find(';') {
+                        return stripped[..semi_pos].trim().to_string();
+                    }
+                }
+                if let Some(stripped) = array_type.strip_prefix("&[") {
+                    // &[u8] -> u8
+                    if let Some(end) = stripped.strip_suffix(']') {
+                        return end.trim().to_string();
+                    }
+                }
+                if let Some(stripped) = array_type.strip_prefix("&mut [")
+                    && let Some(end) = stripped.strip_suffix(']')
+                {
+                    return end.trim().to_string();
+                }
+                String::new()
+            }
+            ExprKind::Binary { left, right, .. } => {
+                let lt = self.infer_expr_rust_type(left);
+                if !lt.is_empty() {
+                    return lt;
+                }
+                self.infer_expr_rust_type(right)
+            }
+            ExprKind::Paren(inner) => self.infer_expr_rust_type(inner),
+            ExprKind::Unary { operand, .. } => self.infer_expr_rust_type(operand),
+            ExprKind::Call { func, args } => {
+                // .len() returns u64
+                if let ExprKind::Field { field, .. } = &func.kind
+                    && field.name == "len"
+                    && args.is_empty()
+                {
+                    return "u64".to_string();
+                }
+                String::new()
+            }
+            _ => String::new(),
+        }
+    }
+
     /// Determine the type suffix needed for wrapping operations.
     /// If either operand is an integer literal, we need a suffix to avoid ambiguity.
     /// Returns the suffix to apply to integer literals (empty string if no literals present).
-    fn infer_wrapping_suffix(left: &Expr, right: &Expr) -> &'static str {
+    fn infer_wrapping_suffix(&self, left: &Expr, right: &Expr) -> String {
         let left_is_lit = matches!(left.kind, ExprKind::Integer(_));
         let right_is_lit = matches!(right.kind, ExprKind::Integer(_));
 
         if !left_is_lit && !right_is_lit {
             // Neither side is a literal, no suffix needed
-            return "";
+            return String::new();
         }
 
-        // Try to infer from the non-literal side
+        // Use context type hint first if available (e.g., from let binding).
+        // This takes priority because the declared type of the variable is the
+        // most authoritative source of what type the expression should produce.
+        if let Some(ref hint) = self.type_hint
+            && Self::is_rust_int_type(hint)
+        {
+            return hint.clone();
+        }
+
+        // Try to infer from the non-literal side using static analysis
         if left_is_lit && !right_is_lit {
             let s = Self::infer_int_type_suffix(right);
             if !s.is_empty() {
-                return s;
+                return s.to_string();
+            }
+            // Try runtime type inference
+            let rt = self.infer_expr_rust_type(right);
+            if !rt.is_empty() && Self::is_rust_int_type(&rt) {
+                return rt;
             }
         }
         if right_is_lit && !left_is_lit {
             let s = Self::infer_int_type_suffix(left);
             if !s.is_empty() {
-                return s;
+                return s.to_string();
+            }
+            let lt = self.infer_expr_rust_type(left);
+            if !lt.is_empty() && Self::is_rust_int_type(&lt) {
+                return lt;
             }
         }
 
         // Both are literals or we couldn't infer - default to u64
         // (most common integer type in crypto code)
-        "u64"
+        "u64".to_string()
+    }
+
+    /// Check if a string is a Rust integer type
+    fn is_rust_int_type(ty: &str) -> bool {
+        matches!(
+            ty,
+            "u8" | "u16" | "u32" | "u64" | "u128" | "i8" | "i16" | "i32" | "i64" | "i128"
+        )
     }
 
     /// Generate an integer literal with an explicit type suffix if needed.
@@ -1911,6 +2142,48 @@ impl RustGenerator {
         None
     }
 
+    /// Convert a parser type to a Rust parameter type string.
+    /// For function parameters, array refs (&[T; N]) are converted to slices (&[T])
+    /// and &mut [T; N] is converted to &mut [T] for more flexible function signatures.
+    fn rust_param_type(ty: &crate::parser::Type, self_name: Option<&str>) -> String {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::ArrayRef { element, .. } => {
+                format!("&[{}]", Self::rust_type_replacing_self(element, self_name))
+            }
+            TypeKind::Ref(inner) => {
+                if let TypeKind::Array { element, .. } = &inner.kind {
+                    format!("&[{}]", Self::rust_type_replacing_self(element, self_name))
+                } else if let TypeKind::Slice { element } = &inner.kind {
+                    format!("&[{}]", Self::rust_type_replacing_self(element, self_name))
+                } else {
+                    Self::rust_type_replacing_self(ty, self_name)
+                }
+            }
+            TypeKind::MutRef(inner) => {
+                if let TypeKind::Slice { element } = &inner.kind {
+                    format!(
+                        "&mut [{}]",
+                        Self::rust_type_replacing_self(element, self_name)
+                    )
+                } else if let TypeKind::ArrayRef { element, .. } = &inner.kind {
+                    format!(
+                        "&mut [{}]",
+                        Self::rust_type_replacing_self(element, self_name)
+                    )
+                } else if let TypeKind::Array { element, .. } = &inner.kind {
+                    format!(
+                        "&mut [{}]",
+                        Self::rust_type_replacing_self(element, self_name)
+                    )
+                } else {
+                    Self::rust_type_replacing_self(ty, self_name)
+                }
+            }
+            _ => Self::rust_type_replacing_self(ty, self_name),
+        }
+    }
+
     /// Check if a type contains SelfType anywhere (either TypeKind::SelfType or Named("Self"))
     fn type_contains_self(ty: &crate::parser::Type) -> bool {
         use crate::parser::TypeKind;
@@ -1925,6 +2198,77 @@ impl RustGenerator {
         }
     }
 
+    /// Check if a type is a slice or reference type (e.g., &[u8], &T)
+    fn type_is_slice_or_ref(ty: &crate::parser::Type) -> bool {
+        use crate::parser::TypeKind;
+        matches!(
+            &ty.kind,
+            TypeKind::Slice { .. } | TypeKind::Ref(_) | TypeKind::ArrayRef { .. }
+        )
+    }
+
+    /// Check if an expression is an array/hex/bytes literal that would need & to become a reference
+    fn expr_is_array_literal(expr: &Expr) -> bool {
+        matches!(
+            &expr.kind,
+            ExprKind::Hex(_) | ExprKind::Array(_) | ExprKind::ArrayRepeat { .. }
+        )
+    }
+
+    /// Check if a function argument needs auto-borrowing.
+    /// This is needed when passing a Vec-typed variable to a function expecting a slice.
+    fn arg_needs_borrow(&self, arg: &Expr) -> bool {
+        if let ExprKind::Ident(ident) = &arg.kind
+            && let Some(ty) = self.var_rust_types.get(&ident.name)
+        {
+            return ty.starts_with("Vec<");
+        }
+        false
+    }
+
+    /// Check if an expression returns a Vec (e.g., reader.read_chunk, reader.read_bytes)
+    /// These can't be assigned to &[u8] directly - the type annotation must be skipped.
+    fn expr_returns_vec(expr: &Expr) -> bool {
+        if let ExprKind::Call { func, .. } = &expr.kind
+            && let ExprKind::Field { field, .. } = &func.kind
+        {
+            return matches!(field.name.as_str(), "read_chunk" | "read_bytes" | "to_vec");
+        }
+        false
+    }
+
+    /// Check if a function needs lifetime annotations.
+    /// This is needed when a function has a struct-with-lifetime parameter
+    /// and also has reference parameters that could be stored in that struct.
+    fn function_needs_lifetime(&self, func: &Function) -> bool {
+        let has_struct_with_lifetime = func.params.iter().any(|p| {
+            // Check if parameter is &mut SomeStruct where SomeStruct has lifetime fields
+            match &p.ty.kind {
+                crate::parser::TypeKind::MutRef(inner) => {
+                    if let crate::parser::TypeKind::Named(ident) = &inner.kind {
+                        // Check if this struct has any fields that need lifetimes
+                        if let Some(fields) = self.struct_defs.get(&ident.name) {
+                            return fields.iter().any(|f| Self::type_needs_lifetime(&f.ty));
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            }
+        });
+
+        let has_ref_param = func.params.iter().any(|p| {
+            matches!(
+                &p.ty.kind,
+                crate::parser::TypeKind::Slice { .. }
+                    | crate::parser::TypeKind::Ref(_)
+                    | crate::parser::TypeKind::ArrayRef { .. }
+            ) || matches!(&p.ty.kind, crate::parser::TypeKind::MutRef(inner) if matches!(&inner.kind, crate::parser::TypeKind::Slice { .. }))
+        });
+
+        has_struct_with_lifetime && has_ref_param
+    }
+
     /// Check if a type contains any references that need a lifetime annotation
     fn type_needs_lifetime(ty: &crate::parser::Type) -> bool {
         use crate::parser::TypeKind;
@@ -1937,8 +2281,18 @@ impl RustGenerator {
         )
     }
 
+    /// Check if a type contains a mutable reference (which prevents deriving Clone)
+    fn type_contains_mut_ref(ty: &crate::parser::Type) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::MutRef(_) => true,
+            TypeKind::Array { element, .. } => Self::type_contains_mut_ref(element),
+            _ => false,
+        }
+    }
+
     /// Convert a parser type to a Rust type string, adding lifetime 'a to references
-    fn rust_type_with_lifetime(ty: &crate::parser::Type) -> String {
+    fn rust_type_with_lifetime(&self, ty: &crate::parser::Type) -> String {
         use crate::parser::TypeKind;
         match &ty.kind {
             TypeKind::Slice { element } => {
@@ -1949,7 +2303,7 @@ impl RustGenerator {
                 if let TypeKind::Slice { element } = &inner.kind {
                     format!("&'a [{}]", Self::rust_type(element))
                 } else {
-                    format!("&'a {}", Self::rust_type(inner))
+                    format!("&'a {}", self.rust_type_with_lifetime(inner))
                 }
             }
             TypeKind::MutRef(inner) => {
@@ -1957,11 +2311,20 @@ impl RustGenerator {
                 if let TypeKind::Slice { element } = &inner.kind {
                     format!("&'a mut [{}]", Self::rust_type(element))
                 } else {
-                    format!("&'a mut {}", Self::rust_type(inner))
+                    format!("&'a mut {}", self.rust_type_with_lifetime(inner))
                 }
             }
             TypeKind::ArrayRef { element, size } => {
                 format!("&'a [{}; {}]", Self::rust_type(element), size)
+            }
+            TypeKind::Named(ident) => {
+                // Check if this named type is a struct with lifetime fields
+                if let Some(fields) = self.struct_defs.get(&ident.name)
+                    && fields.iter().any(|f| Self::type_needs_lifetime(&f.ty))
+                {
+                    return format!("{}<'a>", ident.name);
+                }
+                ident.name.clone()
             }
             _ => Self::rust_type(ty),
         }
@@ -2030,6 +2393,9 @@ impl CodeGenerator for RustGenerator {
         self.struct_defs.clear();
         self.struct_methods.clear();
         self.var_types.clear();
+        self.var_rust_types.clear();
+        self.param_rust_types.clear();
+        self.func_return_types.clear();
 
         // Pre-pass: collect struct definitions and method mappings
         for item in &ast.ast.items {

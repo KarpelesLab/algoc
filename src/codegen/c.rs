@@ -23,6 +23,12 @@ struct StructFieldInfo {
 /// Struct method info (method name -> mangled function name)
 type MethodMap = HashMap<String, String>;
 
+/// Info about a function parameter for C code generation
+#[derive(Clone)]
+struct FuncParamInfo {
+    needs_len: bool,
+}
+
 /// C code generator
 pub struct CGenerator {
     /// Current indentation level
@@ -39,6 +45,10 @@ pub struct CGenerator {
     var_types: HashMap<String, String>,
     /// Variables that are pointers (from &mut / & parameters), needing -> instead of .
     pointer_vars: HashSet<String>,
+    /// Function signatures: func_name -> list of param info (for generating correct call args)
+    func_signatures: HashMap<String, Vec<FuncParamInfo>>,
+    /// Variables that are slices/arrays (need _len companion when passed to functions)
+    slice_vars: HashSet<String>,
 }
 
 impl CGenerator {
@@ -51,6 +61,8 @@ impl CGenerator {
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
             pointer_vars: HashSet::new(),
+            func_signatures: HashMap::new(),
+            slice_vars: HashSet::new(),
         }
     }
 
@@ -161,6 +173,35 @@ impl CGenerator {
         match &ty.kind {
             TypeKind::Array { element, .. } => self.type_to_c_base(element),
             _ => self.type_to_c(ty),
+        }
+    }
+
+    /// Check if a parameter type requires a companion _len argument in C
+    fn param_needs_len(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Array { .. } => true,
+            TypeKind::Slice { .. } => true,
+            TypeKind::ArrayRef { .. } => true,
+            TypeKind::MutRef(inner) => {
+                matches!(inner.kind, TypeKind::Slice { .. } | TypeKind::Array { .. })
+            }
+            TypeKind::Ref(inner) => {
+                matches!(inner.kind, TypeKind::Slice { .. } | TypeKind::Array { .. })
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if a struct field type is a slice-like type that needs a companion _len field
+    fn is_slice_field_type(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Slice { .. } => true,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                matches!(inner.kind, TypeKind::Slice { .. })
+            }
+            _ => false,
         }
     }
 
@@ -590,7 +631,7 @@ impl CGenerator {
     }
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
-        self.writeln("typedef struct {");
+        self.writeln(&format!("typedef struct {} {{", s.name.name));
         self.indent();
         for field in &s.fields {
             let base_ty = self.type_to_c_base(&field.ty);
@@ -601,6 +642,10 @@ impl CGenerator {
             } else {
                 self.writeln(&format!("{} {};", base_ty, field.name.name));
             }
+            // Emit companion _len field for slice-like struct fields
+            if Self::is_slice_field_type(&field.ty) {
+                self.writeln(&format!("size_t {}_len;", field.name.name));
+            }
         }
         self.dedent();
         self.writeln(&format!("}} {};", s.name.name));
@@ -609,7 +654,7 @@ impl CGenerator {
 
     fn generate_layout(&mut self, l: &crate::parser::LayoutDef) {
         // Layouts are similar to structs in C
-        self.writeln("typedef struct {");
+        self.writeln(&format!("typedef struct {} {{", l.name.name));
         self.indent();
         for field in &l.fields {
             let base_ty = self.type_to_c_base(&field.ty);
@@ -785,12 +830,16 @@ impl CGenerator {
         }
     }
 
-    /// Populate pointer_vars from function parameters
+    /// Populate pointer_vars and slice_vars from function parameters
     fn collect_pointer_params(&mut self, func: &Function) {
         self.pointer_vars.clear();
+        self.slice_vars.clear();
         for param in &func.params {
             if Self::is_pointer_param(&param.ty) {
                 self.pointer_vars.insert(param.name.name.clone());
+            }
+            if Self::param_needs_len(&param.ty) {
+                self.slice_vars.insert(param.name.name.clone());
             }
         }
     }
@@ -1251,6 +1300,7 @@ impl CGenerator {
 
                     // Emit a companion length variable
                     self.writeln(&format!("size_t {}_len = {};", name.name, size));
+                    self.slice_vars.insert(name.name.clone());
                     let _ = element;
                 }
                 TypeKind::Slice { element } => {
@@ -1265,6 +1315,7 @@ impl CGenerator {
                         self.write(&format!("{}* {} = NULL;\n", elem_ty, name.name));
                     }
                     self.writeln(&format!("size_t {}_len = 0;", name.name));
+                    self.slice_vars.insert(name.name.clone());
                 }
                 TypeKind::Named(ident) => {
                     self.write_indent();
@@ -1296,6 +1347,7 @@ impl CGenerator {
                             self.write(";\n");
                             // Length companion
                             self.writeln(&format!("size_t {}_len = 0;", name.name));
+                            self.slice_vars.insert(name.name.clone());
                         }
                         TypeKind::Named(ident) => {
                             self.write_indent();
@@ -1340,6 +1392,7 @@ impl CGenerator {
                     }
                     self.write(";\n");
                     self.writeln(&format!("size_t {}_len = {};", name.name, size));
+                    self.slice_vars.insert(name.name.clone());
                 }
                 _ => {
                     let ty_str = self.type_to_c(ty);
@@ -1393,6 +1446,118 @@ impl CGenerator {
             ExprKind::Cast { ty, .. } => self.type_to_c(ty),
             ExprKind::StructLit { name, .. } => name.name.clone(),
             _ => "uint32_t".to_string(),
+        }
+    }
+
+    /// Generate a function call argument, and if the corresponding parameter
+    /// needs a companion _len argument, emit that too.
+    fn generate_call_arg(&mut self, arg: &Expr, needs_len: bool) {
+        self.generate_expr(arg);
+        if needs_len {
+            self.write(", ");
+            self.generate_arg_len_expr(arg);
+        }
+    }
+
+    /// Generate the length expression for an argument being passed to a slice/array parameter.
+    /// This figures out the correct length based on the argument expression form.
+    fn generate_arg_len_expr(&mut self, arg: &Expr) {
+        match &arg.kind {
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) => {
+                // &array or &mut array - use the inner expression's length
+                self.generate_arg_len_expr(inner);
+            }
+            ExprKind::Ident(ident) => {
+                // Variable - use companion _len variable
+                self.write(&format!("{}_len", ident.name));
+            }
+            ExprKind::Field { object, field } => {
+                // struct.field - use struct.field_len
+                let accessor = if let ExprKind::Ident(ident) = &object.kind
+                    && self.pointer_vars.contains(&ident.name)
+                {
+                    "->"
+                } else {
+                    "."
+                };
+                self.generate_expr(object);
+                self.write(&format!("{}{}_len", accessor, field.name));
+            }
+            ExprKind::Slice {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                // array[start..end] - length is (end - start)
+                self.write("(");
+                self.generate_expr(end);
+                if *inclusive {
+                    self.write(" + 1");
+                }
+                self.write(" - ");
+                self.generate_expr(start);
+                self.write(")");
+            }
+            ExprKind::Bytes(s) => {
+                self.write(&format!("{}", s.len()));
+            }
+            ExprKind::Hex(h) => {
+                self.write(&format!("{}", h.len() / 2));
+            }
+            ExprKind::String(s) => {
+                self.write(&format!("{}", s.len()));
+            }
+            ExprKind::Array(elements) => {
+                self.write(&format!("{}", elements.len()));
+            }
+            ExprKind::Paren(inner) => {
+                self.generate_arg_len_expr(inner);
+            }
+            _ => {
+                // Fallback
+                self.write("0");
+            }
+        }
+    }
+
+    /// Generate function call arguments, looking up the function signature to
+    /// determine which arguments need companion _len parameters.
+    fn generate_call_args(&mut self, func_name: &str, args: &[Expr]) {
+        if let Some(params) = self.func_signatures.get(func_name).cloned() {
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                let needs_len = params.get(i).is_some_and(|p| p.needs_len);
+                self.generate_call_arg(arg, needs_len);
+            }
+        } else {
+            // No known signature - just generate args normally
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.generate_expr(arg);
+            }
+        }
+    }
+
+    /// Generate function call arguments for a method call, where the first C parameter
+    /// is the self/receiver (already emitted), and the remaining args map to params[1..].
+    fn generate_method_call_args(&mut self, func_name: &str, args: &[Expr]) {
+        if let Some(params) = self.func_signatures.get(func_name).cloned() {
+            for (i, arg) in args.iter().enumerate() {
+                self.write(", ");
+                // args[i] corresponds to params[i+1] (params[0] is self)
+                let needs_len = params.get(i + 1).is_some_and(|p| p.needs_len);
+                self.generate_call_arg(arg, needs_len);
+            }
+        } else {
+            for arg in args {
+                self.write(", ");
+                self.generate_expr(arg);
+            }
         }
     }
 
@@ -1554,7 +1719,7 @@ impl CGenerator {
                             if i > 0 {
                                 self.write(", ");
                             }
-                            self.generate_expr(arg);
+                            self.generate_call_arg(arg, true);
                         }
                         self.write(")");
                         return;
@@ -1565,7 +1730,7 @@ impl CGenerator {
                             if i > 0 {
                                 self.write(", ");
                             }
-                            self.generate_expr(arg);
+                            self.generate_call_arg(arg, true);
                         }
                         self.write(")");
                         return;
@@ -1578,6 +1743,21 @@ impl CGenerator {
                         // Convert .len() to companion _len variable
                         if let ExprKind::Ident(ident) = &object.kind {
                             self.write(&format!("{}_len", ident.name));
+                        } else if let ExprKind::Field {
+                            object: inner_obj,
+                            field: inner_field,
+                        } = &object.kind
+                        {
+                            // Handle struct.field.len() -> struct.field_len or struct->field_len
+                            let accessor = if let ExprKind::Ident(ident) = &inner_obj.kind
+                                && self.pointer_vars.contains(&ident.name)
+                            {
+                                "->"
+                            } else {
+                                "."
+                            };
+                            self.generate_expr(inner_obj);
+                            self.write(&format!("{}{}_len", accessor, inner_field.name));
                         } else {
                             // Fallback - might not work for complex expressions
                             self.write("/* .len() */ 0");
@@ -1721,28 +1901,36 @@ impl CGenerator {
                     {
                         // Generate: StructName__method(&object, args...) or StructName__method(object, args...) if already a pointer
                         let is_ptr = self.pointer_vars.contains(&obj_ident.name);
+                        let mangled_name = mangled_name.clone();
                         if is_ptr {
                             self.write(&format!("{}(", mangled_name));
                         } else {
                             self.write(&format!("{}(&", mangled_name));
                         }
                         self.generate_expr(object);
-                        for arg in args {
-                            self.write(", ");
-                            self.generate_expr(arg);
-                        }
+                        self.generate_method_call_args(&mangled_name, args);
                         self.write(")");
                         return;
                     }
                 }
 
+                // Extract function name for signature lookup
+                let func_name = if let ExprKind::Ident(ident) = &func.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
                 self.generate_expr(func);
                 self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
+                if let Some(ref name) = func_name {
+                    self.generate_call_args(name, args);
+                } else {
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expr(arg);
                     }
-                    self.generate_expr(arg);
                 }
                 self.write(")");
             }
@@ -1822,12 +2010,22 @@ impl CGenerator {
             ExprKind::StructLit { name, fields } => {
                 // C designated initializer
                 self.write(&format!("({}){{", name.name));
+                let struct_fields = self.struct_defs.get(&name.name).cloned();
                 for (i, (field_name, value)) in fields.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
                     self.write(&format!(".{} = ", field_name.name));
                     self.generate_expr(value);
+                    // If this field has a companion _len field in the struct,
+                    // also emit it based on the value expression
+                    if let Some(ref sfields) = struct_fields
+                        && let Some(field_info) = sfields.iter().find(|f| f.name == field_name.name)
+                        && Self::is_slice_field_type(&field_info.ty)
+                    {
+                        self.write(&format!(", .{}_len = ", field_name.name));
+                        self.generate_arg_len_expr(value);
+                    }
                 }
                 self.write("}");
             }
@@ -1913,10 +2111,7 @@ impl CGenerator {
                 // Generate: mangled_name(&receiver, args...)
                 self.write(&format!("{}(&", mangled_name));
                 self.generate_expr(receiver);
-                for arg in args {
-                    self.write(", ");
-                    self.generate_expr(arg);
-                }
+                self.generate_method_call_args(mangled_name, args);
                 self.write(")");
             }
             ExprKind::TypeStaticCall {
@@ -1925,25 +2120,30 @@ impl CGenerator {
                 args,
             } => {
                 // Should be resolved by monomorphization
-                self.write(&format!("{}__{}", type_name.name, method_name.name));
+                let mangled = format!("{}__{}", type_name.name, method_name.name);
+                self.write(&mangled);
                 self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.generate_expr(arg);
-                }
+                self.generate_call_args(&mangled, args);
                 self.write(")");
             }
             ExprKind::GenericCall { func, args, .. } => {
                 // Should be resolved by monomorphization - generate as regular call
+                let func_name = if let ExprKind::Ident(ident) = &func.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
                 self.generate_expr(func);
                 self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
+                if let Some(ref name) = func_name {
+                    self.generate_call_args(name, args);
+                } else {
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expr(arg);
                     }
-                    self.generate_expr(arg);
                 }
                 self.write(")");
             }
@@ -2353,8 +2553,9 @@ impl CodeGenerator for CGenerator {
         self.struct_defs.clear();
         self.struct_methods.clear();
         self.var_types.clear();
+        self.func_signatures.clear();
 
-        // Pre-pass: collect struct/layout definitions and method maps
+        // Pre-pass: collect struct/layout definitions, method maps, and function signatures
         for item in &ast.ast.items {
             match &item.kind {
                 ItemKind::Struct(s) => {
@@ -2383,10 +2584,29 @@ impl CodeGenerator for CGenerator {
                     let mut methods = HashMap::new();
                     for method in &impl_def.methods {
                         let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
-                        methods.insert(method.name.name.clone(), mangled);
+                        methods.insert(method.name.name.clone(), mangled.clone());
+                        // Also collect method signatures under mangled name
+                        let params: Vec<FuncParamInfo> = method
+                            .params
+                            .iter()
+                            .map(|p| FuncParamInfo {
+                                needs_len: Self::param_needs_len(&p.ty),
+                            })
+                            .collect();
+                        self.func_signatures.insert(mangled, params);
                     }
                     self.struct_methods
                         .insert(impl_def.target.name.clone(), methods);
+                }
+                ItemKind::Function(func) => {
+                    let params: Vec<FuncParamInfo> = func
+                        .params
+                        .iter()
+                        .map(|p| FuncParamInfo {
+                            needs_len: Self::param_needs_len(&p.ty),
+                        })
+                        .collect();
+                    self.func_signatures.insert(func.name.name.clone(), params);
                 }
                 _ => {}
             }

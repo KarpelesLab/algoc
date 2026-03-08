@@ -36,6 +36,12 @@ pub struct GoGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Variable Go types (for type-aware code generation, e.g. "uint32", "uint64")
+    var_go_types: HashMap<String, String>,
+    /// Function parameter Go types (for type-aware code generation)
+    param_go_types: HashMap<String, String>,
+    /// Function return types (function_name -> go_type)
+    func_return_types: HashMap<String, String>,
     /// Track which imports are needed
     needed_imports: HashSet<String>,
     /// Whether we need the assert helper
@@ -60,6 +66,9 @@ impl GoGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            var_go_types: HashMap::new(),
+            param_go_types: HashMap::new(),
+            func_return_types: HashMap::new(),
             needed_imports: HashSet::new(),
             needs_assert: false,
             needs_bytes_equal: false,
@@ -100,6 +109,130 @@ impl GoGenerator {
 
     fn dedent(&mut self) {
         self.indent = self.indent.saturating_sub(1);
+    }
+
+    /// Infer the Go type of an expression, if it can be determined.
+    /// Returns Some(type_string) for typed expressions, None for untyped (e.g., integer literals).
+    /// Used to determine the correct type for for-loop variables and to insert
+    /// explicit type conversions in binary expressions (Go requires matching types).
+    fn infer_expr_go_type(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            // .len() calls produce uint64 (since AlgoC .len() returns u64)
+            // Other function calls: look up return type in func_return_types
+            ExprKind::Call { func, args } => {
+                if let ExprKind::Field { field, .. } = &func.kind
+                    && field.name == "len"
+                    && args.is_empty()
+                {
+                    return Some("uint64".to_string());
+                }
+                // Look up the return type of the function being called
+                if let ExprKind::Ident(ident) = &func.kind {
+                    return self.func_return_types.get(&ident.name).cloned();
+                }
+                None
+            }
+            // TypeStaticCall: look up mangled name in func_return_types
+            ExprKind::TypeStaticCall {
+                type_name,
+                method_name,
+                ..
+            } => {
+                let mangled = format!("{}__{}", type_name.name, method_name.name);
+                self.func_return_types.get(&mangled).cloned()
+            }
+            // Identifiers: look up in var_go_types or param_go_types
+            ExprKind::Ident(ident) => self
+                .var_go_types
+                .get(&ident.name)
+                .or_else(|| self.param_go_types.get(&ident.name))
+                .cloned(),
+            // Parenthesized expressions delegate to inner
+            ExprKind::Paren(inner) => self.infer_expr_go_type(inner),
+            // Casts produce the target type
+            ExprKind::Cast { ty, .. } => Some(self.go_type(ty)),
+            // Integer literals are untyped in Go
+            ExprKind::Integer(_) => None,
+            // Bool literals
+            ExprKind::Bool(_) => Some("bool".to_string()),
+            // Field access: look up struct field type
+            ExprKind::Field { object, field } => {
+                // Determine the struct type of the object
+                let struct_name = match &object.kind {
+                    ExprKind::Ident(ident) => self.var_types.get(&ident.name).cloned(),
+                    _ => None,
+                };
+                if let Some(sname) = struct_name
+                    && let Some(fields) = self.struct_defs.get(&sname)
+                {
+                    for f in fields {
+                        if f.name == field.name {
+                            return Some(self.go_type(&f.ty));
+                        }
+                    }
+                }
+                None
+            }
+            // Index into a slice/array: if the base is []uint8, result is uint8
+            ExprKind::Index { array, .. } => {
+                let array_type = self.infer_expr_go_type(array);
+                if let Some(ref at) = array_type {
+                    if at == "[]uint8" || at.starts_with("[]uint8") {
+                        return Some("uint8".to_string());
+                    }
+                    if at == "[]uint32" || at.starts_with("[]uint32") {
+                        return Some("uint32".to_string());
+                    }
+                    if at == "[]uint64" || at.starts_with("[]uint64") {
+                        return Some("uint64".to_string());
+                    }
+                    if at == "[]uint16" || at.starts_with("[]uint16") {
+                        return Some("uint16".to_string());
+                    }
+                }
+                // If the param type is a slice of bytes (e.g. &[u8] -> []uint8)
+                None
+            }
+            // Binary expressions: infer from operands
+            ExprKind::Binary { left, op, right } => {
+                // Logical/comparison operators produce bool
+                if matches!(
+                    op,
+                    BinaryOp::And
+                        | BinaryOp::Or
+                        | BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                ) {
+                    return Some("bool".to_string());
+                }
+                // Shift operators: result type is the type of the left operand
+                // (Go: the shift count can be any unsigned int, result type = left operand type)
+                if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                    return self.infer_expr_go_type(left);
+                }
+                // Arithmetic/bitwise: result type is the wider of the two operands
+                let lt = self.infer_expr_go_type(left);
+                let rt = self.infer_expr_go_type(right);
+                match (lt, rt) {
+                    (Some(l), Some(r)) => Some(go_wider_type(&l, &r)),
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
+            }
+            // Unary: same type as operand
+            ExprKind::Unary { operand, .. } => self.infer_expr_go_type(operand),
+            // Ref/MutRef/Deref: delegate
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
+                self.infer_expr_go_type(inner)
+            }
+            // Default: unknown type
+            _ => None,
+        }
     }
 
     /// Map an AlgoC type to a Go type string
@@ -556,9 +689,21 @@ impl GoGenerator {
 
     fn pre_scan_item(&mut self, item: &Item) {
         match &item.kind {
-            ItemKind::Function(func) => self.pre_scan_block(&func.body),
+            ItemKind::Function(func) => {
+                // Track function return types for type inference
+                if let Some(ret_ty) = &func.return_type {
+                    self.func_return_types
+                        .insert(func.name.name.clone(), self.go_type(ret_ty));
+                }
+                self.pre_scan_block(&func.body);
+            }
             ItemKind::Impl(impl_def) => {
                 for method in &impl_def.methods {
+                    // Track method return types with mangled names
+                    if let Some(ret_ty) = &method.return_type {
+                        let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
+                        self.func_return_types.insert(mangled, self.go_type(ret_ty));
+                    }
                     self.pre_scan_block(&method.body);
                 }
             }
@@ -797,16 +942,38 @@ impl GoGenerator {
         }
     }
 
+    /// Extract the struct name from a type, unwrapping through references.
+    /// For `&mut BitReader` or `&BitReader` or `BitReader`, returns `Some("BitReader")`.
+    fn extract_named_type(ty: &ParserType) -> Option<String> {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Named(ident) => Some(ident.name.clone()),
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => Self::extract_named_type(inner),
+            _ => None,
+        }
+    }
+
     fn generate_function(&mut self, func: &Function) {
+        // Clear per-function type tracking
+        self.var_go_types.clear();
+        self.param_go_types.clear();
+
         self.write_indent();
         self.write(&format!("func {}(", func.name.name));
 
-        // Parameters
+        // Parameters - also track their Go types and struct types
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
             }
-            self.write(&format!("{} {}", param.name.name, self.go_type(&param.ty)));
+            let go_ty = self.go_type(&param.ty);
+            self.param_go_types
+                .insert(param.name.name.clone(), go_ty.clone());
+            // Track named/struct types for field access type inference
+            if let Some(struct_name) = Self::extract_named_type(&param.ty) {
+                self.var_types.insert(param.name.name.clone(), struct_name);
+            }
+            self.write(&format!("{} {}", param.name.name, go_ty));
         }
 
         self.write(")");
@@ -825,17 +992,28 @@ impl GoGenerator {
     }
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
+        // Clear per-function type tracking
+        self.var_go_types.clear();
+        self.param_go_types.clear();
+
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
 
         self.write_indent();
         self.write(&format!("func {}(", mangled_name));
 
-        // Parameters
+        // Parameters - also track their Go types and struct types
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
             }
-            self.write(&format!("{} {}", param.name.name, self.go_type(&param.ty)));
+            let go_ty = self.go_type(&param.ty);
+            self.param_go_types
+                .insert(param.name.name.clone(), go_ty.clone());
+            // Track named/struct types for field access type inference
+            if let Some(sname) = Self::extract_named_type(&param.ty) {
+                self.var_types.insert(param.name.name.clone(), sname);
+            }
+            self.write(&format!("{} {}", param.name.name, go_ty));
         }
 
         self.write(")");
@@ -1058,15 +1236,30 @@ impl GoGenerator {
                 }
 
                 if let Some(init) = init {
-                    // Use := for variable declaration with initialization
-                    self.write_indent();
-                    self.write(&format!("{} := ", name.name));
-                    self.generate_expr(init);
-                    self.write("\n");
+                    if let Some(ty) = ty {
+                        // Use var with explicit type to preserve Go type semantics
+                        self.write_indent();
+                        let go_ty = self.go_type(ty);
+                        self.var_go_types.insert(name.name.clone(), go_ty.clone());
+                        self.write(&format!("var {} {} = ", name.name, go_ty));
+                        self.generate_expr(init);
+                        self.write("\n");
+                    } else {
+                        // Use := for variable declaration with initialization (type inferred)
+                        // Also track the inferred Go type for use in for-loop bounds
+                        if let Some(inferred_ty) = self.infer_expr_go_type(init) {
+                            self.var_go_types.insert(name.name.clone(), inferred_ty);
+                        }
+                        self.write_indent();
+                        self.write(&format!("{} := ", name.name));
+                        self.generate_expr(init);
+                        self.write("\n");
+                    }
                 } else if let Some(ty) = ty {
                     // Use var for declaration without initialization
                     self.write_indent();
                     let go_ty = self.go_type(ty);
+                    self.var_go_types.insert(name.name.clone(), go_ty.clone());
                     self.write(&format!("var {} {}\n", name.name, go_ty));
                 } else {
                     // No type, no init - shouldn't happen but handle gracefully
@@ -1134,13 +1327,46 @@ impl GoGenerator {
                     }
                 }
 
+                // In Go, assignment also requires matching types.
+                // Cast the value to the target's type if they differ.
+                let target_ty = self.infer_expr_go_type(target);
+                let value_ty = self.infer_expr_go_type(value);
+                let need_cast = match (&target_ty, &value_ty) {
+                    (Some(t), Some(v)) if t != v && is_go_int_type(t) && is_go_int_type(v) => {
+                        Some(t.clone())
+                    }
+                    _ => None,
+                };
+
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
+                if let Some(ref cast_ty) = need_cast {
+                    self.write(&format!("{}(", cast_ty));
+                }
                 self.generate_expr(value);
+                if need_cast.is_some() {
+                    self.write(")");
+                }
                 self.write("\n");
             }
             StmtKind::CompoundAssign { target, op, value } => {
+                // In Go, compound assignment (e.g. x |= y) requires y to have
+                // the same type as x. Infer both types and cast if needed.
+                let target_ty = self.infer_expr_go_type(target);
+                let value_ty = self.infer_expr_go_type(value);
+                let need_cast = match (&target_ty, &value_ty) {
+                    (Some(t), Some(v))
+                        if t != v
+                            && is_go_int_type(t)
+                            && is_go_int_type(v)
+                            && !matches!(op, BinaryOp::Shl | BinaryOp::Shr) =>
+                    {
+                        Some(t.clone())
+                    }
+                    _ => None,
+                };
+
                 self.write_indent();
                 self.generate_expr(target);
                 let op_str = match op {
@@ -1157,7 +1383,13 @@ impl GoGenerator {
                     _ => " = ",
                 };
                 self.write(op_str);
+                if let Some(ref cast_ty) = need_cast {
+                    self.write(&format!("{}(", cast_ty));
+                }
                 self.generate_expr(value);
+                if need_cast.is_some() {
+                    self.write(")");
+                }
                 self.write("\n");
             }
             StmtKind::If {
@@ -1188,8 +1420,19 @@ impl GoGenerator {
                 body,
             } => {
                 self.write_indent();
+                // Determine if the end expression has a specific Go type.
+                // If so, cast the start to match so the loop variable has the correct type.
+                // This avoids type mismatches between the loop variable (default int from := 0)
+                // and the end expression (which may be uint32, uint64, etc.).
+                let end_go_type = self.infer_expr_go_type(end);
                 self.write(&format!("for {} := ", var.name));
+                if let Some(ref ty) = end_go_type {
+                    self.write(&format!("{}(", ty));
+                }
                 self.generate_expr(start);
+                if end_go_type.is_some() {
+                    self.write(")");
+                }
                 self.write(&format!(
                     "; {} {} ",
                     var.name,
@@ -1197,6 +1440,11 @@ impl GoGenerator {
                 ));
                 self.generate_expr(end);
                 self.write(&format!("; {}++ {{\n", var.name));
+                // Register the loop variable's Go type so expressions
+                // inside the body can use it for type inference/coercion.
+                if let Some(ref ty) = end_go_type {
+                    self.var_go_types.insert(var.name.clone(), ty.clone());
+                }
                 self.indent();
                 self.generate_block(body);
                 self.dedent();
@@ -1288,8 +1536,6 @@ impl GoGenerator {
                     }
                 }
 
-                self.write("(");
-                self.generate_expr(left);
                 let op_str = match op {
                     BinaryOp::Add => " + ",
                     BinaryOp::Sub => " - ",
@@ -1310,9 +1556,59 @@ impl GoGenerator {
                     BinaryOp::And => " && ",
                     BinaryOp::Or => " || ",
                 };
-                self.write(op_str);
-                self.generate_expr(right);
-                self.write(")");
+
+                // For shift operators, Go doesn't require matching types between
+                // left and right operands, so no coercion is needed.
+                // For logical operators (&&, ||), both operands are bool.
+                // For all other operators, Go requires matching integer types.
+                let needs_coercion = !matches!(
+                    op,
+                    BinaryOp::Shl | BinaryOp::Shr | BinaryOp::And | BinaryOp::Or
+                );
+
+                if needs_coercion {
+                    let lt = self.infer_expr_go_type(left);
+                    let rt = self.infer_expr_go_type(right);
+
+                    // Determine if we need to cast one side
+                    let (cast_left, cast_right) = match (&lt, &rt) {
+                        (Some(l), Some(r)) if l != r && is_go_int_type(l) && is_go_int_type(r) => {
+                            let wider = go_wider_type(l, r);
+                            let cl = if *l != wider {
+                                Some(wider.clone())
+                            } else {
+                                None
+                            };
+                            let cr = if *r != wider { Some(wider) } else { None };
+                            (cl, cr)
+                        }
+                        _ => (None, None),
+                    };
+
+                    self.write("(");
+                    if let Some(ref cast_ty) = cast_left {
+                        self.write(&format!("{}(", cast_ty));
+                    }
+                    self.generate_expr(left);
+                    if cast_left.is_some() {
+                        self.write(")");
+                    }
+                    self.write(op_str);
+                    if let Some(ref cast_ty) = cast_right {
+                        self.write(&format!("{}(", cast_ty));
+                    }
+                    self.generate_expr(right);
+                    if cast_right.is_some() {
+                        self.write(")");
+                    }
+                    self.write(")");
+                } else {
+                    self.write("(");
+                    self.generate_expr(left);
+                    self.write(op_str);
+                    self.generate_expr(right);
+                    self.write(")");
+                }
             }
             ExprKind::Unary { op, operand } => {
                 let op_str = match op {
@@ -1383,10 +1679,13 @@ impl GoGenerator {
                 // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
-                        // Convert .len() to len(slice)
-                        self.write("len(");
+                        // Convert .len() to uint64(len(slice))
+                        // In AlgoC, .len() returns u64, but Go's len() returns int.
+                        // Wrap with uint64() to match the source type and avoid
+                        // type mismatches when compared with uint64 fields.
+                        self.write("uint64(len(");
                         self.generate_expr(object);
-                        self.write(")");
+                        self.write("))");
                         return;
                     }
 
@@ -2048,6 +2347,7 @@ impl CodeGenerator for GoGenerator {
         self.struct_defs.clear();
         self.struct_methods.clear();
         self.var_types.clear();
+        self.func_return_types.clear();
         self.needed_imports.clear();
         self.needs_assert = false;
         self.needs_bytes_equal = false;
@@ -2317,4 +2617,39 @@ fn is_byte_value(expr: &Expr) -> bool {
         ExprKind::Paren(inner) => is_byte_value(inner),
         _ => false,
     }
+}
+
+/// Get the numeric rank of a Go integer type (higher = wider).
+/// Returns 0 for non-integer types.
+fn go_int_type_rank(ty: &str) -> u8 {
+    match ty {
+        "uint8" => 1,
+        "uint16" => 2,
+        "uint32" => 3,
+        "int" => 3, // int is same width as uint32 on most platforms, treat as same rank
+        "uint64" => 4,
+        _ => 0,
+    }
+}
+
+/// Determine the wider of two Go integer types for binary expression coercion.
+/// When both are integer types, returns the wider one.
+/// When they are the same, returns that type.
+fn go_wider_type(a: &str, b: &str) -> String {
+    let ra = go_int_type_rank(a);
+    let rb = go_int_type_rank(b);
+    if ra == 0 || rb == 0 {
+        // One is not a recognized integer type; return whichever is known
+        if ra > 0 { a.to_string() } else { b.to_string() }
+    } else if ra >= rb {
+        a.to_string()
+    } else {
+        b.to_string()
+    }
+}
+
+/// Check if a Go type string represents a numeric integer type
+/// that can participate in binary arithmetic/comparison requiring casts.
+fn is_go_int_type(ty: &str) -> bool {
+    go_int_type_rank(ty) > 0
 }

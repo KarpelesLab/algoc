@@ -40,6 +40,9 @@ pub struct PhpGenerator {
     mutref_params: HashMap<String, Vec<bool>>,
 }
 
+/// Prefix for all user-defined function names to avoid collisions with PHP built-ins
+const PHP_FUNC_PREFIX: &str = "algoc_";
+
 impl PhpGenerator {
     pub fn new() -> Self {
         Self {
@@ -57,6 +60,11 @@ impl PhpGenerator {
     pub fn with_tests(mut self, include: bool) -> Self {
         self.include_tests = include;
         self
+    }
+
+    /// Returns the PHP-safe function name by adding the prefix
+    fn php_func_name(name: &str) -> String {
+        format!("{}{}", PHP_FUNC_PREFIX, name)
     }
 
     fn write(&mut self, s: &str) {
@@ -497,7 +505,7 @@ impl PhpGenerator {
     }
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
-        let mangled_name = format!("{}__{}", struct_name, func.name.name);
+        let mangled_name = Self::php_func_name(&format!("{}__{}", struct_name, func.name.name));
 
         // Build parameter list - first param is &self or &mut self
         let mut params = Vec::new();
@@ -526,7 +534,10 @@ impl PhpGenerator {
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
-        self.writeln(&format!("function test_{}() {{", test.name.name));
+        self.writeln(&format!(
+            "function {}test_{}() {{",
+            PHP_FUNC_PREFIX, test.name.name
+        ));
         self.indent();
         self.writeln("global $__test_failures, $__test_name;");
         self.generate_block(&test.body);
@@ -557,7 +568,10 @@ impl PhpGenerator {
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
         // Generate a factory function for the struct
-        self.writeln(&format!("function create_{}() {{", s.name.name));
+        self.writeln(&format!(
+            "function {}create_{}() {{",
+            PHP_FUNC_PREFIX, s.name.name
+        ));
         self.indent();
         self.writeln("return [");
         self.indent();
@@ -574,7 +588,10 @@ impl PhpGenerator {
 
     fn generate_layout(&mut self, l: &crate::parser::LayoutDef) {
         // Layouts are similar to structs
-        self.writeln(&format!("function create_{}() {{", l.name.name));
+        self.writeln(&format!(
+            "function {}create_{}() {{",
+            PHP_FUNC_PREFIX, l.name.name
+        ));
         self.indent();
         self.writeln("return [");
         self.indent();
@@ -593,11 +610,12 @@ impl PhpGenerator {
         // Generate enum variants as factory functions
         // Each variant returns an associative array with 'tag' key
         for variant in &e.variants {
+            let func_name = Self::php_func_name(&format!("{}__{}", e.name.name, variant.name.name));
             match &variant.data {
                 crate::parser::EnumVariantData::Unit => {
                     self.writeln(&format!(
-                        "function {}__{}() {{ return ['tag' => '{}']; }}",
-                        e.name.name, variant.name.name, variant.name.name
+                        "function {}() {{ return ['tag' => '{}']; }}",
+                        func_name, variant.name.name
                     ));
                 }
                 crate::parser::EnumVariantData::Tuple(types) => {
@@ -607,9 +625,8 @@ impl PhpGenerator {
                         .map(|i| format!("'v{}' => $v{}", i, i))
                         .collect();
                     self.writeln(&format!(
-                        "function {}__{}({}) {{ return ['tag' => '{}', {}]; }}",
-                        e.name.name,
-                        variant.name.name,
+                        "function {}({}) {{ return ['tag' => '{}', {}]; }}",
+                        func_name,
                         params.join(", "),
                         variant.name.name,
                         fields.join(", ")
@@ -623,9 +640,8 @@ impl PhpGenerator {
                         .map(|f| format!("'{}' => ${}", f.name.name, f.name.name))
                         .collect();
                     self.writeln(&format!(
-                        "function {}__{}({}) {{ return ['tag' => '{}', {}]; }}",
-                        e.name.name,
-                        variant.name.name,
+                        "function {}({}) {{ return ['tag' => '{}', {}]; }}",
+                        func_name,
                         params.join(", "),
                         variant.name.name,
                         field_entries.join(", ")
@@ -643,7 +659,7 @@ impl PhpGenerator {
                 format!("array_fill(0, {}, 0)", size)
             }
             crate::parser::TypeKind::Named(ident) => {
-                format!("create_{}()", ident.name)
+                format!("{}create_{}()", PHP_FUNC_PREFIX, ident.name)
             }
             _ => "null".to_string(),
         }
@@ -662,10 +678,11 @@ impl PhpGenerator {
             }
             is_mutref.push(is_mut);
         }
-        self.mutref_params.insert(func.name.name.clone(), is_mutref);
+        let php_name = Self::php_func_name(&func.name.name);
+        self.mutref_params.insert(php_name.clone(), is_mutref);
 
         self.write_indent();
-        self.write(&format!("function {}(", func.name.name));
+        self.write(&format!("function {}(", php_name));
         self.write(&params.join(", "));
         self.write(") {\n");
         self.indent();
@@ -971,7 +988,7 @@ impl PhpGenerator {
                         if matches!(op, BinaryOp::Ne) {
                             self.write("!");
                         }
-                        self.write("constant_time_eq(");
+                        self.write(&format!("{}(", Self::php_func_name("constant_time_eq")));
                         self.generate_expr(left);
                         self.write(", ");
                         self.generate_expr(right);
@@ -1198,7 +1215,7 @@ impl PhpGenerator {
                         && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
                         && let Some(mangled_name) = methods.get(&field.name)
                     {
-                        // Generate: StructName__method($object, $args...)
+                        // Generate: algoc_StructName__method($object, $args...)
                         self.write(&format!("{}(", mangled_name));
                         self.generate_expr(object);
                         for arg in args {
@@ -1210,15 +1227,30 @@ impl PhpGenerator {
                     }
                 }
 
-                self.generate_expr(func);
-                self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
+                // For function calls where the callee is an identifier,
+                // emit the function name directly (without $) and with the algoc_ prefix
+                // to avoid collisions with PHP built-in functions.
+                if let ExprKind::Ident(ident) = &func.kind {
+                    let php_name = Self::php_func_name(&ident.name);
+                    self.write(&format!("{}(", php_name));
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expr(arg);
                     }
-                    self.generate_expr(arg);
+                    self.write(")");
+                } else {
+                    self.generate_expr(func);
+                    self.write("(");
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expr(arg);
+                    }
+                    self.write(")");
                 }
-                self.write(")");
             }
             ExprKind::Builtin { name, args } => {
                 self.generate_builtin(*name, args);
@@ -1294,11 +1326,13 @@ impl PhpGenerator {
                 variant_name,
                 args,
             } => {
-                // Generate: EnumName__VariantName() or EnumName__VariantName(args...)
+                // Generate: algoc_EnumName__VariantName() or algoc_EnumName__VariantName(args...)
+                let func_name =
+                    Self::php_func_name(&format!("{}__{}", enum_name.name, variant_name.name));
                 if args.is_empty() {
-                    self.write(&format!("{}__{}()", enum_name.name, variant_name.name));
+                    self.write(&format!("{}()", func_name));
                 } else {
-                    self.write(&format!("{}__{}(", enum_name.name, variant_name.name));
+                    self.write(&format!("{}(", func_name));
                     for (i, arg) in args.iter().enumerate() {
                         if i > 0 {
                             self.write(", ");
@@ -1330,8 +1364,9 @@ impl PhpGenerator {
                 args,
                 ..
             } => {
-                // Generate: mangled_name($receiver, $args...)
-                self.write(&format!("{}(", mangled_name));
+                // Generate: algoc_mangled_name($receiver, $args...)
+                let php_name = Self::php_func_name(mangled_name);
+                self.write(&format!("{}(", php_name));
                 self.generate_expr(receiver);
                 for arg in args {
                     self.write(", ");
@@ -1344,8 +1379,10 @@ impl PhpGenerator {
                 method_name,
                 args,
             } => {
-                // Should be resolved by monomorphization - generate placeholder
-                self.write(&format!("{}__{}", type_name.name, method_name.name));
+                // Should be resolved by monomorphization - generate with prefix
+                let php_name =
+                    Self::php_func_name(&format!("{}__{}", type_name.name, method_name.name));
+                self.write(&php_name);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
@@ -1357,8 +1394,14 @@ impl PhpGenerator {
             }
             ExprKind::GenericCall { func, args, .. } => {
                 // Should be resolved by monomorphization - generate as regular call
-                self.generate_expr(func);
-                self.write("(");
+                // For function identifiers, emit without $ prefix and with algoc_ prefix
+                if let ExprKind::Ident(ident) = &func.kind {
+                    let php_name = Self::php_func_name(&ident.name);
+                    self.write(&format!("{}(", php_name));
+                } else {
+                    self.generate_expr(func);
+                    self.write("(");
+                }
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
@@ -1725,7 +1768,10 @@ impl CodeGenerator for PhpGenerator {
                 ItemKind::Impl(impl_def) => {
                     let mut methods = HashMap::new();
                     for method in &impl_def.methods {
-                        let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
+                        let mangled = Self::php_func_name(&format!(
+                            "{}__{}",
+                            impl_def.target.name, method.name.name
+                        ));
                         methods.insert(method.name.name.clone(), mangled);
                     }
                     self.struct_methods
@@ -1776,7 +1822,7 @@ impl CodeGenerator for PhpGenerator {
                 self.writeln("$__test_failures = 0;");
                 self.writeln("try {");
                 self.indent();
-                self.writeln(&format!("test_{}();", name));
+                self.writeln(&format!("{}test_{}();", PHP_FUNC_PREFIX, name));
                 self.writeln("if ($__test_failures === 0) {");
                 self.indent();
                 self.writeln(&format!("echo \"PASS: {}\\n\";", name));

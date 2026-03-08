@@ -39,6 +39,10 @@ pub struct KotlinGenerator {
     var_types: HashMap<String, String>,
     /// Variable element types for arrays/slices (for correct type conversion on assignment)
     var_elem_types: HashMap<String, PrimitiveType>,
+    /// Variable primitive types (for scalar variables like UByte, UShort, etc.)
+    var_prim_types: HashMap<String, PrimitiveType>,
+    /// Current function return type (for return statement conversion)
+    current_return_type: Option<ParserType>,
 }
 
 impl KotlinGenerator {
@@ -51,6 +55,8 @@ impl KotlinGenerator {
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
             var_elem_types: HashMap::new(),
+            var_prim_types: HashMap::new(),
+            current_return_type: None,
         }
     }
 
@@ -185,7 +191,7 @@ impl KotlinGenerator {
         self.writeln("}");
         self.writeln("");
 
-        // read_bytes
+        // read_bytes (accept both Int and UInt)
         self.writeln("fun read_bytes(count: Int): UByteArray {");
         self.indent();
         self.writeln("if (pos + count > data.size) throw Exception(\"EOF\")");
@@ -194,9 +200,10 @@ impl KotlinGenerator {
         self.writeln("return result");
         self.dedent();
         self.writeln("}");
+        self.writeln("fun read_bytes(count: UInt): UByteArray = read_bytes(count.toInt())");
         self.writeln("");
 
-        // read_chunk
+        // read_chunk (accept both Int and UInt)
         self.writeln("fun read_chunk(maxSize: Int): UByteArray {");
         self.indent();
         self.writeln("val remaining = data.size - pos");
@@ -206,6 +213,7 @@ impl KotlinGenerator {
         self.writeln("return result");
         self.dedent();
         self.writeln("}");
+        self.writeln("fun read_chunk(maxSize: UInt): UByteArray = read_chunk(maxSize.toInt())");
         self.writeln("");
 
         // eof
@@ -383,10 +391,16 @@ impl KotlinGenerator {
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
         let saved_elem_types = self.var_elem_types.clone();
+        let saved_prim_types = self.var_prim_types.clone();
+        let saved_return_type = self.current_return_type.take();
+        self.current_return_type = func.return_type.clone();
         for param in &func.params {
             if let Some(elem_prim) = Self::element_primitive(&param.ty) {
                 self.var_elem_types
                     .insert(param.name.name.clone(), elem_prim);
+            }
+            if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
+                self.var_prim_types.insert(param.name.name.clone(), *p);
             }
         }
 
@@ -409,6 +423,8 @@ impl KotlinGenerator {
         self.writeln("}");
         self.writeln("");
         self.var_elem_types = saved_elem_types;
+        self.var_prim_types = saved_prim_types;
+        self.current_return_type = saved_return_type;
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
@@ -422,8 +438,9 @@ impl KotlinGenerator {
 
     fn generate_const(&mut self, c: &crate::parser::ConstDef) {
         self.write_indent();
-        self.write(&format!("val {} = ", c.name.name));
-        self.generate_expr(&c.value);
+        let ty_str = self.type_to_kotlin(&c.ty);
+        self.write(&format!("val {}: {} = ", c.name.name, ty_str));
+        self.generate_expr_with_type_hint(&c.value, &c.ty);
         self.write("\n\n");
     }
 
@@ -607,15 +624,15 @@ impl KotlinGenerator {
         }
     }
 
-    /// Check if an assignment target is a UByte-typed location that needs .toUByte() conversion
-    fn target_needs_ubyte_conversion(&self, target: &Expr) -> bool {
+    /// Check what conversion suffix an assignment target needs (e.g. ".toUByte()" for UByte locations)
+    fn target_conversion_suffix(&self, target: &Expr) -> Option<&'static str> {
         match &target.kind {
             ExprKind::Index { array, .. } => {
-                // Check if the array element type is UByte
+                // Check if the array element type needs conversion
                 if let ExprKind::Ident(ident) = &array.kind
                     && let Some(elem_prim) = self.var_elem_types.get(&ident.name)
                 {
-                    return matches!(elem_prim.to_native(), PrimitiveType::U8 | PrimitiveType::I8);
+                    return Self::prim_conversion_suffix(elem_prim);
                 }
                 if let ExprKind::Field { object, field } = &array.kind
                     && let ExprKind::Ident(obj_ident) = &object.kind
@@ -626,27 +643,136 @@ impl KotlinGenerator {
                         if f.name == field.name
                             && let Some(elem_prim) = Self::element_primitive(&f.ty)
                         {
-                            return matches!(
-                                elem_prim.to_native(),
-                                PrimitiveType::U8 | PrimitiveType::I8
-                            );
+                            return Self::prim_conversion_suffix(&elem_prim);
                         }
                     }
                 }
-                false
+                None
             }
-            _ => false,
+            ExprKind::Ident(ident) => {
+                // Check if the variable itself is a UByte/UShort scalar
+                self.var_prim_types
+                    .get(&ident.name)
+                    .and_then(|p| Self::prim_conversion_suffix(p))
+            }
+            ExprKind::Field { object, field } => {
+                // Check if the struct field type needs narrowing
+                if let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name
+                            && let crate::parser::TypeKind::Primitive(p) = &f.ty.kind
+                        {
+                            return Self::prim_conversion_suffix(p);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the conversion suffix for a primitive type to ensure type safety.
+    /// Returns a conversion suffix for all unsigned types since Kotlin does
+    /// not support implicit conversions between unsigned types, and our binary
+    /// operations widen all operands to ULong for type safety.
+    fn prim_conversion_suffix(p: &PrimitiveType) -> Option<&'static str> {
+        match p.to_native() {
+            PrimitiveType::U8 | PrimitiveType::I8 => Some(".toUByte()"),
+            PrimitiveType::U16 | PrimitiveType::I16 => Some(".toUShort()"),
+            PrimitiveType::U32 | PrimitiveType::I32 => Some(".toUInt()"),
+            PrimitiveType::U64 | PrimitiveType::I64 | PrimitiveType::U128 | PrimitiveType::I128 => {
+                Some(".toULong()")
+            }
+            _ => None,
+        }
+    }
+
+    /// Infer the primitive type of an expression from its structure.
+    /// Used to track variable types when there's no explicit type annotation.
+    fn infer_expr_primitive(&self, expr: &Expr) -> Option<PrimitiveType> {
+        match &expr.kind {
+            // Array/struct field access: look up the element/field type
+            ExprKind::Index { array, .. } => {
+                if let ExprKind::Ident(ident) = &array.kind {
+                    return self.var_elem_types.get(&ident.name).copied();
+                }
+                if let ExprKind::Field { object, field } = &array.kind
+                    && let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name
+                            && let Some(elem_prim) = Self::element_primitive(&f.ty)
+                        {
+                            return Some(elem_prim);
+                        }
+                    }
+                }
+                None
+            }
+            // Struct field access: look up the field's primitive type
+            ExprKind::Field { object, field } => {
+                if let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name
+                            && let crate::parser::TypeKind::Primitive(p) = &f.ty.kind
+                        {
+                            return Some(*p);
+                        }
+                    }
+                }
+                None
+            }
+            // Identifier: look up its tracked type
+            ExprKind::Ident(ident) => self.var_prim_types.get(&ident.name).copied(),
+            // Cast: use the target type
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    Some(*p)
+                } else {
+                    None
+                }
+            }
+            // Parenthesized: recurse
+            ExprKind::Paren(inner) => self.infer_expr_primitive(inner),
+            // Ref/Deref: recurse
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
+                self.infer_expr_primitive(inner)
+            }
+            _ => None,
         }
     }
 
     fn generate_function(&mut self, func: &Function) {
         // Track parameter element types for correct type conversion
         let saved_elem_types = self.var_elem_types.clone();
+        let saved_prim_types = self.var_prim_types.clone();
+        let saved_var_types = self.var_types.clone();
+        let saved_return_type = self.current_return_type.take();
+        self.current_return_type = func.return_type.clone();
         for param in &func.params {
             if let Some(elem_prim) = Self::element_primitive(&param.ty) {
                 self.var_elem_types
                     .insert(param.name.name.clone(), elem_prim);
             }
+            // Track scalar primitive types for parameters
+            if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
+                self.var_prim_types.insert(param.name.name.clone(), *p);
+            }
+            // Track struct types from Named type parameters
+            Self::track_param_type(
+                &param.ty,
+                &param.name.name,
+                &mut self.var_types,
+            );
         }
 
         self.write_indent();
@@ -672,6 +798,8 @@ impl KotlinGenerator {
         self.writeln("}");
         self.writeln("");
         self.var_elem_types = saved_elem_types;
+        self.var_prim_types = saved_prim_types;
+        self.current_return_type = saved_return_type;
     }
 
     fn generate_block(&mut self, block: &Block) {
@@ -701,6 +829,13 @@ impl KotlinGenerator {
                     && let Some(elem_prim) = Self::element_primitive(ty)
                 {
                     self.var_elem_types.insert(name.name.clone(), elem_prim);
+                }
+
+                // Track scalar primitive types for narrowing conversions on assignment
+                if let Some(ty) = ty
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    self.var_prim_types.insert(name.name.clone(), *p);
                 }
 
                 // Infer element type from ArrayRepeat with cast
@@ -734,6 +869,14 @@ impl KotlinGenerator {
                     }
                 }
 
+                // Infer primitive type from init expression when no type annotation
+                if ty.is_none()
+                    && let Some(init_expr) = init
+                    && let Some(p) = self.infer_expr_primitive(init_expr)
+                {
+                    self.var_prim_types.insert(name.name.clone(), p);
+                }
+
                 self.write_indent();
                 let kw = if *mutable { "var" } else { "val" };
 
@@ -746,7 +889,13 @@ impl KotlinGenerator {
 
                 if let Some(init) = init {
                     self.write(" = ");
-                    self.generate_expr(init);
+                    // If we have a type annotation, wrap the init expression
+                    // with a conversion to ensure type compatibility
+                    if let Some(ty) = ty {
+                        self.generate_expr_with_type_hint(init, ty);
+                    } else {
+                        self.generate_expr(init);
+                    }
                 } else if let Some(ty) = ty {
                     self.write(&format!(" = {}", self.default_value_for_type(ty)));
                 }
@@ -773,16 +922,17 @@ impl KotlinGenerator {
                     }
                 }
 
-                // Check if assigning to an index of a UByteArray - needs .toUByte()
-                let needs_to_ubyte = self.target_needs_ubyte_conversion(target);
+                // Check if assigning to an index that needs type narrowing
+                let conversion = self.target_conversion_suffix(target);
 
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
-                if needs_to_ubyte {
+                if let Some(suffix) = conversion {
                     self.write("(");
                     self.generate_expr(value);
-                    self.write(").toUByte()");
+                    self.write(")");
+                    self.write(suffix);
                 } else {
                     self.generate_expr(value);
                 }
@@ -790,50 +940,42 @@ impl KotlinGenerator {
             }
             StmtKind::CompoundAssign { target, op, value } => {
                 self.write_indent();
-                // Kotlin unsigned types don't support compound assignment with
-                // bitwise ops directly using +=. We have to expand them.
-                match op {
-                    BinaryOp::BitAnd
-                    | BinaryOp::BitOr
-                    | BinaryOp::BitXor
-                    | BinaryOp::Shl
-                    | BinaryOp::Shr => {
-                        // target = target op value
-                        self.generate_expr(target);
-                        self.write(" = ");
-                        self.generate_expr(target);
-                        let op_str = match op {
-                            BinaryOp::BitAnd => " and ",
-                            BinaryOp::BitOr => " or ",
-                            BinaryOp::BitXor => " xor ",
-                            BinaryOp::Shl => " shl ",
-                            BinaryOp::Shr => " shr ",
-                            _ => unreachable!(),
-                        };
-                        self.write(op_str);
-                        // shl/shr need Int operand
-                        if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
-                            self.generate_shift_amount(value);
-                        } else {
-                            self.generate_expr(value);
-                        }
-                        self.write("\n");
-                    }
-                    _ => {
-                        let op_str = match op {
-                            BinaryOp::Add => "+=",
-                            BinaryOp::Sub => "-=",
-                            BinaryOp::Mul => "*=",
-                            BinaryOp::Div => "/=",
-                            BinaryOp::Rem => "%=",
-                            _ => "=",
-                        };
-                        self.generate_expr(target);
-                        self.write(&format!(" {} ", op_str));
-                        self.generate_expr(value);
-                        self.write("\n");
-                    }
+                let conversion = self.target_conversion_suffix(target);
+                // Always expand compound assignments to:
+                //   target = (target.toULong() op value.toULong()).toTargetType()
+                // This handles:
+                // 1. Bitwise ops which don't have compound assignment in Kotlin
+                // 2. Mixed unsigned type arithmetic (ULong += UInt is not valid)
+                // 3. Narrowing types (UByte, UShort) need explicit conversion
+                let op_str = match op {
+                    BinaryOp::BitAnd => " and ",
+                    BinaryOp::BitOr => " or ",
+                    BinaryOp::BitXor => " xor ",
+                    BinaryOp::Shl => " shl ",
+                    BinaryOp::Shr => " shr ",
+                    BinaryOp::Add => " + ",
+                    BinaryOp::Sub => " - ",
+                    BinaryOp::Mul => " * ",
+                    BinaryOp::Div => " / ",
+                    BinaryOp::Rem => " % ",
+                    _ => " + ",
+                };
+                self.generate_expr(target);
+                self.write(" = (");
+                self.generate_expr(target);
+                self.write(".toULong()");
+                self.write(op_str);
+                if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                    self.generate_shift_amount(value);
+                } else {
+                    self.generate_expr(value);
+                    self.write(".toULong()");
                 }
+                self.write(")");
+                // Narrow the ULong result back to the target type.
+                // If conversion is None, the target is UInt (default unsigned type).
+                self.write(conversion.unwrap_or(".toUInt()"));
+                self.write("\n");
             }
             StmtKind::If {
                 condition,
@@ -862,14 +1004,19 @@ impl KotlinGenerator {
                 inclusive,
                 body,
             } => {
+                // Kotlin for-loop variables are Int (since ranges use Int).
+                // Use an internal Int loop variable and create a UInt shadow
+                // so the body can use it in unsigned arithmetic contexts.
                 self.write_indent();
                 let range_op = if *inclusive { ".." } else { " until " };
-                self.write(&format!("for ({} in ", var.name));
+                let int_var = format!("__{}_int", var.name);
+                self.write(&format!("for ({} in ", int_var));
                 self.generate_expr_as_int(start);
                 self.write(range_op);
                 self.generate_expr_as_int(end);
                 self.write(") {\n");
                 self.indent();
+                self.writeln(&format!("val {} = {}.toUInt()", var.name, int_var));
                 self.generate_block(body);
                 self.dedent();
                 self.writeln("}");
@@ -902,7 +1049,11 @@ impl KotlinGenerator {
                 self.write("return");
                 if let Some(expr) = expr {
                     self.write(" ");
-                    self.generate_expr(expr);
+                    if let Some(ret_ty) = &self.current_return_type.clone() {
+                        self.generate_expr_with_type_hint(expr, ret_ty);
+                    } else {
+                        self.generate_expr(expr);
+                    }
                 }
                 self.write("\n");
             }
@@ -927,6 +1078,195 @@ impl KotlinGenerator {
         self.write("(");
         self.generate_expr(expr);
         self.write(").toInt()");
+    }
+
+    /// Generate an expression with a type hint, adding conversion if needed.
+    /// This handles cases like `val x: ULong = 0u` -> `val x: ULong = 0uL`
+    /// and `val x: UByteArray = uintArrayOf(...)` -> correct array type.
+    fn generate_expr_with_type_hint(&mut self, expr: &Expr, ty: &ParserType) {
+        use crate::parser::TypeKind;
+
+        let kt_type = self.type_to_kotlin(ty);
+
+        // For integer literals, generate with the correct suffix for the target type
+        if let ExprKind::Integer(n) = &expr.kind {
+            match kt_type.as_str() {
+                "UByte" => {
+                    self.write(&format!("{}u.toUByte()", n));
+                    return;
+                }
+                "UShort" => {
+                    self.write(&format!("{}u.toUShort()", n));
+                    return;
+                }
+                "ULong" => {
+                    self.write(&format!("{}uL", n));
+                    return;
+                }
+                _ => {
+                    // UInt or other - default works fine
+                    self.generate_expr(expr);
+                    return;
+                }
+            }
+        }
+
+        // For ArrayRepeat, respect the target array type
+        if let ExprKind::ArrayRepeat { value, count } = &expr.kind {
+            match kt_type.as_str() {
+                s if s.starts_with("UByteArray") => {
+                    self.write("UByteArray(");
+                    self.generate_expr_as_int(count);
+                    self.write(") { ");
+                    self.generate_expr(value);
+                    self.write(".toUByte() }");
+                    return;
+                }
+                s if s.starts_with("UShortArray") => {
+                    self.write("UShortArray(");
+                    self.generate_expr_as_int(count);
+                    self.write(") { ");
+                    self.generate_expr(value);
+                    self.write(".toUShort() }");
+                    return;
+                }
+                s if s.starts_with("UIntArray") => {
+                    self.write("UIntArray(");
+                    self.generate_expr_as_int(count);
+                    self.write(") { ");
+                    self.generate_expr(value);
+                    self.write(".toUInt() }");
+                    return;
+                }
+                s if s.starts_with("ULongArray") => {
+                    self.write("ULongArray(");
+                    self.generate_expr_as_int(count);
+                    self.write(") { ");
+                    self.generate_expr(value);
+                    self.write(".toULong() }");
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // For Array literal expressions, generate with the correct array type
+        if let ExprKind::Array(elements) = &expr.kind
+            && let TypeKind::Array { element, .. }
+            | TypeKind::Slice { element }
+            | TypeKind::ArrayRef { element, .. } = &ty.kind
+        {
+            let elem_kt = self.type_to_kotlin(element);
+            let (array_of, elem_suffix) = match elem_kt.as_str() {
+                "UByte" => ("ubyteArrayOf", Some(".toUByte()")),
+                "UShort" => ("ushortArrayOf", Some(".toUShort()")),
+                "UInt" => ("uintArrayOf", None),
+                "ULong" => ("ulongArrayOf", Some(".toULong()")),
+                _ => ("arrayOf", None),
+            };
+            self.write(array_of);
+            self.write("(");
+            for (i, elem) in elements.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                if let Some(suffix) = elem_suffix {
+                    if let ExprKind::Integer(n) = &elem.kind {
+                        // For integer literals going to UByte/UShort, use conversion
+                        self.write(&format!("{}u{}", n, suffix));
+                    } else {
+                        self.write("(");
+                        self.generate_expr(elem);
+                        self.write(")");
+                        self.write(suffix);
+                    }
+                } else {
+                    self.generate_expr(elem);
+                }
+            }
+            self.write(")");
+            return;
+        }
+
+        // For array types, check if we need to convert the result
+        if let TypeKind::Array { element, .. }
+        | TypeKind::Slice { element }
+        | TypeKind::ArrayRef { element, .. } = &ty.kind
+        {
+            let elem_kt = self.type_to_kotlin(element);
+            // Generate the expression normally, then check if we might need conversion
+            // For calls that return a different array type (e.g., read_bytes returns UByteArray
+            // but target is UIntArray), we may need conversion
+            match elem_kt.as_str() {
+                "UInt" => {
+                    // If the expr might produce UByteArray, add conversion
+                    if Self::might_produce_ubyte_array(expr) {
+                        self.write("(");
+                        self.generate_expr(expr);
+                        self.write(").toUIntArray()");
+                        return;
+                    }
+                }
+                "UByte" => {
+                    if Self::might_produce_uint_array(expr) {
+                        self.write("(");
+                        self.generate_expr(expr);
+                        self.write(").toUByteArray()");
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // For primitive types, wrap the expression with type conversion to handle
+        // cases where binary operations widen to ULong but the target is narrower
+        if let TypeKind::Primitive(p) = &ty.kind
+            && let Some(suffix) = Self::prim_conversion_suffix(p)
+        {
+            self.write("(");
+            self.generate_expr(expr);
+            self.write(")");
+            self.write(suffix);
+            return;
+        }
+
+        // Default: just generate the expression normally
+        self.generate_expr(expr);
+    }
+
+    /// Check if an expression might produce a UByteArray (for type conversion detection)
+    fn might_produce_ubyte_array(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Hex(_) | ExprKind::Bytes(_) | ExprKind::String(_) => true,
+            ExprKind::ArrayRepeat { value, .. } => is_byte_value(value),
+            ExprKind::Array(elements) => elements.iter().all(|e| {
+                if let ExprKind::Integer(n) = &e.kind {
+                    *n <= 255
+                } else {
+                    false
+                }
+            }),
+            _ => false,
+        }
+    }
+
+    /// Check if an expression might produce a UIntArray
+    fn might_produce_uint_array(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::ArrayRepeat { value, .. } => !is_byte_value(value),
+            ExprKind::Array(elements) => {
+                !elements.is_empty()
+                    && !elements.iter().all(|e| {
+                        if let ExprKind::Integer(n) = &e.kind {
+                            *n <= 255
+                        } else {
+                            false
+                        }
+                    })
+            }
+            _ => false,
+        }
     }
 
     /// Generate a shift amount expression. Kotlin requires shift amount to be Int.
@@ -980,7 +1320,7 @@ impl KotlinGenerator {
                         .chunks(2)
                         .map(|chunk| {
                             let s = std::str::from_utf8(chunk).unwrap_or("00");
-                            format!("0x{}u", s)
+                            format!("0x{}.toUByte()", s)
                         })
                         .collect();
                     self.write(&bytes.join(", "));
@@ -1009,32 +1349,31 @@ impl KotlinGenerator {
                     }
                 }
 
-                // Kotlin uses infix functions for bitwise operations on unsigned types
+                // Kotlin uses infix functions for bitwise operations on unsigned types.
+                // Kotlin unsigned types do not support implicit widening/narrowing,
+                // so we widen both operands to ULong for arithmetic and bitwise ops
+                // to ensure type compatibility. The result is narrowed back at the
+                // assignment site via prim_conversion_suffix.
                 match op {
-                    BinaryOp::BitAnd => {
+                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                        let op_str = match op {
+                            BinaryOp::BitAnd => " and ",
+                            BinaryOp::BitOr => " or ",
+                            BinaryOp::BitXor => " xor ",
+                            _ => unreachable!(),
+                        };
                         self.write("(");
                         self.generate_expr(left);
-                        self.write(" and ");
+                        self.write(".toULong()");
+                        self.write(op_str);
                         self.generate_expr(right);
-                        self.write(")");
-                    }
-                    BinaryOp::BitOr => {
-                        self.write("(");
-                        self.generate_expr(left);
-                        self.write(" or ");
-                        self.generate_expr(right);
-                        self.write(")");
-                    }
-                    BinaryOp::BitXor => {
-                        self.write("(");
-                        self.generate_expr(left);
-                        self.write(" xor ");
-                        self.generate_expr(right);
+                        self.write(".toULong()");
                         self.write(")");
                     }
                     BinaryOp::Shl => {
                         self.write("(");
                         self.generate_expr(left);
+                        self.write(".toULong()");
                         self.write(" shl ");
                         self.generate_shift_amount(right);
                         self.write(")");
@@ -1042,6 +1381,7 @@ impl KotlinGenerator {
                     BinaryOp::Shr => {
                         self.write("(");
                         self.generate_expr(left);
+                        self.write(".toULong()");
                         self.write(" shr ");
                         self.generate_shift_amount(right);
                         self.write(")");
@@ -1092,6 +1432,8 @@ impl KotlinGenerator {
                         self.write(")");
                     }
                     _ => {
+                        // Arithmetic: Add, Sub, Mul, Div, Rem
+                        // Widen both operands to ULong for type safety
                         let op_str = match op {
                             BinaryOp::Add => " + ",
                             BinaryOp::Sub => " - ",
@@ -1102,8 +1444,10 @@ impl KotlinGenerator {
                         };
                         self.write("(");
                         self.generate_expr(left);
+                        self.write(".toULong()");
                         self.write(op_str);
                         self.generate_expr(right);
+                        self.write(".toULong()");
                         self.write(")");
                     }
                 }
@@ -1174,9 +1518,11 @@ impl KotlinGenerator {
                 // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
-                        // Convert .len() to .size
+                        // Convert .len() to .size.toUInt() since AlgoC len()
+                        // returns an unsigned integer, and UInt is the most
+                        // common unsigned type used in operations.
                         self.generate_expr(object);
-                        self.write(".size");
+                        self.write(".size.toUInt()");
                         return;
                     }
 
@@ -1315,22 +1661,32 @@ impl KotlinGenerator {
                             false
                         }
                     });
-                    let all_ints = elements
-                        .iter()
-                        .all(|e| matches!(e.kind, ExprKind::Integer(_)));
 
                     if all_bytes {
                         self.write("ubyteArrayOf(");
-                    } else if all_ints {
-                        self.write("uintArrayOf(");
-                    } else {
-                        self.write("arrayOf(");
-                    }
-                    for (i, elem) in elements.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
+                        for (i, elem) in elements.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            // ubyteArrayOf needs UByte arguments
+                            if let ExprKind::Integer(n) = &elem.kind {
+                                self.write(&format!("{}u.toUByte()", n));
+                            } else {
+                                self.write("(");
+                                self.generate_expr(elem);
+                                self.write(").toUByte()");
+                            }
                         }
-                        self.generate_expr(elem);
+                    } else {
+                        // Use uintArrayOf for all other cases - Kotlin needs
+                        // specialized array types, not Array<UInt>
+                        self.write("uintArrayOf(");
+                        for (i, elem) in elements.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_expr(elem);
+                        }
                     }
                     self.write(")");
                 }
@@ -2081,6 +2437,8 @@ impl CodeGenerator for KotlinGenerator {
         self.struct_methods.clear();
         self.var_types.clear();
         self.var_elem_types.clear();
+        self.var_prim_types.clear();
+        self.current_return_type = None;
 
         // Pre-pass: collect struct field info and methods
         for item in &ast.ast.items {

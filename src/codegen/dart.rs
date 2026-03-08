@@ -8,8 +8,8 @@ use super::CodeGenerator;
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
-    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
-    Type as ParserType, UnaryOp,
+    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, PrimitiveType,
+    Stmt, StmtKind, Type as ParserType, TypeKind, UnaryOp,
 };
 use std::collections::HashMap;
 
@@ -37,6 +37,8 @@ pub struct DartGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Current struct name for resolving SelfType (set during method/function generation)
+    current_struct_name: Option<String>,
 }
 
 impl DartGenerator {
@@ -48,6 +50,7 @@ impl DartGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            current_struct_name: None,
         }
     }
 
@@ -346,6 +349,7 @@ impl DartGenerator {
     }
 
     fn generate_method(&mut self, struct_name: &str, func: &crate::parser::Function) {
+        self.current_struct_name = Some(struct_name.to_string());
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
         let return_type = self.dart_return_type(func.return_type.as_ref());
 
@@ -364,6 +368,7 @@ impl DartGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.current_struct_name = None;
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
@@ -510,12 +515,18 @@ impl DartGenerator {
                     PrimitiveType::U32 | PrimitiveType::U32Be | PrimitiveType::U32Le => {
                         format!("Uint32List /* {} */", size)
                     }
+                    PrimitiveType::U64 | PrimitiveType::U64Be | PrimitiveType::U64Le => {
+                        format!("Uint64List /* {} */", size)
+                    }
                     PrimitiveType::I8 => format!("Int8List /* {} */", size),
                     PrimitiveType::I16 | PrimitiveType::I16Be | PrimitiveType::I16Le => {
                         format!("Int16List /* {} */", size)
                     }
                     PrimitiveType::I32 | PrimitiveType::I32Be | PrimitiveType::I32Le => {
                         format!("Int32List /* {} */", size)
+                    }
+                    PrimitiveType::I64 | PrimitiveType::I64Be | PrimitiveType::I64Le => {
+                        format!("Int64List /* {} */", size)
                     }
                     _ => format!("List<int> /* {} */", size),
                 },
@@ -525,14 +536,50 @@ impl DartGenerator {
                 match &element.kind {
                     TypeKind::Primitive(p) => match p {
                         PrimitiveType::U8 => "Uint8List".to_string(),
+                        PrimitiveType::U16 | PrimitiveType::U16Be | PrimitiveType::U16Le => {
+                            "Uint16List".to_string()
+                        }
+                        PrimitiveType::U32 | PrimitiveType::U32Be | PrimitiveType::U32Le => {
+                            "Uint32List".to_string()
+                        }
+                        PrimitiveType::I8 => "Int8List".to_string(),
+                        PrimitiveType::I16 | PrimitiveType::I16Be | PrimitiveType::I16Le => {
+                            "Int16List".to_string()
+                        }
+                        PrimitiveType::I32 | PrimitiveType::I32Be | PrimitiveType::I32Le => {
+                            "Int32List".to_string()
+                        }
+                        PrimitiveType::U64 | PrimitiveType::U64Be | PrimitiveType::U64Le => {
+                            "Uint64List".to_string()
+                        }
+                        PrimitiveType::I64 | PrimitiveType::I64Be | PrimitiveType::I64Le => {
+                            "Int64List".to_string()
+                        }
                         _ => "List<int>".to_string(),
                     },
                     _ => "List<dynamic>".to_string(),
                 }
             }
             TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.dart_type(inner),
-            TypeKind::Named(ident) => ident.name.clone(),
-            TypeKind::SelfType => "dynamic".to_string(),
+            TypeKind::Named(ident) => {
+                if ident.name == "Self" {
+                    // Named("Self") should resolve like SelfType
+                    if let Some(ref name) = self.current_struct_name {
+                        name.clone()
+                    } else {
+                        "dynamic".to_string()
+                    }
+                } else {
+                    ident.name.clone()
+                }
+            }
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_struct_name {
+                    name.clone()
+                } else {
+                    "dynamic".to_string()
+                }
+            }
         }
     }
 
@@ -564,12 +611,18 @@ impl DartGenerator {
                     PrimitiveType::U32 | PrimitiveType::U32Be | PrimitiveType::U32Le => {
                         format!("Uint32List({})", size)
                     }
+                    PrimitiveType::U64 | PrimitiveType::U64Be | PrimitiveType::U64Le => {
+                        format!("Uint64List({})", size)
+                    }
                     PrimitiveType::I8 => format!("Int8List({})", size),
                     PrimitiveType::I16 | PrimitiveType::I16Be | PrimitiveType::I16Le => {
                         format!("Int16List({})", size)
                     }
                     PrimitiveType::I32 | PrimitiveType::I32Be | PrimitiveType::I32Le => {
                         format!("Int32List({})", size)
+                    }
+                    PrimitiveType::I64 | PrimitiveType::I64Be | PrimitiveType::I64Le => {
+                        format!("Int64List({})", size)
                     }
                     _ => format!("List<int>.filled({}, 0)", size),
                 },
@@ -579,6 +632,25 @@ impl DartGenerator {
                 match &element.kind {
                     TypeKind::Primitive(p) => match p {
                         PrimitiveType::U8 => "Uint8List(0)".to_string(),
+                        PrimitiveType::U16 | PrimitiveType::U16Be | PrimitiveType::U16Le => {
+                            "Uint16List(0)".to_string()
+                        }
+                        PrimitiveType::U32 | PrimitiveType::U32Be | PrimitiveType::U32Le => {
+                            "Uint32List(0)".to_string()
+                        }
+                        PrimitiveType::I8 => "Int8List(0)".to_string(),
+                        PrimitiveType::I16 | PrimitiveType::I16Be | PrimitiveType::I16Le => {
+                            "Int16List(0)".to_string()
+                        }
+                        PrimitiveType::I32 | PrimitiveType::I32Be | PrimitiveType::I32Le => {
+                            "Int32List(0)".to_string()
+                        }
+                        PrimitiveType::U64 | PrimitiveType::U64Be | PrimitiveType::U64Le => {
+                            "Uint64List(0)".to_string()
+                        }
+                        PrimitiveType::I64 | PrimitiveType::I64Be | PrimitiveType::I64Le => {
+                            "Int64List(0)".to_string()
+                        }
                         _ => "<int>[]".to_string(),
                     },
                     _ => "<dynamic>[]".to_string(),
@@ -586,13 +658,32 @@ impl DartGenerator {
             }
             TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.default_value_for_type(inner),
             TypeKind::Named(ident) => {
-                format!("create_{}()", ident.name)
+                // Handle Named("Self") by resolving to the current struct name
+                if ident.name == "Self" {
+                    if let Some(ref name) = self.current_struct_name {
+                        format!("create_{}()", name)
+                    } else {
+                        "0".to_string()
+                    }
+                } else {
+                    format!("create_{}()", ident.name)
+                }
             }
-            _ => "0".to_string(),
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_struct_name {
+                    format!("create_{}()", name)
+                } else {
+                    "0".to_string()
+                }
+            }
         }
     }
 
     fn generate_function(&mut self, func: &Function) {
+        // Detect if this function was monomorphized from a method/generic
+        // If the function name contains "__", the prefix is the struct name
+        self.current_struct_name = Self::infer_self_type_name(&func.name.name, func);
+
         let return_type = self.dart_return_type(func.return_type.as_ref());
 
         self.write_indent();
@@ -615,6 +706,7 @@ impl DartGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.current_struct_name = None;
     }
 
     fn generate_block(&mut self, block: &Block) {
@@ -659,7 +751,13 @@ impl DartGenerator {
                 self.write_indent();
                 self.write(&format!("var {} = ", name.name));
                 if let Some(init) = init {
-                    self.generate_expr(init);
+                    // When we have a type annotation and the init is an array literal,
+                    // pass the type context so the correct typed list constructor is used
+                    if let ExprKind::Array(elements) = &init.kind {
+                        self.generate_array_expr(elements, ty.as_ref());
+                    } else {
+                        self.generate_expr(init);
+                    }
                 } else if let Some(ty) = ty {
                     self.write(&self.default_value_for_type(ty));
                 } else {
@@ -930,11 +1028,10 @@ impl DartGenerator {
             ExprKind::Slice {
                 array, start, end, ..
             } => {
-                // Dart: Use Uint8List.sublistView for typed data, .sublist for general
-                // We'll use sublistView for maximum compatibility with typed arrays
-                self.write("Uint8List.sublistView(");
+                // Use .sublist(start, end) which preserves the typed list type
+                // (e.g., Uint8List.sublist returns Uint8List, Uint32List.sublist returns Uint32List)
                 self.generate_expr(array);
-                self.write(", ");
+                self.write(".sublist(");
                 self.generate_expr(start);
                 self.write(", ");
                 self.generate_expr(end);
@@ -1094,68 +1191,25 @@ impl DartGenerator {
                 self.generate_builtin(*name, args);
             }
             ExprKind::Array(elements) => {
-                if elements.is_empty() {
-                    self.write("Uint8List(0)");
-                } else {
-                    // Check if all elements are small integers (bytes)
-                    let all_bytes = elements.iter().all(|e| {
-                        if let ExprKind::Integer(n) = &e.kind {
-                            *n <= 255
-                        } else {
-                            false
-                        }
-                    });
-                    let all_ints = elements
-                        .iter()
-                        .all(|e| matches!(e.kind, ExprKind::Integer(_)));
-
-                    if all_bytes {
-                        self.write("Uint8List.fromList([");
-                    } else if all_ints {
-                        self.write("Uint32List.fromList([");
-                    } else {
-                        self.write("[");
-                    }
-                    for (i, elem) in elements.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
-                        }
-                        self.generate_expr(elem);
-                    }
-                    if all_bytes || all_ints {
-                        self.write("])");
-                    } else {
-                        self.write("]");
-                    }
-                }
+                self.generate_array_expr(elements, None);
             }
             ExprKind::ArrayRepeat { value, count } => {
-                let is_byte = is_byte_value(value);
+                // Determine the appropriate typed list from the value's type
+                let typed_list = typed_list_for_value(value);
 
-                if is_byte {
-                    // Uint8List filled with value
-                    self.write("Uint8List(");
-                    self.generate_expr(count);
-                    self.write(")");
-                    // Only add .fill if value is nonzero
-                    if let ExprKind::Integer(n) = &value.kind {
-                        if *n != 0 {
-                            self.write("..fillRange(0, ");
-                            self.generate_expr(count);
-                            self.write(", ");
-                            self.generate_expr(value);
-                            self.write(")");
-                        }
-                        // else: Uint8List is already zero-initialized
-                    } else {
-                        self.write("..fillRange(0, ");
-                        self.generate_expr(count);
-                        self.write(", ");
-                        self.generate_expr(value);
-                        self.write(")");
-                    }
-                } else {
-                    self.write("List<int>.filled(");
+                // All typed lists are zero-initialized, so we can just use the constructor
+                self.write(&format!("{}(", typed_list));
+                self.generate_expr(count);
+                self.write(")");
+
+                // Check if we need to fill with a non-zero value
+                let is_zero = matches!(&value.kind, ExprKind::Integer(0));
+                let is_cast_zero = matches!(
+                    &value.kind,
+                    ExprKind::Cast { expr, .. } if matches!(&expr.kind, ExprKind::Integer(0))
+                );
+                if !is_zero && !is_cast_zero {
+                    self.write("..fillRange(0, ");
                     self.generate_expr(count);
                     self.write(", ");
                     self.generate_expr(value);
@@ -1409,6 +1463,91 @@ impl DartGenerator {
         }
     }
 
+    /// Get the appropriate Dart typed list constructor name for a parser type.
+    /// Returns e.g. "Uint32List" for an array/slice of u32, or None for non-typed-list types.
+    fn typed_list_name_for_type(ty: &crate::parser::Type) -> Option<&'static str> {
+        use crate::parser::TypeKind;
+        let element = match &ty.kind {
+            TypeKind::Array { element, .. }
+            | TypeKind::Slice { element }
+            | TypeKind::ArrayRef { element, .. } => element,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                return Self::typed_list_name_for_type(inner);
+            }
+            _ => return None,
+        };
+        match &element.kind {
+            TypeKind::Primitive(p) => match p {
+                PrimitiveType::U8 => Some("Uint8List"),
+                PrimitiveType::U16 | PrimitiveType::U16Be | PrimitiveType::U16Le => {
+                    Some("Uint16List")
+                }
+                PrimitiveType::U32 | PrimitiveType::U32Be | PrimitiveType::U32Le => {
+                    Some("Uint32List")
+                }
+                PrimitiveType::I8 => Some("Int8List"),
+                PrimitiveType::I16 | PrimitiveType::I16Be | PrimitiveType::I16Le => {
+                    Some("Int16List")
+                }
+                PrimitiveType::I32 | PrimitiveType::I32Be | PrimitiveType::I32Le => {
+                    Some("Int32List")
+                }
+                PrimitiveType::U64 | PrimitiveType::U64Be | PrimitiveType::U64Le => {
+                    Some("Uint64List")
+                }
+                PrimitiveType::I64 | PrimitiveType::I64Be | PrimitiveType::I64Le => {
+                    Some("Int64List")
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Generate an array expression, optionally with a target type hint.
+    /// When target_type is provided, uses the appropriate typed list constructor.
+    /// When not provided, infers from element values.
+    fn generate_array_expr(
+        &mut self,
+        elements: &[Expr],
+        target_type: Option<&crate::parser::Type>,
+    ) {
+        if elements.is_empty() {
+            if let Some(ty) = target_type {
+                if let Some(list_name) = Self::typed_list_name_for_type(ty) {
+                    self.write(&format!("{}(0)", list_name));
+                } else {
+                    self.write("Uint8List(0)");
+                }
+            } else {
+                self.write("Uint8List(0)");
+            }
+            return;
+        }
+
+        // Determine the constructor to use
+        let constructor: &str = if let Some(ty) = target_type {
+            // Use the target type to determine the correct typed list constructor
+            if let Some(name) = Self::typed_list_name_for_type(ty) {
+                name
+            } else {
+                typed_list_for_value(&elements[0])
+            }
+        } else {
+            // Infer from element values
+            typed_list_for_value(&elements[0])
+        };
+
+        self.write(&format!("{}.fromList([", constructor));
+        for (i, elem) in elements.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            self.generate_expr(elem);
+        }
+        self.write("])");
+    }
+
     fn generate_builtin(&mut self, name: BuiltinFunc, args: &[Expr]) {
         match name {
             BuiltinFunc::Assert => {
@@ -1619,6 +1758,33 @@ impl DartGenerator {
         // Default to little endian, 32 bits
         (true, 32)
     }
+
+    /// Infer the concrete type name that should replace `Self` in a function.
+    /// For functions with names like "StructName__method", the prefix is the struct name.
+    /// Always extracts from the mangled name if present, since monomorphization may
+    /// have already resolved some SelfType references while leaving others.
+    fn infer_self_type_name(func_name: &str, _func: &Function) -> Option<String> {
+        // Extract struct name from mangled function name (e.g., "Sha256State__update")
+        if let Some(idx) = func_name.find("__") {
+            return Some(func_name[..idx].to_string());
+        }
+
+        None
+    }
+
+    /// Check if a type contains SelfType anywhere (either TypeKind::SelfType or Named("Self"))
+    #[allow(dead_code)]
+    fn type_contains_self(ty: &crate::parser::Type) -> bool {
+        match &ty.kind {
+            TypeKind::SelfType => true,
+            TypeKind::Named(ident) if ident.name == "Self" => true,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => Self::type_contains_self(inner),
+            TypeKind::Array { element, .. }
+            | TypeKind::Slice { element }
+            | TypeKind::ArrayRef { element, .. } => Self::type_contains_self(element),
+            _ => false,
+        }
+    }
 }
 
 /// Check if an expression is likely an array type (used for comparison)
@@ -1656,21 +1822,38 @@ fn is_byte_sequence_expr(expr: &Expr) -> bool {
     }
 }
 
-/// Check if an expression produces a byte value (u8)
-fn is_byte_value(expr: &Expr) -> bool {
-    use crate::parser::{PrimitiveType, TypeKind};
-
-    match &expr.kind {
-        ExprKind::Integer(n) => *n <= 255,
+/// Determine the appropriate Dart typed list constructor name from a value expression.
+/// For example, a value cast to u32 means we need a Uint32List.
+fn typed_list_for_value(value: &Expr) -> &'static str {
+    match &value.kind {
         ExprKind::Cast { ty, .. } => {
             if let TypeKind::Primitive(p) = &ty.kind {
-                matches!(p.to_native(), PrimitiveType::U8)
+                match p.to_native() {
+                    PrimitiveType::U8 => "Uint8List",
+                    PrimitiveType::U16 => "Uint16List",
+                    PrimitiveType::U32 => "Uint32List",
+                    PrimitiveType::U64 => "Uint64List",
+                    PrimitiveType::I8 => "Int8List",
+                    PrimitiveType::I16 => "Int16List",
+                    PrimitiveType::I32 => "Int32List",
+                    PrimitiveType::I64 => "Int64List",
+                    _ => "Uint8List",
+                }
             } else {
-                false
+                "Uint8List"
             }
         }
-        ExprKind::Paren(inner) => is_byte_value(inner),
-        _ => false,
+        ExprKind::Integer(n) => {
+            if *n <= 255 {
+                "Uint8List"
+            } else if *n <= 0xFFFF_FFFF {
+                "Uint32List"
+            } else {
+                "Uint64List"
+            }
+        }
+        ExprKind::Paren(inner) => typed_list_for_value(inner),
+        _ => "Uint8List",
     }
 }
 

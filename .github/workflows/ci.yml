@@ -444,14 +444,13 @@ jobs:
 
       - name: Run stdlib tests
         run: |
-          shopt -s globstar
           failed=0
-          for file in stdlib/**/*.algoc; do
+          while IFS= read -r file; do
             echo "Testing: $file"
             if ! ./target/release/algoc test "$file" -t objc; then
               failed=1
             fi
-          done
+          done < <(find stdlib -name '*.algoc' -type f)
           exit $failed
 
   test-vhdl:
