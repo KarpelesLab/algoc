@@ -267,14 +267,23 @@ impl ObjCGenerator {
         Self::get_array_size(&field_info.ty)
     }
 
-    /// Generate a parameter declaration with companion _len for slices
+    /// Generate a parameter declaration with companion _len for slices.
+    /// If the parameter name conflicts with an auto-generated `_len` companion
+    /// (recorded in `var_renames`), the renamed version is emitted.
     fn generate_param_decl(&mut self, param: &crate::parser::Param) {
         use crate::parser::TypeKind;
+
+        // Use the renamed name if this param conflicts with a generated _len companion
+        let effective_name = self
+            .var_renames
+            .get(&param.name.name)
+            .cloned()
+            .unwrap_or_else(|| param.name.name.clone());
 
         match &param.ty.kind {
             TypeKind::Array { .. } => {
                 let base = self.type_to_c_base(&param.ty);
-                self.write(&format!("{}* {}", base, param.name.name));
+                self.write(&format!("{}* {}", base, effective_name));
             }
             TypeKind::Slice { element } => {
                 let elem_ty = self.type_to_c(element);
@@ -323,16 +332,19 @@ impl ObjCGenerator {
                 }
             },
             TypeKind::Named(ident) => {
-                self.write(&format!("struct {} {}", ident.name, param.name.name));
+                self.write(&format!("struct {} {}", ident.name, effective_name));
             }
             _ => {
                 let ty_str = self.type_to_c(&param.ty);
-                self.write(&format!("{} {}", ty_str, param.name.name));
+                self.write(&format!("{} {}", ty_str, effective_name));
             }
         }
     }
 
-    /// Populate pointer_vars, slice_vars, fixed_array_vars, and len_param_names from function parameters
+    /// Populate pointer_vars, slice_vars, fixed_array_vars, and len_param_names from function parameters.
+    /// Also detects when an explicit parameter name conflicts with an auto-generated `_len`
+    /// companion (e.g. param `data: &[u8]` generates `data_len`, conflicting with an explicit
+    /// `data_len: u64` parameter) and records a rename in `var_renames`.
     fn collect_pointer_params(&mut self, func: &Function) {
         self.pointer_vars.clear();
         self.slice_vars.clear();
@@ -350,6 +362,14 @@ impl ObjCGenerator {
             }
             if let Some(size) = Self::get_fixed_array_param_size(&param.ty) {
                 self.fixed_array_vars.insert(param.name.name.clone(), size);
+            }
+        }
+        // Detect explicit parameters whose names conflict with auto-generated _len companions
+        for param in &func.params {
+            if !Self::param_needs_len(&param.ty) && self.len_param_names.contains(&param.name.name)
+            {
+                let renamed = format!("_local_{}", param.name.name);
+                self.var_renames.insert(param.name.name.clone(), renamed);
             }
         }
     }
@@ -850,6 +870,9 @@ impl ObjCGenerator {
 
     /// Generate a forward declaration for a function or method
     fn generate_forward_decl(&mut self, func: &Function, struct_name: Option<&str>) {
+        // Pre-scan params to detect _len conflicts before generating the signature
+        self.collect_pointer_params(func);
+
         let func_name = if let Some(sn) = struct_name {
             format!("{}__{}", sn, func.name.name)
         } else {
@@ -905,6 +928,8 @@ impl ObjCGenerator {
 
     fn generate_function(&mut self, func: &Function) {
         self.var_types.clear();
+        // Pre-scan params to detect _len conflicts before generating the signature
+        self.collect_pointer_params(func);
 
         // Return type
         let ret_type = if let Some(ref rt) = func.return_type {
@@ -944,7 +969,6 @@ impl ObjCGenerator {
 
         self.write(") {\n");
         self.indent();
-        self.collect_pointer_params(func);
         self.generate_block(&func.body);
         self.dedent();
         self.writeln("}");
@@ -953,6 +977,10 @@ impl ObjCGenerator {
 
     fn generate_method(&mut self, struct_name: &str, func: &crate::parser::Function) {
         self.var_types.clear();
+        // Pre-scan params to detect _len conflicts before generating the signature
+        self.collect_pointer_params(func);
+        // 'self' is always a pointer in methods
+        self.pointer_vars.insert("self".to_string());
 
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
 
@@ -1006,9 +1034,6 @@ impl ObjCGenerator {
 
         self.write(") {\n");
         self.indent();
-        self.collect_pointer_params(func);
-        // 'self' is always a pointer in methods
-        self.pointer_vars.insert("self".to_string());
         self.generate_block(&func.body);
         self.dedent();
         self.writeln("}");
@@ -1717,26 +1742,55 @@ impl ObjCGenerator {
             },
             None => {
                 if let Some(init) = init {
-                    let inferred_type = self.infer_expr_c_type(init);
-                    self.write_indent();
-                    self.write(&format!("{} {} = ", inferred_type, name_str));
-                    self.generate_expr(init);
-                    self.write(";\n");
-                    // Track fixed arrays from Hex/Bytes/String literals
-                    match &init.kind {
-                        ExprKind::Hex(h) => {
-                            self.fixed_array_vars
-                                .insert(name.name.clone(), (h.len() / 2) as u64);
+                    // Check for dynamically-sized ArrayRepeat: needs a _len companion
+                    // and heap allocation (calloc) since the size is dynamic.
+                    if let ExprKind::ArrayRepeat { value, count } = &init.kind {
+                        // Emit the _len companion first (the count expression)
+                        self.write_indent();
+                        self.write(&format!("size_t {}_len = ", name_str));
+                        self.generate_expr(count);
+                        self.write(";\n");
+                        // Allocate with calloc (zero-initialized heap memory)
+                        self.write_indent();
+                        if matches!(value.kind, ExprKind::Integer(0)) {
+                            self.write(&format!(
+                                "uint8_t* {} = (uint8_t*)calloc({}_len, sizeof(uint8_t))",
+                                name_str, name_str
+                            ));
+                        } else {
+                            // Non-zero fill: allocate + memset
+                            self.write(&format!(
+                                "uint8_t* {} = (uint8_t*)calloc({}_len, sizeof(uint8_t))",
+                                name_str, name_str
+                            ));
                         }
-                        ExprKind::Bytes(s) => {
-                            self.fixed_array_vars
-                                .insert(name.name.clone(), s.len() as u64);
+                        self.write(";\n");
+                        self.slice_vars.insert(name.name.clone());
+                        // Track the generated _len name so later locals with the same name
+                        // are renamed to avoid redeclaration conflicts
+                        self.len_param_names.insert(format!("{}_len", name.name));
+                    } else {
+                        let inferred_type = self.infer_expr_c_type(init);
+                        self.write_indent();
+                        self.write(&format!("{} {} = ", inferred_type, name_str));
+                        self.generate_expr(init);
+                        self.write(";\n");
+                        // Track fixed arrays from Hex/Bytes/String literals
+                        match &init.kind {
+                            ExprKind::Hex(h) => {
+                                self.fixed_array_vars
+                                    .insert(name.name.clone(), (h.len() / 2) as u64);
+                            }
+                            ExprKind::Bytes(s) => {
+                                self.fixed_array_vars
+                                    .insert(name.name.clone(), s.len() as u64);
+                            }
+                            ExprKind::String(s) => {
+                                self.fixed_array_vars
+                                    .insert(name.name.clone(), s.len() as u64);
+                            }
+                            _ => {}
                         }
-                        ExprKind::String(s) => {
-                            self.fixed_array_vars
-                                .insert(name.name.clone(), s.len() as u64);
-                        }
-                        _ => {}
                     }
                 } else {
                     self.write_indent();

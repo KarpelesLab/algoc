@@ -37,7 +37,10 @@ pub struct GoGenerator {
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
     /// Variable Go types (for type-aware code generation, e.g. "uint32", "uint64")
+    /// Cleared at the start of each function.
     var_go_types: HashMap<String, String>,
+    /// Constant Go types (persists across function boundaries)
+    const_go_types: HashMap<String, String>,
     /// Function parameter Go types (for type-aware code generation)
     param_go_types: HashMap<String, String>,
     /// Function return types (function_name -> go_type)
@@ -50,13 +53,6 @@ pub struct GoGenerator {
     needs_assert: bool,
     /// Whether we need the bytes_equal helper
     needs_bytes_equal: bool,
-    /// Whether we need the conditional helper functions (one per type)
-    needs_cond_uint8: bool,
-    needs_cond_uint16: bool,
-    needs_cond_uint32: bool,
-    needs_cond_uint64: bool,
-    needs_cond_bool: bool,
-    needs_cond_bytes: bool,
     /// Current impl struct name for resolving Self type
     current_impl_struct: Option<String>,
 }
@@ -71,18 +67,13 @@ impl GoGenerator {
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
             var_go_types: HashMap::new(),
+            const_go_types: HashMap::new(),
             param_go_types: HashMap::new(),
             func_return_types: HashMap::new(),
             func_signatures: HashMap::new(),
             needed_imports: HashSet::new(),
             needs_assert: false,
             needs_bytes_equal: false,
-            needs_cond_uint8: false,
-            needs_cond_uint16: false,
-            needs_cond_uint32: false,
-            needs_cond_uint64: false,
-            needs_cond_bool: false,
-            needs_cond_bytes: false,
             current_impl_struct: None,
         }
     }
@@ -147,10 +138,11 @@ impl GoGenerator {
                 let mangled = format!("{}__{}", type_name.name, method_name.name);
                 self.func_return_types.get(&mangled).cloned()
             }
-            // Identifiers: look up in var_go_types or param_go_types
+            // Identifiers: look up in var_go_types, const_go_types, or param_go_types
             ExprKind::Ident(ident) => self
                 .var_go_types
                 .get(&ident.name)
+                .or_else(|| self.const_go_types.get(&ident.name))
                 .or_else(|| self.param_go_types.get(&ident.name))
                 .cloned(),
             // Parenthesized expressions delegate to inner
@@ -232,6 +224,28 @@ impl GoGenerator {
             }
             // Unary: same type as operand
             ExprKind::Unary { operand, .. } => self.infer_expr_go_type(operand),
+            // ArrayRepeat: [value; count] produces []<element_type>
+            ExprKind::ArrayRepeat { value, .. } => {
+                let elem_ty = self.infer_expr_go_type(value)?;
+                Some(format!("[]{}", elem_ty))
+            }
+            // Array literal: infer element type from first element
+            ExprKind::Array(elements) => {
+                if let Some(first) = elements.first() {
+                    let elem_ty = self.infer_expr_go_type(first)?;
+                    Some(format!("[]{}", elem_ty))
+                } else {
+                    None
+                }
+            }
+            // Conditional: infer from branches
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => self
+                .infer_expr_go_type(then_expr)
+                .or_else(|| self.infer_expr_go_type(else_expr)),
             // Ref/MutRef/Deref: delegate
             ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
                 self.infer_expr_go_type(inner)
@@ -631,90 +645,8 @@ impl GoGenerator {
             self.writeln("");
         }
 
-        // Conditional helper functions (Go has no ternary operator)
-        if self.needs_cond_uint8 {
-            self.writeln("func __cond_uint8(c bool, a, b uint8) uint8 {");
-            self.indent();
-            self.writeln("if c {");
-            self.indent();
-            self.writeln("return a");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("return b");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("");
-        }
-
-        if self.needs_cond_uint16 {
-            self.writeln("func __cond_uint16(c bool, a, b uint16) uint16 {");
-            self.indent();
-            self.writeln("if c {");
-            self.indent();
-            self.writeln("return a");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("return b");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("");
-        }
-
-        if self.needs_cond_uint32 {
-            self.writeln("func __cond_uint32(c bool, a, b uint32) uint32 {");
-            self.indent();
-            self.writeln("if c {");
-            self.indent();
-            self.writeln("return a");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("return b");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("");
-        }
-
-        if self.needs_cond_uint64 {
-            self.writeln("func __cond_uint64(c bool, a, b uint64) uint64 {");
-            self.indent();
-            self.writeln("if c {");
-            self.indent();
-            self.writeln("return a");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("return b");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("");
-        }
-
-        if self.needs_cond_bool {
-            self.writeln("func __cond_bool(c bool, a, b bool) bool {");
-            self.indent();
-            self.writeln("if c {");
-            self.indent();
-            self.writeln("return a");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("return b");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("");
-        }
-
-        if self.needs_cond_bytes {
-            self.writeln("func __cond_bytes(c bool, a, b []byte) []byte {");
-            self.indent();
-            self.writeln("if c {");
-            self.indent();
-            self.writeln("return a");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("return b");
-            self.dedent();
-            self.writeln("}");
-            self.writeln("");
-        }
+        // Conditional expressions are now generated as inline IIFEs,
+        // so no __cond_* helper functions are needed.
     }
 
     /// Pre-scan the AST to determine which imports and helpers are needed
@@ -909,8 +841,8 @@ impl GoGenerator {
                 self.pre_scan_expr(condition);
                 self.pre_scan_expr(then_expr);
                 self.pre_scan_expr(else_expr);
-                // Mark that we need a conditional helper - use uint32 as default
-                self.needs_cond_uint32 = true;
+                // Conditionals are now generated as IIFEs (inline if-else)
+                // so no __cond_* helper functions are needed.
             }
             ExprKind::EnumVariant { args, .. } => {
                 for arg in args {
@@ -1117,6 +1049,9 @@ impl GoGenerator {
         // which would infer `int`)
         let go_ty = self.go_type(&c.ty);
         self.var_go_types.insert(c.name.name.clone(), go_ty.clone());
+        // Also persist in const_go_types so the type survives function-level clears
+        self.const_go_types
+            .insert(c.name.name.clone(), go_ty.clone());
         self.write(&format!("var {} {} = ", c.name.name, go_ty));
         // Use type-aware expression generation for arrays
         if matches!(c.ty.kind, crate::parser::TypeKind::Array { .. }) {
@@ -1769,19 +1704,15 @@ impl GoGenerator {
 
                     self.write("(");
                     if let Some(ref cast_ty) = cast_left {
-                        self.write(&format!("{}(", cast_ty));
-                    }
-                    self.generate_expr(left);
-                    if cast_left.is_some() {
-                        self.write(")");
+                        self.generate_expr_with_go_cast(left, cast_ty);
+                    } else {
+                        self.generate_expr(left);
                     }
                     self.write(op_str);
                     if let Some(ref cast_ty) = cast_right {
-                        self.write(&format!("{}(", cast_ty));
-                    }
-                    self.generate_expr(right);
-                    if cast_right.is_some() {
-                        self.write(")");
+                        self.generate_expr_with_go_cast(right, cast_ty);
+                    } else {
+                        self.generate_expr(right);
                     }
                     self.write(")");
                 } else {
@@ -2251,15 +2182,20 @@ impl GoGenerator {
                 then_expr,
                 else_expr,
             } => {
-                // Go has no ternary operator - use helper function
-                // We use a generic approach with a helper function
-                self.write("__cond_uint32(");
+                // Go has no ternary operator.  We use an inline IIFE so that
+                // the branches are lazily evaluated (important when an argument
+                // contains array indexing that would panic if evaluated eagerly).
+                let cond_type = self
+                    .infer_expr_go_type(then_expr)
+                    .or_else(|| self.infer_expr_go_type(else_expr))
+                    .unwrap_or_else(|| "uint32".to_string());
+                self.write(&format!("func() {} {{ if ", cond_type));
                 self.generate_expr(condition);
-                self.write(", ");
-                self.generate_expr(then_expr);
-                self.write(", ");
-                self.generate_expr(else_expr);
-                self.write(")");
+                self.write(" { return ");
+                self.generate_cond_arg(then_expr, &cond_type);
+                self.write(" }; return ");
+                self.generate_cond_arg(else_expr, &cond_type);
+                self.write(" }()");
             }
             ExprKind::EnumVariant {
                 enum_name,
@@ -2609,6 +2545,30 @@ impl GoGenerator {
             return;
         }
 
+        // Special case: casting a bitwise-NOT of a constant to an unsigned type.
+        // In Go, `^3` is the untyped constant -4 and `uint32(-4)` does not compile.
+        // Instead we emit `^uint32(3)` which produces the correct unsigned result.
+        if let ExprKind::Unary {
+            op: UnaryOp::BitNot,
+            operand,
+        } = &expr.kind
+            && let TypeKind::Primitive(p) = &ty.kind
+        {
+            let go_ty = match p {
+                PrimitiveType::U8 | PrimitiveType::I8 => Some("uint8"),
+                PrimitiveType::U16 | PrimitiveType::I16 => Some("uint16"),
+                PrimitiveType::U32 | PrimitiveType::I32 => Some("uint32"),
+                PrimitiveType::U64 | PrimitiveType::I64 => Some("uint64"),
+                _ => None,
+            };
+            if let Some(t) = go_ty {
+                self.write(&format!("^{}(", t));
+                self.generate_expr(operand);
+                self.write(")");
+                return;
+            }
+        }
+
         // Standard casts - Go type conversions
         match &ty.kind {
             TypeKind::Primitive(p) => match p {
@@ -2651,6 +2611,60 @@ impl GoGenerator {
             _ => {
                 self.generate_expr(expr);
             }
+        }
+    }
+
+    /// Emit `expr` wrapped in a Go type conversion to `cast_ty`.
+    /// Handles the special case where `expr` is a bitwise-NOT of a constant:
+    /// instead of `uint32(^(3))` (which fails because `^3` is the negative
+    /// untyped constant -4), we emit `^uint32(3)`.
+    fn generate_expr_with_go_cast(&mut self, expr: &Expr, cast_ty: &str) {
+        // Special case: bitwise NOT of a value – move the type inside the NOT.
+        if let ExprKind::Unary {
+            op: UnaryOp::BitNot,
+            operand,
+        } = &expr.kind
+        {
+            self.write(&format!("^{}(", cast_ty));
+            self.generate_expr(operand);
+            self.write(")");
+            return;
+        }
+        // Special case: negation of a constant – produce wrapping result via
+        // two's-complement identity: `-x` as unsigned == `^type(x-1)` when x>0,
+        // but the simplest portable approach is `type(0) - type(x)`.
+        if let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } = &expr.kind
+            && matches!(&operand.kind, ExprKind::Integer(_))
+        {
+            self.write(&format!("({}(0) - {}(", cast_ty, cast_ty));
+            self.generate_expr(operand);
+            self.write("))");
+            return;
+        }
+        self.write(&format!("{}(", cast_ty));
+        self.generate_expr(expr);
+        self.write(")");
+    }
+
+    /// Generate an argument expression for a `__cond_*` helper, inserting a
+    /// Go type conversion when the expression's inferred type does not match
+    /// the helper's expected type.  Integer literals are left uncast because
+    /// Go's untyped constants adapt automatically.
+    fn generate_cond_arg(&mut self, expr: &Expr, expected_go_type: &str) {
+        let expr_ty = self.infer_expr_go_type(expr);
+        let needs_cast = match &expr_ty {
+            Some(t) => {
+                t != expected_go_type && is_go_int_type(t) && is_go_int_type(expected_go_type)
+            }
+            None => false, // untyped literal – no cast needed
+        };
+        if needs_cast {
+            self.generate_expr_with_go_cast(expr, expected_go_type);
+        } else {
+            self.generate_expr(expr);
         }
     }
 
@@ -2762,16 +2776,11 @@ impl CodeGenerator for GoGenerator {
         self.struct_defs.clear();
         self.struct_methods.clear();
         self.var_types.clear();
+        self.const_go_types.clear();
         self.func_return_types.clear();
         self.needed_imports.clear();
         self.needs_assert = false;
         self.needs_bytes_equal = false;
-        self.needs_cond_uint8 = false;
-        self.needs_cond_uint16 = false;
-        self.needs_cond_uint32 = false;
-        self.needs_cond_uint64 = false;
-        self.needs_cond_bool = false;
-        self.needs_cond_bytes = false;
 
         // Pre-pass: collect struct definitions and method mappings
         for item in &ast.ast.items {
@@ -2897,7 +2906,7 @@ impl CodeGenerator for GoGenerator {
             self.writeln("}");
             self.dedent();
             self.writeln("}");
-        } else if !self.include_tests {
+        } else {
             // Generate a placeholder main if no tests and no main function exists
             let has_main = ast.ast.items.iter().any(|item| {
                 if let ItemKind::Function(f) = &item.kind {

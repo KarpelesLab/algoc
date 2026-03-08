@@ -52,11 +52,19 @@ pub struct CGenerator {
     /// Variables that are fixed-size arrays (decay to pointers, no & needed)
     /// Maps variable name to known array size.
     fixed_array_vars: HashMap<String, u64>,
+    /// Variables that are VLAs (variable-length arrays) without a companion _len variable.
+    /// For these, use `sizeof(X) / sizeof(X[0])` to compute the length.
+    vla_vars: HashSet<String>,
     /// Generated `_len` companion parameter names (e.g., "data_len" from param `data: &[u8]`).
     /// Used to detect local variable name conflicts.
     len_param_names: HashSet<String>,
     /// Mapping from original variable name to renamed variable (to avoid _len conflicts).
     var_renames: HashMap<String, String>,
+    /// Mapping from slice param name to its actual companion `_len` name when the default
+    /// `{name}_len` collides with another explicit parameter name.
+    /// E.g. if params are `data: &mut [u8], data_len: u64`, the companion for `data` is
+    /// renamed from `data_len` to `__data_sz`, so this maps `"data"` -> `"__data_sz"`.
+    len_companion_renames: HashMap<String, String>,
 }
 
 impl CGenerator {
@@ -72,8 +80,10 @@ impl CGenerator {
             func_signatures: HashMap::new(),
             slice_vars: HashSet::new(),
             fixed_array_vars: HashMap::new(),
+            vla_vars: HashSet::new(),
             len_param_names: HashSet::new(),
             var_renames: HashMap::new(),
+            len_companion_renames: HashMap::new(),
         }
     }
 
@@ -781,6 +791,9 @@ impl CGenerator {
     /// Generate a forward declaration for a standalone function
     fn generate_forward_decl(&mut self, func: &Function) {
         let ret_ty = self.return_type_to_c(func.return_type.as_ref());
+
+        self.prescan_param_companion_renames(&func.params);
+
         self.write_indent();
         self.write(&format!("static {} {}(", ret_ty, func.name.name));
 
@@ -804,6 +817,9 @@ impl CGenerator {
     fn generate_method_forward_decl(&mut self, struct_name: &str, func: &Function) {
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
         let ret_ty = self.return_type_to_c_with_self(func.return_type.as_ref(), Some(struct_name));
+
+        self.prescan_param_companion_renames(&func.params);
+
         self.write_indent();
         self.write(&format!("static {} {}(", ret_ty, mangled_name));
 
@@ -1045,11 +1061,44 @@ impl CGenerator {
         }
     }
 
+    /// Pre-scan function parameters to detect companion `_len` name collisions.
+    /// If a slice param `X` would generate companion `X_len` but another explicit param
+    /// is also named `X_len`, rename the companion to `__X_sz` to avoid redefinition.
+    /// Populates `self.len_companion_renames`.
+    fn prescan_param_companion_renames(&mut self, params: &[crate::parser::Param]) {
+        self.len_companion_renames.clear();
+        // Collect all explicit param names
+        let explicit_names: HashSet<String> = params.iter().map(|p| p.name.name.clone()).collect();
+        // For each param that needs a companion _len, check for collision
+        for param in params {
+            if Self::param_needs_len(&param.ty) {
+                let companion = format!("{}_len", param.name.name);
+                if explicit_names.contains(&companion) {
+                    // Collision: rename the companion
+                    let renamed = format!("__{}_sz", param.name.name);
+                    self.len_companion_renames
+                        .insert(param.name.name.clone(), renamed);
+                }
+            }
+        }
+    }
+
+    /// Get the companion length parameter name for a slice parameter.
+    /// Returns the renamed companion if a collision was detected, otherwise `{name}_len`.
+    fn get_len_companion_name(&self, param_name: &str) -> String {
+        if let Some(renamed) = self.len_companion_renames.get(param_name) {
+            renamed.clone()
+        } else {
+            format!("{}_len", param_name)
+        }
+    }
+
     /// Populate pointer_vars, slice_vars, fixed_array_vars, and len_param_names from function parameters
     fn collect_pointer_params(&mut self, func: &Function) {
         self.pointer_vars.clear();
         self.slice_vars.clear();
         self.fixed_array_vars.clear();
+        self.vla_vars.clear();
         self.len_param_names.clear();
         self.var_renames.clear();
         for param in &func.params {
@@ -1058,8 +1107,8 @@ impl CGenerator {
             }
             if Self::param_needs_len(&param.ty) {
                 self.slice_vars.insert(param.name.name.clone());
-                self.len_param_names
-                    .insert(format!("{}_len", param.name.name));
+                let companion = self.get_len_companion_name(&param.name.name);
+                self.len_param_names.insert(companion);
             }
             if let Some(size) = Self::get_fixed_array_param_size(&param.ty) {
                 self.fixed_array_vars.insert(param.name.name.clone(), size);
@@ -1084,6 +1133,8 @@ impl CGenerator {
 
     fn generate_function(&mut self, func: &Function) {
         let ret_ty = self.return_type_to_c(func.return_type.as_ref());
+
+        self.prescan_param_companion_renames(&func.params);
 
         self.write_indent();
         self.write(&format!("static {} {}(", ret_ty, func.name.name));
@@ -1114,6 +1165,8 @@ impl CGenerator {
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
         let ret_ty = self.return_type_to_c_with_self(func.return_type.as_ref(), Some(struct_name));
+
+        self.prescan_param_companion_renames(&func.params);
 
         self.write_indent();
         self.write(&format!("static {} {}(", ret_ty, mangled_name));
@@ -1152,6 +1205,8 @@ impl CGenerator {
     fn generate_param_decl(&mut self, param: &crate::parser::Param) {
         use crate::parser::TypeKind;
 
+        let companion_name = self.get_len_companion_name(&param.name.name);
+
         match &param.ty.kind {
             TypeKind::Array { element: _, size } => {
                 // Fixed-size arrays decay to pointers in function params
@@ -1164,20 +1219,20 @@ impl CGenerator {
                 // Slice: pointer + length
                 let elem_ty = self.type_to_c(element);
                 self.write(&format!("const {}* {}", elem_ty, param.name.name));
-                self.write(&format!(", size_t {}_len", param.name.name));
+                self.write(&format!(", size_t {}", companion_name));
             }
             TypeKind::ArrayRef { element, size } => {
                 // Reference to fixed-size array: pointer
                 let elem_ty = self.type_to_c(element);
                 self.write(&format!("const {}* {}", elem_ty, param.name.name));
-                self.write(&format!(", size_t {}_len", param.name.name));
+                self.write(&format!(", size_t {}", companion_name));
                 let _ = size;
             }
             TypeKind::MutRef(inner) => match &inner.kind {
                 TypeKind::Slice { element } => {
                     let elem_ty = self.type_to_c(element);
                     self.write(&format!("{}* {}", elem_ty, param.name.name));
-                    self.write(&format!(", size_t {}_len", param.name.name));
+                    self.write(&format!(", size_t {}", companion_name));
                 }
                 TypeKind::Array { element, size } => {
                     // Fixed-size array ref: no companion _len needed
@@ -1197,7 +1252,7 @@ impl CGenerator {
                 TypeKind::Slice { element } => {
                     let elem_ty = self.type_to_c(element);
                     self.write(&format!("const {}* {}", elem_ty, param.name.name));
-                    self.write(&format!(", size_t {}_len", param.name.name));
+                    self.write(&format!(", size_t {}", companion_name));
                 }
                 TypeKind::Array { element, size } => {
                     // Fixed-size array ref: no companion _len needed
@@ -1227,6 +1282,7 @@ impl CGenerator {
         self.pointer_vars.clear();
         self.slice_vars.clear();
         self.fixed_array_vars.clear();
+        self.vla_vars.clear();
         self.len_param_names.clear();
         self.var_renames.clear();
         self.writeln(&format!("static void test_{}(void) {{", test.name.name));
@@ -1789,6 +1845,53 @@ impl CGenerator {
                             self.fixed_array_vars
                                 .insert(name.name.clone(), byte_count as u64);
                         }
+                        ExprKind::ArrayRepeat { value, count } => {
+                            // [value; count] - generate as VLA with memset
+                            let elem_ty = self.infer_c_type(value);
+                            // Check if count is a compile-time integer constant
+                            if let ExprKind::Integer(n) = &count.kind {
+                                self.write_indent();
+                                self.write(&format!("{} {}[{}]", elem_ty, name_str, n));
+                                if is_zero_value(value) {
+                                    self.write(" = {0}");
+                                } else {
+                                    self.write(";\n");
+                                    self.write_indent();
+                                    self.write(&format!(
+                                        "for (size_t __i = 0; __i < {}; __i++) {}[__i] = ",
+                                        n, name_str
+                                    ));
+                                    self.generate_expr(value);
+                                }
+                                self.write(";\n");
+                                self.fixed_array_vars.insert(name.name.clone(), *n as u64);
+                            } else {
+                                // Runtime-sized VLA
+                                self.write_indent();
+                                self.write(&format!("{} {}[", elem_ty, name_str));
+                                self.generate_expr(count);
+                                self.write("];\n");
+                                if is_zero_value(value) {
+                                    self.write_indent();
+                                    self.write(&format!(
+                                        "memset({}, 0, sizeof({}));\n",
+                                        name_str, name_str
+                                    ));
+                                } else {
+                                    self.write_indent();
+                                    self.write(&format!(
+                                        "for (size_t __i = 0; __i < sizeof({}) / sizeof({}[0]); __i++) {}[__i] = ",
+                                        name_str, name_str, name_str
+                                    ));
+                                    self.generate_expr(value);
+                                    self.write(";\n");
+                                }
+                                // Don't generate a companion _len variable for VLAs.
+                                // The user may define their own (e.g. compressed_len = ...).
+                                // When the VLA is passed to a function, we use sizeof().
+                                self.vla_vars.insert(name.name.clone());
+                            }
+                        }
                         ExprKind::Slice { .. } => {
                             // Slice expression like data[offset..offset+64] - treat as const uint8_t*
                             self.write_indent();
@@ -1946,14 +2049,21 @@ impl CGenerator {
                 if let Some(&size) = self.fixed_array_vars.get(&ident.name) {
                     // Fixed-size array: use the known compile-time size
                     self.write(&format!("{}", size));
+                } else if self.vla_vars.contains(&ident.name) {
+                    // VLA: use sizeof(X) / sizeof(X[0])
+                    self.write(&format!(
+                        "sizeof({}) / sizeof({}[0])",
+                        ident.name, ident.name
+                    ));
                 } else {
                     // Variable - use companion _len variable (with rename if applicable)
-                    let effective = self
-                        .var_renames
-                        .get(&ident.name)
-                        .cloned()
-                        .unwrap_or_else(|| ident.name.clone());
-                    self.write(&format!("{}_len", effective));
+                    let companion = self.get_len_companion_name(&ident.name);
+                    // Also check var_renames for local variable renames
+                    if let Some(renamed) = self.var_renames.get(&ident.name) {
+                        self.write(&format!("{}_len", renamed));
+                    } else {
+                        self.write(&companion);
+                    }
                 }
             }
             ExprKind::Field { object, field } => {
