@@ -12,7 +12,11 @@ pub mod parser;
 
 // Re-export commonly used types
 pub use analysis::{AnalyzedAst, analyze};
-pub use codegen::{CodeGenerator, JavaScriptGenerator, PythonGenerator};
+pub use codegen::{
+    CGenerator, CodeGenerator, CppGenerator, DartGenerator, GoGenerator, JavaGenerator,
+    JavaScriptGenerator, KotlinGenerator, ObjCGenerator, PerlGenerator, PhpGenerator,
+    PythonGenerator, RustGenerator, SwiftGenerator, VerilogGenerator, VhdlGenerator,
+};
 pub use errors::{AlgocError, AlgocResult, SourceSpan};
 pub use lexer::{Lexer, Token, TokenKind};
 pub use parser::{Ast, Parser};

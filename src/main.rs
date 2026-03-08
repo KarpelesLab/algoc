@@ -7,9 +7,59 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use algoc::parser::{Ast, Item, ItemKind};
-use algoc::{
-    CodeGenerator, JavaScriptGenerator, Parser, PythonGenerator, analyze, errors::print_error,
-};
+use algoc::{CodeGenerator, Parser, analyze, errors::print_error};
+
+/// Create a code generator for the given target name
+fn create_generator(target: &str, include_tests: bool) -> Option<Box<dyn CodeGenerator>> {
+    match target {
+        "javascript" | "js" => Some(Box::new(
+            algoc::JavaScriptGenerator::new().with_tests(include_tests),
+        )),
+        "python" | "py" => Some(Box::new(
+            algoc::PythonGenerator::new().with_tests(include_tests),
+        )),
+        "rust" | "rs" => Some(Box::new(
+            algoc::RustGenerator::new().with_tests(include_tests),
+        )),
+        "c" => Some(Box::new(algoc::CGenerator::new().with_tests(include_tests))),
+        "cpp" | "c++" | "cxx" => Some(Box::new(
+            algoc::CppGenerator::new().with_tests(include_tests),
+        )),
+        "go" | "golang" => Some(Box::new(
+            algoc::GoGenerator::new().with_tests(include_tests),
+        )),
+        "java" => Some(Box::new(
+            algoc::JavaGenerator::new().with_tests(include_tests),
+        )),
+        "kotlin" | "kt" => Some(Box::new(
+            algoc::KotlinGenerator::new().with_tests(include_tests),
+        )),
+        "swift" => Some(Box::new(
+            algoc::SwiftGenerator::new().with_tests(include_tests),
+        )),
+        "dart" => Some(Box::new(
+            algoc::DartGenerator::new().with_tests(include_tests),
+        )),
+        "php" => Some(Box::new(
+            algoc::PhpGenerator::new().with_tests(include_tests),
+        )),
+        "perl" | "pl" => Some(Box::new(
+            algoc::PerlGenerator::new().with_tests(include_tests),
+        )),
+        "objc" | "objective-c" | "objectivec" => Some(Box::new(
+            algoc::ObjCGenerator::new().with_tests(include_tests),
+        )),
+        "vhdl" => Some(Box::new(
+            algoc::VhdlGenerator::new().with_tests(include_tests),
+        )),
+        "verilog" | "v" => Some(Box::new(
+            algoc::VerilogGenerator::new().with_tests(include_tests),
+        )),
+        _ => None,
+    }
+}
+
+const AVAILABLE_TARGETS: &str = "javascript (js), python (py), rust (rs), c, c++ (cpp), go, java, kotlin (kt), swift, dart, php, perl (pl), objc, vhdl, verilog (v)";
 
 /// Load and parse a file, recursively processing `use` statements
 fn load_with_imports(
@@ -77,6 +127,302 @@ fn load_file(filename: &str) -> Result<(Ast, String), (String, String)> {
     Ok((ast, source))
 }
 
+/// Run a test for an interpreted target
+fn run_interpreted_test(code: &str, interpreter: &str, flag: &str, suffix: &str) -> ExitCode {
+    let code_with_runner = format!("{}{}", code, suffix);
+    let status = Command::new(interpreter)
+        .arg(flag)
+        .arg(&code_with_runner)
+        .status();
+    match status {
+        Ok(s) if s.success() => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("Error running {}: {}", interpreter, e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run a test for a compiled target
+fn run_compiled_test(code: &str, ext: &str, target: &str) -> ExitCode {
+    let temp_dir = env::temp_dir();
+    let source_path = temp_dir.join(format!("algoc_test.{}", ext));
+    let binary_path = temp_dir.join("algoc_test_bin");
+
+    // Write source file
+    if let Err(e) = fs::write(&source_path, code) {
+        eprintln!("Error writing temp file: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    let result = match target {
+        "rust" | "rs" => {
+            let compile = Command::new("rustc")
+                .arg(&source_path)
+                .arg("-o")
+                .arg(&binary_path)
+                .status();
+            match compile {
+                Ok(s) if s.success() => Command::new(&binary_path).status(),
+                Ok(s) => {
+                    let _ = fs::remove_file(&source_path);
+                    return if s.success() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    };
+                }
+                Err(e) => {
+                    eprintln!("Error running rustc: {}", e);
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        "c" => {
+            let compile = Command::new("gcc")
+                .args(["-std=c11", "-O2", "-lm", "-o"])
+                .arg(&binary_path)
+                .arg(&source_path)
+                .status();
+            match compile {
+                Ok(s) if s.success() => Command::new(&binary_path).status(),
+                Ok(_) => {
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error running gcc: {}", e);
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        "cpp" | "c++" | "cxx" => {
+            let compile = Command::new("g++")
+                .args(["-std=c++20", "-O2", "-o"])
+                .arg(&binary_path)
+                .arg(&source_path)
+                .status();
+            match compile {
+                Ok(s) if s.success() => Command::new(&binary_path).status(),
+                Ok(_) => {
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error running g++: {}", e);
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        "go" | "golang" => {
+            let status = Command::new("go").arg("run").arg(&source_path).status();
+            let _ = fs::remove_file(&source_path);
+            return match status {
+                Ok(s) if s.success() => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("Error running go: {}", e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        "java" => {
+            // Java needs the class name to match the file name
+            let java_path = temp_dir.join("AlgocTest.java");
+            let _ = fs::write(&java_path, code);
+            let compile = Command::new("javac").arg(&java_path).status();
+            let result = match compile {
+                Ok(s) if s.success() => Command::new("java")
+                    .arg("-cp")
+                    .arg(&temp_dir)
+                    .arg("AlgocTest")
+                    .status(),
+                Ok(_) => {
+                    let _ = fs::remove_file(&java_path);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error running javac: {}", e);
+                    let _ = fs::remove_file(&java_path);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let _ = fs::remove_file(&java_path);
+            let _ = fs::remove_file(temp_dir.join("AlgocTest.class"));
+            return match result {
+                Ok(s) if s.success() => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("Error running java: {}", e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        "kotlin" | "kt" => {
+            let jar_path = temp_dir.join("algoc_test.jar");
+            let compile = Command::new("kotlinc")
+                .arg(&source_path)
+                .args(["-include-runtime", "-d"])
+                .arg(&jar_path)
+                .status();
+            let result = match compile {
+                Ok(s) if s.success() => Command::new("java").arg("-jar").arg(&jar_path).status(),
+                Ok(_) => {
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error running kotlinc: {}", e);
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let _ = fs::remove_file(&source_path);
+            let _ = fs::remove_file(&jar_path);
+            return match result {
+                Ok(s) if s.success() => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("Error running java: {}", e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        "swift" => {
+            let status = Command::new("swift").arg(&source_path).status();
+            let _ = fs::remove_file(&source_path);
+            return match status {
+                Ok(s) if s.success() => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("Error running swift: {}", e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        "dart" => {
+            let status = Command::new("dart").arg("run").arg(&source_path).status();
+            let _ = fs::remove_file(&source_path);
+            return match status {
+                Ok(s) if s.success() => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("Error running dart: {}", e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        "objc" | "objective-c" | "objectivec" => {
+            let compile = Command::new("gcc")
+                .args(["-O2", "-lobjc", "-o"])
+                .arg(&binary_path)
+                .arg(&source_path)
+                .status();
+            match compile {
+                Ok(s) if s.success() => Command::new(&binary_path).status(),
+                Ok(_) => {
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error running gcc: {}", e);
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        "verilog" | "v" => {
+            let vvp_path = temp_dir.join("algoc_test.vvp");
+            let compile = Command::new("iverilog")
+                .arg("-o")
+                .arg(&vvp_path)
+                .arg(&source_path)
+                .status();
+            let result = match compile {
+                Ok(s) if s.success() => Command::new("vvp").arg(&vvp_path).status(),
+                Ok(_) => {
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error running iverilog: {}", e);
+                    let _ = fs::remove_file(&source_path);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let _ = fs::remove_file(&source_path);
+            let _ = fs::remove_file(&vvp_path);
+            return match result {
+                Ok(s) if s.success() => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("Error running vvp: {}", e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        "vhdl" => {
+            let work_dir = temp_dir.join("algoc_vhdl_work");
+            let _ = fs::create_dir_all(&work_dir);
+            let analyze = Command::new("ghdl")
+                .args(["--workdir=."])
+                .current_dir(&work_dir)
+                .arg("-a")
+                .arg(&source_path)
+                .status();
+            let result = match analyze {
+                Ok(s) if s.success() => {
+                    let elab = Command::new("ghdl")
+                        .args(["--workdir=."])
+                        .current_dir(&work_dir)
+                        .args(["-e", "testbench"])
+                        .status();
+                    match elab {
+                        Ok(s) if s.success() => Command::new("ghdl")
+                            .args(["--workdir=."])
+                            .current_dir(&work_dir)
+                            .args(["-r", "testbench"])
+                            .status(),
+                        other => other,
+                    }
+                }
+                other => other,
+            };
+            let _ = fs::remove_file(&source_path);
+            let _ = fs::remove_dir_all(&work_dir);
+            return match result {
+                Ok(s) if s.success() => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("Error running ghdl: {}", e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        _ => {
+            eprintln!("No test runner for target: {}", target);
+            let _ = fs::remove_file(&source_path);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Common cleanup for compile-then-run targets
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&binary_path);
+    match result {
+        Ok(s) if s.success() => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("Error running test binary: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
@@ -92,9 +438,9 @@ fn main() -> ExitCode {
         println!("  compile <file> -t <target> [-o <output>] [--test]");
         println!("                         Compile to target language");
         println!("  test <file> [-t <target>]");
-        println!("                         Run tests directly (streams to interpreter)");
+        println!("                         Run tests directly");
         println!();
-        println!("Targets: javascript (js, default), python (py)");
+        println!("Targets: {}", AVAILABLE_TARGETS);
         println!();
         return ExitCode::SUCCESS;
     }
@@ -267,7 +613,7 @@ fn main() -> ExitCode {
                 Some(t) => t,
                 None => {
                     eprintln!("Error: -t <target> is required");
-                    eprintln!("Available targets: javascript (js), python (py)");
+                    eprintln!("Available targets: {}", AVAILABLE_TARGETS);
                     return ExitCode::FAILURE;
                 }
             };
@@ -290,31 +636,21 @@ fn main() -> ExitCode {
                 }
             };
 
-            // Generate code
-            let (code, ext) = match target.as_str() {
-                "javascript" | "js" => {
-                    let mut generator = JavaScriptGenerator::new().with_tests(include_tests);
-                    match generator.generate(&analyzed) {
-                        Ok(code) => (code, generator.file_extension()),
-                        Err(e) => {
-                            print_error(&source, filename, &e);
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-                "python" | "py" => {
-                    let mut generator = PythonGenerator::new().with_tests(include_tests);
-                    match generator.generate(&analyzed) {
-                        Ok(code) => (code, generator.file_extension()),
-                        Err(e) => {
-                            print_error(&source, filename, &e);
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-                _ => {
+            // Create generator
+            let mut generator = match create_generator(&target, include_tests) {
+                Some(g) => g,
+                None => {
                     eprintln!("Unknown target: {}", target);
-                    eprintln!("Available targets: javascript (js), python (py)");
+                    eprintln!("Available targets: {}", AVAILABLE_TARGETS);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            // Generate code
+            let code = match generator.generate(&analyzed) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error(&source, filename, &e);
                     return ExitCode::FAILURE;
                 }
             };
@@ -325,7 +661,7 @@ fn main() -> ExitCode {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("output");
-                format!("{}.{}", stem, ext)
+                format!("{}.{}", stem, generator.file_extension())
             });
 
             match fs::write(&output_path, &code) {
@@ -386,67 +722,42 @@ fn main() -> ExitCode {
                 }
             };
 
-            // Generate code with tests enabled
-            let (code, interpreter) = match target.as_str() {
-                "javascript" | "js" => {
-                    let mut generator = JavaScriptGenerator::new().with_tests(true);
-                    match generator.generate(&analyzed) {
-                        Ok(code) => (code, "node"),
-                        Err(e) => {
-                            print_error(&source, filename, &e);
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-                "python" | "py" => {
-                    let mut generator = PythonGenerator::new().with_tests(true);
-                    match generator.generate(&analyzed) {
-                        Ok(code) => (code, "python3"),
-                        Err(e) => {
-                            print_error(&source, filename, &e);
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-                _ => {
+            // Create generator with tests enabled
+            let mut generator = match create_generator(&target, true) {
+                Some(g) => g,
+                None => {
                     eprintln!("Unknown target: {}", target);
-                    eprintln!("Available targets: javascript (js), python (py)");
+                    eprintln!("Available targets: {}", AVAILABLE_TARGETS);
                     return ExitCode::FAILURE;
                 }
             };
 
-            // Append direct test execution (needed when running via -e/-c)
-            let code_with_runner = if interpreter == "node" {
-                format!("{}\nprocess.exit(run_tests() ? 0 : 1);", code)
-            } else {
-                format!("{}\nimport sys; sys.exit(0 if run_tests() else 1)", code)
-            };
-
-            // Spawn interpreter with code via -e flag (node) or -c flag (python)
-            let status = if interpreter == "node" {
-                Command::new(interpreter)
-                    .arg("-e")
-                    .arg(&code_with_runner)
-                    .status()
-            } else {
-                Command::new(interpreter)
-                    .arg("-c")
-                    .arg(&code_with_runner)
-                    .status()
-            };
-
-            match status {
-                Ok(status) => {
-                    if status.success() {
-                        ExitCode::SUCCESS
-                    } else {
-                        ExitCode::FAILURE
-                    }
-                }
+            let code = match generator.generate(&analyzed) {
+                Ok(code) => code,
                 Err(e) => {
-                    eprintln!("Error running {}: {}", interpreter, e);
-                    ExitCode::FAILURE
+                    print_error(&source, filename, &e);
+                    return ExitCode::FAILURE;
                 }
+            };
+
+            let ext = generator.file_extension();
+
+            // Run test based on target type
+            match target.as_str() {
+                // Interpreted targets
+                "javascript" | "js" => {
+                    let code_with_runner = format!("{}\nprocess.exit(run_tests() ? 0 : 1);", code);
+                    run_interpreted_test(&code_with_runner, "node", "-e", "")
+                }
+                "python" | "py" => {
+                    let code_with_runner =
+                        format!("{}\nimport sys; sys.exit(0 if run_tests() else 1)", code);
+                    run_interpreted_test(&code_with_runner, "python3", "-c", "")
+                }
+                "php" => run_interpreted_test(&code, "php", "-r", ""),
+                "perl" | "pl" => run_interpreted_test(&code, "perl", "-e", ""),
+                // Compiled/run targets
+                _ => run_compiled_test(&code, ext, &target),
             }
         }
         _ => {

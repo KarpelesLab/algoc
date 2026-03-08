@@ -67,7 +67,7 @@ jobs:
           failed=0
           for file in stdlib/**/*.algoc; do
             echo "Testing: $file"
-            if ! ./algoc test "$file" --target js; then
+            if ! ./algoc test "$file" -t js; then
               failed=1
             fi
           done
@@ -100,7 +100,421 @@ jobs:
           failed=0
           for file in stdlib/**/*.algoc; do
             echo "Testing: $file"
-            if ! ./algoc test "$file" --target python; then
+            if ! ./algoc test "$file" -t python; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-c:
+    name: Test (C)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t c; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-cpp:
+    name: Test (C++)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t cpp; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-rust:
+    name: Test (Rust)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t rust; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-go:
+    name: Test (Go)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t go; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-java:
+    name: Test (Java)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t java; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-kotlin:
+    name: Test (Kotlin)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Kotlin
+        run: |
+          curl -s https://get.sdkman.io | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install kotlin
+          echo "$HOME/.sdkman/candidates/kotlin/current/bin" >> $GITHUB_PATH
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t kotlin; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-php:
+    name: Test (PHP)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t php; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-perl:
+    name: Test (Perl)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t perl; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-swift:
+    name: Test (Swift)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '5.10'
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t swift; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-dart:
+    name: Test (Dart)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Setup Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.3.0'
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t dart; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-objc:
+    name: Test (Objective-C)
+    needs: build
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./target/release/algoc test "$file" -t objc; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-vhdl:
+    name: Test (VHDL)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Install GHDL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ghdl
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t vhdl; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-verilog:
+    name: Test (Verilog)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
+      - name: Install Icarus Verilog
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iverilog
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" -t verilog; then
               failed=1
             fi
           done
