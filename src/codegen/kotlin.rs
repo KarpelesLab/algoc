@@ -691,6 +691,23 @@ impl KotlinGenerator {
         }
     }
 
+    /// Track struct type from a function parameter's type annotation
+    fn track_param_type(
+        ty: &ParserType,
+        param_name: &str,
+        var_types: &mut HashMap<String, String>,
+    ) {
+        match &ty.kind {
+            crate::parser::TypeKind::Named(ident) => {
+                var_types.insert(param_name.to_string(), ident.name.clone());
+            }
+            crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) => {
+                Self::track_param_type(inner, param_name, var_types);
+            }
+            _ => {}
+        }
+    }
+
     /// Infer the primitive type of an expression from its structure.
     /// Used to track variable types when there's no explicit type annotation.
     fn infer_expr_primitive(&self, expr: &Expr) -> Option<PrimitiveType> {
@@ -768,11 +785,7 @@ impl KotlinGenerator {
                 self.var_prim_types.insert(param.name.name.clone(), *p);
             }
             // Track struct types from Named type parameters
-            Self::track_param_type(
-                &param.ty,
-                &param.name.name,
-                &mut self.var_types,
-            );
+            Self::track_param_type(&param.ty, &param.name.name, &mut self.var_types);
         }
 
         self.write_indent();
@@ -799,6 +812,7 @@ impl KotlinGenerator {
         self.writeln("");
         self.var_elem_types = saved_elem_types;
         self.var_prim_types = saved_prim_types;
+        self.var_types = saved_var_types;
         self.current_return_type = saved_return_type;
     }
 
