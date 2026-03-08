@@ -7,8 +7,8 @@ use super::CodeGenerator;
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
-    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
-    Type as ParserType, UnaryOp,
+    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, PrimitiveType,
+    Stmt, StmtKind, Type as ParserType, UnaryOp,
 };
 use std::collections::HashMap;
 
@@ -36,6 +36,8 @@ pub struct PythonGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Variable element types for arrays/slices (for correct integer masking on assignment)
+    var_elem_types: HashMap<String, PrimitiveType>,
 }
 
 impl PythonGenerator {
@@ -47,6 +49,7 @@ impl PythonGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            var_elem_types: HashMap::new(),
         }
     }
 
@@ -54,6 +57,55 @@ impl PythonGenerator {
     pub fn with_tests(mut self, include: bool) -> Self {
         self.include_tests = include;
         self
+    }
+
+    /// Extract the element primitive type from a parser type, unwrapping references/arrays/slices.
+    fn element_primitive(ty: &ParserType) -> Option<PrimitiveType> {
+        match &ty.kind {
+            crate::parser::TypeKind::Array { element, .. }
+            | crate::parser::TypeKind::Slice { element }
+            | crate::parser::TypeKind::ArrayRef { element, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &element.kind {
+                    Some(*p)
+                } else {
+                    None
+                }
+            }
+            crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) => {
+                Self::element_primitive(inner)
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the Python wrapping function name for a primitive type, if masking is needed
+    /// (i.e., when the type is narrower than the default _u32 wrapping).
+    fn wrap_fn_for_primitive(p: PrimitiveType) -> Option<&'static str> {
+        match p {
+            PrimitiveType::U8 | PrimitiveType::I8 => Some("_u8"),
+            PrimitiveType::U16
+            | PrimitiveType::I16
+            | PrimitiveType::U16Be
+            | PrimitiveType::I16Be
+            | PrimitiveType::U16Le
+            | PrimitiveType::I16Le => Some("_u16"),
+            // u32 and wider don't need special wrapping since _u32 is the default
+            _ => None,
+        }
+    }
+
+    /// Get the variable name from an index target expression (e.g., `data[idx]` -> "data")
+    fn index_target_var(expr: &Expr) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Index { array, .. } => {
+                if let ExprKind::Ident(ident) = &array.kind {
+                    Some(&ident.name)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     fn write(&mut self, s: &str) {
@@ -101,6 +153,12 @@ impl PythonGenerator {
         self.writeln("def _u8(x):");
         self.indent();
         self.writeln("return x & 0xFF");
+        self.dedent();
+        self.writeln("");
+
+        self.writeln("def _u16(x):");
+        self.indent();
+        self.writeln("return x & 0xFFFF");
         self.dedent();
         self.writeln("");
 
@@ -549,6 +607,15 @@ impl PythonGenerator {
     }
 
     fn generate_function(&mut self, func: &Function) {
+        // Track parameter element types for correct masking
+        let saved_elem_types = self.var_elem_types.clone();
+        for param in &func.params {
+            if let Some(elem_prim) = Self::element_primitive(&param.ty) {
+                self.var_elem_types
+                    .insert(param.name.name.clone(), elem_prim);
+            }
+        }
+
         self.write_indent();
         self.write(&format!("def {}(", func.name.name));
 
@@ -571,6 +638,7 @@ impl PythonGenerator {
 
         self.dedent();
         self.writeln("");
+        self.var_elem_types = saved_elem_types;
     }
 
     fn generate_block(&mut self, block: &Block) {
@@ -588,6 +656,22 @@ impl PythonGenerator {
                 {
                     self.var_types
                         .insert(name.name.clone(), type_ident.name.clone());
+                }
+
+                // Track element types for arrays/slices (for correct masking on assignment)
+                if let Some(ty) = ty
+                    && let Some(elem_prim) = Self::element_primitive(ty)
+                {
+                    self.var_elem_types.insert(name.name.clone(), elem_prim);
+                }
+
+                // Also infer element type from ArrayRepeat with cast: [val as u8; N]
+                if let Some(init_expr) = init
+                    && let ExprKind::ArrayRepeat { value, .. } = &init_expr.kind
+                    && let ExprKind::Cast { ty, .. } = &value.kind
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    self.var_elem_types.insert(name.name.clone(), *p);
                 }
 
                 // Infer type from static method calls like TypeName__new() or TypeName::new()
@@ -686,31 +770,75 @@ impl PythonGenerator {
                         return;
                     }
                 }
+                // Check if target is an array element with a narrow type that needs masking
+                let wrap_fn = Self::index_target_var(target).and_then(|var| {
+                    self.var_elem_types
+                        .get(var)
+                        .and_then(|p| Self::wrap_fn_for_primitive(*p))
+                });
+
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
-                self.generate_expr(value);
+                if let Some(wfn) = wrap_fn {
+                    self.write(&format!("{}(", wfn));
+                    self.generate_expr(value);
+                    self.write(")");
+                } else {
+                    self.generate_expr(value);
+                }
                 self.write("\n");
             }
             StmtKind::CompoundAssign { target, op, value } => {
-                self.write_indent();
-                self.generate_expr(target);
-                let op_str = match op {
-                    BinaryOp::Add => " += ",
-                    BinaryOp::Sub => " -= ",
-                    BinaryOp::Mul => " *= ",
-                    BinaryOp::Div => " //= ",
-                    BinaryOp::Rem => " %= ",
-                    BinaryOp::BitAnd => " &= ",
-                    BinaryOp::BitOr => " |= ",
-                    BinaryOp::BitXor => " ^= ",
-                    BinaryOp::Shl => " <<= ",
-                    BinaryOp::Shr => " >>= ",
-                    _ => " = ",
-                };
-                self.write(op_str);
-                self.generate_expr(value);
-                self.write("\n");
+                // Check if target is an array element with a narrow type that needs masking
+                let wrap_fn = Self::index_target_var(target).and_then(|var| {
+                    self.var_elem_types
+                        .get(var)
+                        .and_then(|p| Self::wrap_fn_for_primitive(*p))
+                });
+
+                if let Some(wfn) = wrap_fn {
+                    // Can't use compound assignment with masking, expand to full assignment
+                    self.write_indent();
+                    self.generate_expr(target);
+                    self.write(&format!(" = {}(", wfn));
+                    self.generate_expr(target);
+                    let op_str = match op {
+                        BinaryOp::Add => " + ",
+                        BinaryOp::Sub => " - ",
+                        BinaryOp::Mul => " * ",
+                        BinaryOp::Div => " // ",
+                        BinaryOp::Rem => " % ",
+                        BinaryOp::BitAnd => " & ",
+                        BinaryOp::BitOr => " | ",
+                        BinaryOp::BitXor => " ^ ",
+                        BinaryOp::Shl => " << ",
+                        BinaryOp::Shr => " >> ",
+                        _ => " + ",
+                    };
+                    self.write(op_str);
+                    self.generate_expr(value);
+                    self.write(")\n");
+                } else {
+                    self.write_indent();
+                    self.generate_expr(target);
+                    let op_str = match op {
+                        BinaryOp::Add => " += ",
+                        BinaryOp::Sub => " -= ",
+                        BinaryOp::Mul => " *= ",
+                        BinaryOp::Div => " //= ",
+                        BinaryOp::Rem => " %= ",
+                        BinaryOp::BitAnd => " &= ",
+                        BinaryOp::BitOr => " |= ",
+                        BinaryOp::BitXor => " ^= ",
+                        BinaryOp::Shl => " <<= ",
+                        BinaryOp::Shr => " >>= ",
+                        _ => " = ",
+                    };
+                    self.write(op_str);
+                    self.generate_expr(value);
+                    self.write("\n");
+                }
             }
             StmtKind::If {
                 condition,
