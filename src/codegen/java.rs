@@ -55,6 +55,9 @@ pub struct JavaGenerator {
     loop_var_renames: HashMap<String, String>,
     /// Current struct name for resolving SelfType (set during method/function generation)
     current_struct_name: Option<String>,
+    /// Variables known to be non-u8 arrays (e.g., int[], long[])
+    #[allow(dead_code)]
+    non_u8_array_vars: HashSet<String>,
 }
 
 impl JavaGenerator {
@@ -74,6 +77,7 @@ impl JavaGenerator {
             loop_var_counter: 0,
             loop_var_renames: HashMap::new(),
             current_struct_name: None,
+            non_u8_array_vars: HashSet::new(),
         }
     }
 
@@ -250,6 +254,28 @@ impl JavaGenerator {
         }
     }
 
+    /// Whether a type is an array of non-u8 primitives (e.g., u32[8], u64[4]).
+    /// Used to detect variables that need `Arrays.fill(arr, 0)` for secure_zero.
+    fn is_non_u8_array_type(ty: &ParserType) -> bool {
+        use crate::parser::{PrimitiveType, TypeKind};
+        let inner_ty = match &ty.kind {
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => inner.as_ref(),
+            _ => ty,
+        };
+        match &inner_ty.kind {
+            TypeKind::Array { element, .. }
+            | TypeKind::Slice { element }
+            | TypeKind::ArrayRef { element, .. } => {
+                if let TypeKind::Primitive(p) = &element.kind {
+                    !matches!(p.to_native(), PrimitiveType::U8 | PrimitiveType::I8)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a primitive type is 64-bit (long) in Java
     fn is_long_type(p: &crate::parser::PrimitiveType) -> bool {
         use crate::parser::PrimitiveType;
@@ -345,6 +371,9 @@ impl JavaGenerator {
                 self.byte_vars.insert(param.name.name.clone());
             } else if Self::is_byte_array_type(&param.ty) {
                 self.byte_array_vars.insert(param.name.name.clone());
+            }
+            if Self::is_non_u8_array_type(&param.ty) {
+                self.non_u8_array_vars.insert(param.name.name.clone());
             }
             // Also register struct types in var_types (looking through refs)
             Self::register_struct_type_for_param(&param.name.name, &param.ty, &mut self.var_types);
@@ -523,6 +552,7 @@ impl JavaGenerator {
         // Clone (not take) byte vars so that global constants remain visible.
         let saved_byte_vars = self.byte_vars.clone();
         let saved_byte_array_vars = self.byte_array_vars.clone();
+        let saved_non_u8_array_vars = self.non_u8_array_vars.clone();
         let saved_var_types_func = self.var_types.clone();
         let saved_return_type = self.current_return_type.take();
         let saved_declared_vars = std::mem::take(&mut self.declared_vars);
@@ -531,6 +561,7 @@ impl JavaGenerator {
         self.generate_block(&func.body);
         self.byte_vars = saved_byte_vars;
         self.byte_array_vars = saved_byte_array_vars;
+        self.non_u8_array_vars = saved_non_u8_array_vars;
         self.var_types = saved_var_types_func;
         self.current_return_type = saved_return_type;
         self.declared_vars = saved_declared_vars;
@@ -566,6 +597,7 @@ impl JavaGenerator {
         self.indent();
         let saved_byte_vars = self.byte_vars.clone();
         let saved_byte_array_vars = self.byte_array_vars.clone();
+        let saved_non_u8_array_vars = self.non_u8_array_vars.clone();
         let saved_var_types_method = self.var_types.clone();
         let saved_return_type = self.current_return_type.take();
         let saved_declared_vars = std::mem::take(&mut self.declared_vars);
@@ -587,6 +619,7 @@ impl JavaGenerator {
         self.generate_block(&func.body);
         self.byte_vars = saved_byte_vars;
         self.byte_array_vars = saved_byte_array_vars;
+        self.non_u8_array_vars = saved_non_u8_array_vars;
         self.var_types = saved_var_types_method;
         self.current_return_type = saved_return_type;
         self.declared_vars = saved_declared_vars;
@@ -601,11 +634,13 @@ impl JavaGenerator {
         self.indent();
         let saved_byte_vars = self.byte_vars.clone();
         let saved_byte_array_vars = self.byte_array_vars.clone();
+        let saved_non_u8_array_vars = self.non_u8_array_vars.clone();
         let saved_return_type = self.current_return_type.take();
         let saved_declared_vars = std::mem::take(&mut self.declared_vars);
         self.generate_block(&test.body);
         self.byte_vars = saved_byte_vars;
         self.byte_array_vars = saved_byte_array_vars;
+        self.non_u8_array_vars = saved_non_u8_array_vars;
         self.current_return_type = saved_return_type;
         self.declared_vars = saved_declared_vars;
         self.dedent();
@@ -800,6 +835,10 @@ impl JavaGenerator {
                         self.byte_vars.insert(name.name.clone());
                     } else if Self::is_byte_array_type(ty) {
                         self.byte_array_vars.insert(name.name.clone());
+                    }
+                    // Track non-u8 array variables for secure_zero -> Arrays.fill
+                    if Self::is_non_u8_array_type(ty) {
+                        self.non_u8_array_vars.insert(name.name.clone());
                     }
                 }
                 // Also infer byte array type from init expression when no
@@ -1729,18 +1768,22 @@ impl JavaGenerator {
                 self.write(")");
             }
             ExprKind::StructLit { name, fields } => {
-                // Create a new struct instance and set fields
-                // In Java we need a block expression - use a helper lambda pattern
-                // Since Java doesn't have expression blocks, we use an immediately invoked pattern:
-                // ((Supplier<StructName>)(() -> { StructName o = new StructName(); o.f1 = v1; ... return o; })).get()
-                // Simpler: just use a static helper. But for inline, let's do:
-                self.write(&format!("new {}() {{ {{ ", name.name));
+                // Create a new struct instance and set fields using an IIFE lambda.
+                // We avoid the anonymous subclass pattern `new T() {{ f = v; }}`
+                // because when a field name matches a local variable name (e.g.,
+                // `data = data;`), the field shadows the local variable inside the
+                // anonymous class, causing the field to be assigned to itself (null).
+                // The lambda pattern avoids this by using a temporary `__s`.
+                self.write(&format!(
+                    "((java.util.function.Supplier<{0}>)(() -> {{ {0} __s = new {0}(); ",
+                    name.name
+                ));
                 for (field_name, value) in fields {
-                    self.write(&format!("{} = ", field_name.name));
+                    self.write(&format!("__s.{} = ", field_name.name));
                     self.generate_expr(value);
                     self.write("; ");
                 }
-                self.write("} }");
+                self.write("return __s; })).get()");
             }
             ExprKind::Conditional {
                 condition,
@@ -2304,21 +2347,26 @@ impl JavaGenerator {
     /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
     fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
         use crate::parser::TypeKind;
-        if let ExprKind::Field { object, field } = &expr.kind
-            && let ExprKind::Ident(obj_ident) = &object.kind
-            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
-            && let Some(fields) = self.struct_defs.get(struct_name)
-        {
-            for f in fields {
-                if f.name == field.name
-                    && let TypeKind::Array { element, .. } = &f.ty.kind
-                    && let TypeKind::Primitive(p) = &element.kind
+        match &expr.kind {
+            ExprKind::Field { object, field } => {
+                if let Some(obj_name) = Self::extract_object_ident_name(object)
+                    && let Some(struct_name) = self.var_types.get(obj_name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
                 {
-                    return p.to_native() != crate::parser::PrimitiveType::U8;
+                    for f in fields {
+                        if f.name == field.name
+                            && let TypeKind::Array { element, .. } = &f.ty.kind
+                            && let TypeKind::Primitive(p) = &element.kind
+                        {
+                            return p.to_native() != crate::parser::PrimitiveType::U8;
+                        }
+                    }
                 }
+                false
             }
+            ExprKind::Ident(ident) => self.non_u8_array_vars.contains(&ident.name),
+            _ => false,
         }
-        false
     }
 
     /// Check if an expression produces a Java `byte` value.
@@ -2498,6 +2546,7 @@ impl CodeGenerator for JavaGenerator {
         self.var_types.clear();
         self.byte_vars.clear();
         self.byte_array_vars.clear();
+        self.non_u8_array_vars.clear();
         self.func_param_types.clear();
         self.current_return_type = None;
         self.declared_vars.clear();

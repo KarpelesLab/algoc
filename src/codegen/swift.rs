@@ -45,6 +45,8 @@ pub struct SwiftGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Variable primitive types (for scalar variables like UInt8, UInt32, etc.)
+    var_prim_types: HashMap<String, crate::parser::PrimitiveType>,
     /// Set of names that are mutable parameters (inout)
     inout_params: std::collections::HashSet<String>,
     /// Function signatures: function name -> Vec<FuncParamInfo>
@@ -62,6 +64,7 @@ impl SwiftGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            var_prim_types: HashMap::new(),
             inout_params: std::collections::HashSet::new(),
             func_param_info: HashMap::new(),
             current_struct_name: None,
@@ -464,6 +467,16 @@ impl SwiftGenerator {
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
         self.current_struct_name = Some(struct_name.to_string());
         self.inout_params.clear();
+        let saved_var_types = self.var_types.clone();
+        let saved_prim_types = self.var_prim_types.clone();
+
+        // Track parameter types for secure_zero detection and type casting
+        for param in &func.params {
+            Self::track_param_type(&param.ty, &param.name.name, &mut self.var_types);
+            if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
+                self.var_prim_types.insert(param.name.name.clone(), *p);
+            }
+        }
 
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
 
@@ -509,6 +522,8 @@ impl SwiftGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.var_types = saved_var_types;
+        self.var_prim_types = saved_prim_types;
         self.current_struct_name = None;
     }
 
@@ -670,6 +685,16 @@ impl SwiftGenerator {
         self.current_struct_name = Self::infer_self_type_name(&func.name.name);
 
         self.inout_params.clear();
+        let saved_var_types = self.var_types.clone();
+        let saved_prim_types = self.var_prim_types.clone();
+
+        // Track parameter types for secure_zero detection and type casting
+        for param in &func.params {
+            Self::track_param_type(&param.ty, &param.name.name, &mut self.var_types);
+            if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
+                self.var_prim_types.insert(param.name.name.clone(), *p);
+            }
+        }
 
         let func_safe_name = Self::swift_safe_ident(&func.name.name);
         self.write_indent();
@@ -714,6 +739,8 @@ impl SwiftGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.var_types = saved_var_types;
+        self.var_prim_types = saved_prim_types;
         self.current_struct_name = None;
     }
 
@@ -824,12 +851,12 @@ impl SwiftGenerator {
     }
 
     /// Check if an expression might produce a Swift `Int` value instead of a UInt type.
-    /// This covers loop variables (plain identifiers), .count results, and Int arithmetic.
-    #[allow(clippy::only_used_in_recursion)]
+    /// This covers loop variables (plain identifiers not known to be a specific type),
+    /// .count results, and Int arithmetic.
     fn expr_might_be_int(&self, expr: &Expr) -> bool {
         match &expr.kind {
-            // Plain identifiers could be loop variables (which are Int in Swift)
-            ExprKind::Ident(_) => true,
+            // Plain identifiers: only if we don't know their type (e.g., loop variables)
+            ExprKind::Ident(ident) => !self.var_prim_types.contains_key(&ident.name),
             // Binary expressions with Int operands produce Int
             ExprKind::Binary { left, right, .. } => {
                 self.expr_might_be_int(left) || self.expr_might_be_int(right)
@@ -846,6 +873,8 @@ impl SwiftGenerator {
             | ExprKind::TypeStaticCall { .. } => false,
             // Field access might produce Int but our .len() already wraps with UInt64
             ExprKind::Field { .. } => false,
+            // Index expressions return the element type, not Int
+            ExprKind::Index { .. } => false,
             _ => false,
         }
     }
@@ -893,6 +922,13 @@ impl SwiftGenerator {
                 {
                     self.var_types
                         .insert(name.name.clone(), type_ident.name.clone());
+                }
+
+                // Track scalar primitive types for correct Int-to-UIntXX casting
+                if let Some(ty) = ty
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    self.var_prim_types.insert(name.name.clone(), *p);
                 }
 
                 // Also infer type from static method calls like TypeName__new()
@@ -1009,7 +1045,19 @@ impl SwiftGenerator {
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
-                self.generate_expr(value);
+                // Wrap with explicit type cast when assigning an Int expression
+                // to a UInt variable (e.g., loop counter to UInt32)
+                if let Some(target_type) = self.get_target_prim_type(target) {
+                    if target_type != "Bool" && self.expr_might_be_int(value) {
+                        self.write(&format!("{}(truncatingIfNeeded: ", target_type));
+                        self.generate_expr(value);
+                        self.write(")");
+                    } else {
+                        self.generate_expr(value);
+                    }
+                } else {
+                    self.generate_expr(value);
+                }
                 self.write("\n");
             }
             StmtKind::CompoundAssign { target, op, value } => {
@@ -1233,6 +1281,23 @@ impl SwiftGenerator {
                         self.generate_expr(arg);
                     }
                     self.write(")");
+                    return;
+                }
+
+                // Handle secure_zero calls on non-u8 arrays (e.g., [UInt32])
+                // secure_zero expects inout [UInt8] but state.h is [UInt32].
+                // Generate a fill with zeros instead.
+                if let ExprKind::Ident(ident) = &func.kind
+                    && ident.name == "secure_zero"
+                    && args.len() == 1
+                    && let ExprKind::MutRef(inner) = &args[0].kind
+                    && self.is_non_u8_array_expr(inner)
+                {
+                    self.write("for __i in 0..<");
+                    self.generate_expr(inner);
+                    self.write(".count { ");
+                    self.generate_expr(inner);
+                    self.write("[__i] = 0 }");
                     return;
                 }
 
@@ -1892,6 +1957,74 @@ impl SwiftGenerator {
         }
         None
     }
+
+    /// Track struct type from a function parameter's type annotation.
+    fn track_param_type(
+        ty: &ParserType,
+        param_name: &str,
+        var_types: &mut HashMap<String, String>,
+    ) {
+        match &ty.kind {
+            crate::parser::TypeKind::Named(ident) => {
+                var_types.insert(param_name.to_string(), ident.name.clone());
+            }
+            crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) => {
+                Self::track_param_type(inner, param_name, var_types);
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
+    /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
+    fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
+        use crate::parser::TypeKind;
+        if let ExprKind::Field { object, field } = &expr.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+            && let Some(fields) = self.struct_defs.get(struct_name)
+        {
+            for f in fields {
+                if f.name == field.name
+                    && let TypeKind::Array { element, .. } = &f.ty.kind
+                {
+                    if let TypeKind::Primitive(p) = &element.kind {
+                        return *p != crate::parser::PrimitiveType::U8;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get the Swift type string for a target expression if it's a known scalar variable.
+    /// Returns the Swift type (e.g., "UInt32") when the target variable has a tracked primitive type.
+    fn get_target_prim_type(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(ident) => self
+                .var_prim_types
+                .get(&ident.name)
+                .map(|p| self.swift_primitive_type(*p)),
+            ExprKind::Field { object, field } => {
+                // Check for struct field access: object.field
+                if let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name
+                            && let crate::parser::TypeKind::Primitive(p) = &f.ty.kind
+                        {
+                            return Some(self.swift_primitive_type(*p));
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Check if an expression is likely an array type (used for comparison)
@@ -1970,6 +2103,7 @@ impl CodeGenerator for SwiftGenerator {
         self.struct_defs.clear();
         self.struct_methods.clear();
         self.var_types.clear();
+        self.var_prim_types.clear();
         self.func_param_info.clear();
 
         // Pre-pass: collect struct field info, methods, and function signatures

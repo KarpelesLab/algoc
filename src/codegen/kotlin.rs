@@ -1659,6 +1659,20 @@ impl KotlinGenerator {
                     return;
                 }
 
+                // Handle secure_zero calls on non-u8 arrays (e.g., UIntArray)
+                // secure_zero expects UByteArray but state.h is UIntArray.
+                // Generate .fill(0u) instead.
+                if let ExprKind::Ident(ident) = &func.kind
+                    && ident.name == "secure_zero"
+                    && args.len() == 1
+                    && let ExprKind::MutRef(inner) = &args[0].kind
+                    && self.is_non_u8_array_expr(inner)
+                {
+                    self.generate_expr(inner);
+                    self.write(".fill(0u)");
+                    return;
+                }
+
                 // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
@@ -2522,6 +2536,29 @@ impl KotlinGenerator {
             return Some(func_name[..idx].to_string());
         }
         None
+    }
+
+    /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
+    /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
+    fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
+        use crate::parser::TypeKind;
+        if let ExprKind::Field { object, field } = &expr.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+            && let Some(fields) = self.struct_defs.get(struct_name)
+        {
+            for f in fields {
+                if f.name == field.name
+                    && let TypeKind::Array { element, .. } = &f.ty.kind
+                {
+                    if let TypeKind::Primitive(p) = &element.kind {
+                        return *p != crate::parser::PrimitiveType::U8;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

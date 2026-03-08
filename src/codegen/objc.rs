@@ -9,10 +9,10 @@ use super::CodeGenerator;
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
-    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
+    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, ItemKind, Stmt, StmtKind,
     Type as ParserType, UnaryOp,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Struct field info for code generation
 #[derive(Clone)]
@@ -38,6 +38,8 @@ pub struct ObjCGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Variables that are pointers (from &mut / & parameters), needing -> instead of .
+    pointer_vars: HashSet<String>,
 }
 
 impl ObjCGenerator {
@@ -49,6 +51,7 @@ impl ObjCGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            pointer_vars: HashSet::new(),
         }
     }
 
@@ -156,6 +159,31 @@ impl ObjCGenerator {
         }
     }
 
+    /// Check if a parameter type results in a pointer to a struct/primitive (not array/slice)
+    /// and thus needs -> for field access instead of .
+    fn is_pointer_param(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                matches!(
+                    inner.kind,
+                    TypeKind::Named(_) | TypeKind::Primitive(_) | TypeKind::SelfType
+                )
+            }
+            _ => false,
+        }
+    }
+
+    /// Populate pointer_vars from function parameters
+    fn collect_pointer_params(&mut self, func: &Function) {
+        self.pointer_vars.clear();
+        for param in &func.params {
+            if Self::is_pointer_param(&param.ty) {
+                self.pointer_vars.insert(param.name.name.clone());
+            }
+        }
+    }
+
     /// Generate the runtime helper functions
     fn generate_runtime(&mut self) {
         self.writeln("// ---- Runtime Helpers ----");
@@ -170,7 +198,7 @@ impl ObjCGenerator {
         self.writeln("");
 
         // Reader struct and functions
-        self.writeln("typedef struct {");
+        self.writeln("typedef struct Reader {");
         self.indent();
         self.writeln("const uint8_t *data;");
         self.writeln("size_t len;");
@@ -296,7 +324,7 @@ impl ObjCGenerator {
         self.writeln("");
 
         // Writer struct and functions
-        self.writeln("typedef struct {");
+        self.writeln("typedef struct Writer {");
         self.indent();
         self.writeln("uint8_t *data;");
         self.writeln("size_t len;");
@@ -458,36 +486,164 @@ impl ObjCGenerator {
     }
 
     fn generate_ast(&mut self, ast: &Ast) {
+        // Pass 1: Emit type definitions (structs, enums, layouts, consts)
         for item in &ast.items {
-            self.generate_item(item);
+            match &item.kind {
+                ItemKind::Struct(s) => self.generate_struct(s),
+                ItemKind::Layout(l) => self.generate_layout(l),
+                ItemKind::Enum(e) => self.generate_enum(e),
+                ItemKind::Const(c) => self.generate_const(c),
+                _ => {}
+            }
+        }
+
+        // Pass 2: Emit forward declarations for all functions and methods
+        self.generate_forward_declarations(ast);
+
+        // Pass 3: Emit function/method/test definitions
+        for item in &ast.items {
+            match &item.kind {
+                ItemKind::Function(func) => self.generate_function(func),
+                ItemKind::Impl(impl_def) => {
+                    for method in &impl_def.methods {
+                        self.generate_method(&impl_def.target.name, method);
+                    }
+                }
+                ItemKind::Test(test) => {
+                    if self.include_tests {
+                        self.generate_test(test);
+                    }
+                }
+                ItemKind::Use(_)
+                | ItemKind::Interface(_)
+                | ItemKind::Struct(_)
+                | ItemKind::Layout(_)
+                | ItemKind::Enum(_)
+                | ItemKind::Const(_) => {
+                    // Already handled in pass 1 or not needed
+                }
+            }
         }
     }
 
-    fn generate_item(&mut self, item: &Item) {
-        match &item.kind {
-            ItemKind::Function(func) => self.generate_function(func),
-            ItemKind::Const(c) => self.generate_const(c),
-            ItemKind::Struct(s) => self.generate_struct(s),
-            ItemKind::Layout(l) => self.generate_layout(l),
-            ItemKind::Enum(e) => self.generate_enum(e),
-            ItemKind::Test(test) => {
-                if self.include_tests {
-                    self.generate_test(test);
+    /// Generate forward declarations for all functions and methods
+    fn generate_forward_declarations(&mut self, ast: &Ast) {
+        let mut has_decls = false;
+
+        for item in &ast.items {
+            match &item.kind {
+                ItemKind::Function(func) => {
+                    self.generate_forward_decl(func, None);
+                    has_decls = true;
                 }
-            }
-            ItemKind::Use(_) => {
-                // Use statements are handled during loading, items are already merged
-            }
-            ItemKind::Impl(impl_def) => {
-                // Generate methods as standalone functions with mangled names
-                for method in &impl_def.methods {
-                    self.generate_method(&impl_def.target.name, method);
+                ItemKind::Impl(impl_def) => {
+                    for method in &impl_def.methods {
+                        self.generate_forward_decl(method, Some(&impl_def.target.name));
+                        has_decls = true;
+                    }
                 }
-            }
-            ItemKind::Interface(_) => {
-                // Interfaces are compile-time only, no runtime representation
+                ItemKind::Test(test) => {
+                    if self.include_tests {
+                        self.writeln(&format!("static void test_{}(void);", test.name.name));
+                        has_decls = true;
+                    }
+                }
+                _ => {}
             }
         }
+
+        if has_decls {
+            self.writeln("");
+        }
+    }
+
+    /// Generate a forward declaration for a function or method
+    fn generate_forward_decl(&mut self, func: &Function, struct_name: Option<&str>) {
+        let func_name = if let Some(sn) = struct_name {
+            format!("{}__{}", sn, func.name.name)
+        } else {
+            func.name.name.clone()
+        };
+
+        // Return type - resolve Self to actual struct name
+        let ret_type = if let Some(ref rt) = func.return_type {
+            match &rt.kind {
+                crate::parser::TypeKind::Named(ident)
+                    if ident.name == "Self" && struct_name.is_some() =>
+                {
+                    format!("struct {}", struct_name.unwrap())
+                }
+                crate::parser::TypeKind::SelfType if struct_name.is_some() => {
+                    format!("struct {}", struct_name.unwrap())
+                }
+                crate::parser::TypeKind::Named(ident) => format!("struct {}", ident.name),
+                crate::parser::TypeKind::Array { .. } => "void".to_string(),
+                _ => self.type_to_c(rt),
+            }
+        } else {
+            "void".to_string()
+        };
+
+        self.write_indent();
+        self.write(&format!("{} {}(", ret_type, func_name));
+
+        let mut first = true;
+        for param in &func.params {
+            if !first {
+                self.write(", ");
+            }
+            first = false;
+
+            if param.name.name == "self" {
+                if let Some(sn) = struct_name {
+                    self.write(&format!("struct {}* self", sn));
+                } else {
+                    self.write("void* self");
+                }
+            } else {
+                let base_type = self.type_to_c_base(&param.ty);
+                let arr_suffix = self.type_array_suffix(&param.ty);
+                if arr_suffix.is_empty() {
+                    match &param.ty.kind {
+                        crate::parser::TypeKind::Slice { element }
+                        | crate::parser::TypeKind::ArrayRef { element, .. } => {
+                            let elem_type = self.type_to_c(element);
+                            self.write(&format!("{}* {}", elem_type, param.name.name));
+                        }
+                        crate::parser::TypeKind::MutRef(inner)
+                        | crate::parser::TypeKind::Ref(inner) => match &inner.kind {
+                            crate::parser::TypeKind::Slice { element }
+                            | crate::parser::TypeKind::ArrayRef { element, .. } => {
+                                let elem_type = self.type_to_c(element);
+                                self.write(&format!("{}* {}", elem_type, param.name.name));
+                            }
+                            crate::parser::TypeKind::Array { .. } => {
+                                let base = self.type_to_c_base(inner);
+                                self.write(&format!("{}* {}", base, param.name.name));
+                            }
+                            _ => {
+                                let inner_type = self.type_to_c(inner);
+                                self.write(&format!("{}* {}", inner_type, param.name.name));
+                            }
+                        },
+                        crate::parser::TypeKind::Named(ident) => {
+                            self.write(&format!("struct {} {}", ident.name, param.name.name));
+                        }
+                        _ => {
+                            self.write(&format!("{} {}", base_type, param.name.name));
+                        }
+                    }
+                } else {
+                    self.write(&format!("{}* {}", base_type, param.name.name));
+                }
+            }
+        }
+
+        if first {
+            self.write("void");
+        }
+
+        self.write(");\n");
     }
 
     fn generate_function(&mut self, func: &Function) {
@@ -577,6 +733,7 @@ impl ObjCGenerator {
 
         self.write(") {\n");
         self.indent();
+        self.collect_pointer_params(func);
         self.generate_block(&func.body);
         self.dedent();
         self.writeln("}");
@@ -588,11 +745,14 @@ impl ObjCGenerator {
 
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
 
-        // Return type
+        // Return type - resolve Self to the actual struct name
         let ret_type = if let Some(ref rt) = func.return_type {
-            // Check if return type is Named and matches the struct name → return struct by value
             match &rt.kind {
+                crate::parser::TypeKind::Named(ident) if ident.name == "Self" => {
+                    format!("struct {}", struct_name)
+                }
                 crate::parser::TypeKind::Named(ident) => format!("struct {}", ident.name),
+                crate::parser::TypeKind::SelfType => format!("struct {}", struct_name),
                 _ => self.type_to_c(rt),
             }
         } else {
@@ -668,6 +828,9 @@ impl ObjCGenerator {
 
         self.write(") {\n");
         self.indent();
+        self.collect_pointer_params(func);
+        // 'self' is always a pointer in methods
+        self.pointer_vars.insert("self".to_string());
         self.generate_block(&func.body);
         self.dedent();
         self.writeln("}");
@@ -708,7 +871,8 @@ impl ObjCGenerator {
     }
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
-        self.writeln("typedef struct {");
+        // Use tagged struct so both `StructName` and `struct StructName` work
+        self.writeln(&format!("typedef struct {} {{", s.name.name));
         self.indent();
         for field in &s.fields {
             let base_type = self.type_to_c_base(&field.ty);
@@ -718,15 +882,11 @@ impl ObjCGenerator {
         self.dedent();
         self.writeln(&format!("}} {};", s.name.name));
         self.writeln("");
-
-        // Also emit with the 'struct' tag for compatibility
-        // The typedef above makes both `StructName` and `struct StructName` work
-        // Actually, we need to emit it properly so that `struct Name` also works
     }
 
     fn generate_layout(&mut self, l: &crate::parser::LayoutDef) {
-        // Layouts are similar to structs in C
-        self.writeln("typedef struct {");
+        // Layouts are similar to structs in C - use tagged struct
+        self.writeln(&format!("typedef struct {} {{", l.name.name));
         self.indent();
         for field in &l.fields {
             let base_type = self.type_to_c_base(&field.ty);
@@ -1304,11 +1464,11 @@ impl ObjCGenerator {
                 self.write(")");
             }
             ExprKind::Field { object, field } => {
-                // Check if the object is a dereference (pointer -> use ->)
+                // Check if the object is a pointer (from &mut / & parameters) -> use ->
                 if let ExprKind::Ident(ident) = &object.kind
-                    && ident.name == "self"
+                    && self.pointer_vars.contains(&ident.name)
                 {
-                    self.write(&format!("self->{}", field.name));
+                    self.write(&format!("{}->{}", ident.name, field.name));
                     return;
                 }
                 self.generate_expr(object);
@@ -1377,13 +1537,18 @@ impl ObjCGenerator {
                         && let Some(struct_name) = self.var_types.get(&var_ident.name).cloned()
                         && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
                     {
+                        let accessor = if self.pointer_vars.contains(&var_ident.name) {
+                            "->"
+                        } else {
+                            "."
+                        };
                         self.write("do { ");
                         for field_info in &fields {
                             if let Some(read_method) = self.get_read_method_for_type(&field_info.ty)
                             {
                                 self.write(&format!(
-                                    "{}.{} = {}(&",
-                                    var_ident.name, field_info.name, read_method
+                                    "{}{}{} = {}(&",
+                                    var_ident.name, accessor, field_info.name, read_method
                                 ));
                                 self.generate_expr(object);
                                 self.write("); ");
@@ -1404,6 +1569,11 @@ impl ObjCGenerator {
                             && let Some(struct_name) = self.var_types.get(&var_ident.name).cloned()
                             && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
                         {
+                            let accessor = if self.pointer_vars.contains(&var_ident.name) {
+                                "->"
+                            } else {
+                                "."
+                            };
                             self.write("do { ");
                             for field_info in &fields {
                                 if let Some(write_method) =
@@ -1412,8 +1582,8 @@ impl ObjCGenerator {
                                     self.write(&format!("{}(&", write_method));
                                     self.generate_expr(object);
                                     self.write(&format!(
-                                        ", {}.{}); ",
-                                        var_ident.name, field_info.name
+                                        ", {}{}{}); ",
+                                        var_ident.name, accessor, field_info.name
                                     ));
                                 }
                             }
@@ -1471,8 +1641,14 @@ impl ObjCGenerator {
                         && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
                         && let Some(mangled_name) = methods.get(&field.name)
                     {
-                        // Generate: StructName__method(&object, args...)
-                        self.write(&format!("{}(&", mangled_name));
+                        // Generate: StructName__method(&object, args...) or StructName__method(object, args...) if already a pointer
+                        let is_ptr = self.pointer_vars.contains(&obj_ident.name);
+                        let mangled_name = mangled_name.clone();
+                        if is_ptr {
+                            self.write(&format!("{}(", mangled_name));
+                        } else {
+                            self.write(&format!("{}(&", mangled_name));
+                        }
                         self.generate_expr(object);
                         for arg in args {
                             self.write(", ");

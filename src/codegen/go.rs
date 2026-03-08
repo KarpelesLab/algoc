@@ -57,6 +57,8 @@ pub struct GoGenerator {
     needs_cond_uint64: bool,
     needs_cond_bool: bool,
     needs_cond_bytes: bool,
+    /// Current impl struct name for resolving Self type
+    current_impl_struct: Option<String>,
 }
 
 impl GoGenerator {
@@ -81,6 +83,7 @@ impl GoGenerator {
             needs_cond_uint64: false,
             needs_cond_bool: false,
             needs_cond_bytes: false,
+            current_impl_struct: None,
         }
     }
 
@@ -269,12 +272,30 @@ impl GoGenerator {
                 // since Go doesn't use references to arrays — slices serve that role.
                 if let TypeKind::Array { element, .. } = &inner.kind {
                     format!("[]{}", self.go_type(element))
+                } else if matches!(inner.kind, TypeKind::Named(_) | TypeKind::SelfType) {
+                    // References to structs (or Self) become pointers in Go so that
+                    // mutations inside called functions are visible to callers.
+                    format!("*{}", self.go_type(inner))
                 } else {
                     self.go_type(inner)
                 }
             }
-            TypeKind::Named(ident) => ident.name.clone(),
-            TypeKind::SelfType => "interface{}".to_string(),
+            TypeKind::Named(ident) => {
+                // Resolve "Self" to the actual struct name when inside an impl block
+                if ident.name == "Self"
+                    && let Some(ref name) = self.current_impl_struct
+                {
+                    return name.clone();
+                }
+                ident.name.clone()
+            }
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_impl_struct {
+                    name.clone()
+                } else {
+                    "interface{}".to_string()
+                }
+            }
         }
     }
 
@@ -709,6 +730,7 @@ impl GoGenerator {
                 self.pre_scan_block(&func.body);
             }
             ItemKind::Impl(impl_def) => {
+                self.current_impl_struct = Some(impl_def.target.name.clone());
                 for method in &impl_def.methods {
                     // Track method return types with mangled names
                     if let Some(ret_ty) = &method.return_type {
@@ -717,6 +739,7 @@ impl GoGenerator {
                     }
                     self.pre_scan_block(&method.body);
                 }
+                self.current_impl_struct = None;
             }
             ItemKind::Test(test) => {
                 if self.include_tests {
@@ -964,8 +987,19 @@ impl GoGenerator {
         }
     }
 
+    /// Check if a type is or contains SelfType (e.g., `&mut Self`, `Self`).
+    fn is_self_type(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::SelfType => true,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => Self::is_self_type(inner),
+            _ => false,
+        }
+    }
+
     fn generate_function(&mut self, func: &Function) {
         // Clear per-function type tracking
+        self.var_types.clear();
         self.var_go_types.clear();
         self.param_go_types.clear();
 
@@ -1008,8 +1042,11 @@ impl GoGenerator {
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
         // Clear per-function type tracking
+        self.var_types.clear();
         self.var_go_types.clear();
         self.param_go_types.clear();
+        // Set current impl struct for resolving Self type
+        self.current_impl_struct = Some(struct_name.to_string());
 
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
 
@@ -1031,6 +1068,10 @@ impl GoGenerator {
             // Track named/struct types for field access type inference
             if let Some(sname) = Self::extract_named_type(&param.ty) {
                 self.var_types.insert(param.name.name.clone(), sname);
+            } else if Self::is_self_type(&param.ty) {
+                // For Self type parameters (e.g., &mut self), track as the impl struct
+                self.var_types
+                    .insert(param.name.name.clone(), struct_name.to_string());
             }
             self.write(&format!("{} {}", param.name.name, go_ty));
         }
@@ -1048,9 +1089,14 @@ impl GoGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.current_impl_struct = None;
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
+        // Clear per-function type tracking
+        self.var_types.clear();
+        self.var_go_types.clear();
+        self.param_go_types.clear();
         self.writeln(&format!("func test_{}() {{", test.name.name));
         self.indent();
         self.generate_block(&test.body);
@@ -2027,10 +2073,51 @@ impl GoGenerator {
                 // for other types we just pass the value.
                 // If the inner expression is a fixed-size array, we need to
                 // convert it to a slice with [:] so it can be passed as []T.
+                // If the inner expression is a struct variable, we need to
+                // take its address with & so the pointer is passed.
                 let inner_type = self.infer_expr_go_type(inner);
                 let needs_slice = inner_type
                     .as_ref()
                     .is_some_and(|t| is_fixed_array_go_type(t));
+                let needs_addr = match &inner.kind {
+                    ExprKind::Ident(ident) => {
+                        // Only take address if this is a struct variable that
+                        // is NOT already a pointer (i.e., not a &mut param).
+                        let is_struct_var = self.var_types.contains_key(&ident.name);
+                        let already_ptr = self
+                            .param_go_types
+                            .get(&ident.name)
+                            .or_else(|| self.var_go_types.get(&ident.name))
+                            .is_some_and(|t| t.starts_with('*'));
+                        is_struct_var && !already_ptr
+                    }
+                    ExprKind::Field { object, field } => {
+                        // Check if the field itself is a struct type
+                        if let ExprKind::Ident(obj_ident) = &object.kind {
+                            if let Some(struct_name) = self.var_types.get(&obj_ident.name) {
+                                if let Some(fields) = self.struct_defs.get(struct_name) {
+                                    fields.iter().any(|f| {
+                                        f.name == field.name
+                                            && matches!(
+                                                f.ty.kind,
+                                                crate::parser::TypeKind::Named(_)
+                                            )
+                                    })
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if needs_addr {
+                    self.write("&");
+                }
                 self.generate_expr(inner);
                 if needs_slice {
                     self.write("[:]");

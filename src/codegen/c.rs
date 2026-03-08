@@ -52,6 +52,11 @@ pub struct CGenerator {
     /// Variables that are fixed-size arrays (decay to pointers, no & needed)
     /// Maps variable name to known array size.
     fixed_array_vars: HashMap<String, u64>,
+    /// Generated `_len` companion parameter names (e.g., "data_len" from param `data: &[u8]`).
+    /// Used to detect local variable name conflicts.
+    len_param_names: HashSet<String>,
+    /// Mapping from original variable name to renamed variable (to avoid _len conflicts).
+    var_renames: HashMap<String, String>,
 }
 
 impl CGenerator {
@@ -67,6 +72,8 @@ impl CGenerator {
             func_signatures: HashMap::new(),
             slice_vars: HashSet::new(),
             fixed_array_vars: HashMap::new(),
+            len_param_names: HashSet::new(),
+            var_renames: HashMap::new(),
         }
     }
 
@@ -221,8 +228,32 @@ impl CGenerator {
         }
     }
 
+    /// Look up a struct field's fixed array size.
+    /// Returns Some(size) if the field is a fixed-size array, None otherwise.
+    fn get_struct_field_array_size(&self, object: &Expr, field_name: &str) -> Option<u64> {
+        // Determine the struct type from var_types
+        let struct_name = if let ExprKind::Ident(ident) = &object.kind {
+            self.var_types.get(&ident.name)?.clone()
+        } else {
+            return None;
+        };
+        // Look up the field in struct_defs
+        let fields = self.struct_defs.get(&struct_name)?;
+        let field_info = fields.iter().find(|f| f.name == field_name)?;
+        Self::get_array_size(&field_info.ty)
+    }
+
     /// Get the return type string for a function
     fn return_type_to_c(&self, ty: Option<&ParserType>) -> String {
+        self.return_type_to_c_with_self(ty, None)
+    }
+
+    /// Get the return type string for a function, resolving Self to the given struct name
+    fn return_type_to_c_with_self(
+        &self,
+        ty: Option<&ParserType>,
+        self_struct: Option<&str>,
+    ) -> String {
         match ty {
             None => "void".to_string(),
             Some(ty) => {
@@ -230,7 +261,24 @@ impl CGenerator {
                     // Can't return arrays in C, return void (use out param)
                     "void".to_string()
                 } else {
-                    self.type_to_c(ty)
+                    // Resolve Self/SelfType to the actual struct name
+                    match &ty.kind {
+                        crate::parser::TypeKind::SelfType => {
+                            if let Some(name) = self_struct {
+                                name.to_string()
+                            } else {
+                                self.type_to_c(ty)
+                            }
+                        }
+                        crate::parser::TypeKind::Named(ident) if ident.name == "Self" => {
+                            if let Some(name) = self_struct {
+                                name.to_string()
+                            } else {
+                                self.type_to_c(ty)
+                            }
+                        }
+                        _ => self.type_to_c(ty),
+                    }
                 }
             }
         }
@@ -701,7 +749,7 @@ impl CGenerator {
     /// Generate a forward declaration for a method (mangled name)
     fn generate_method_forward_decl(&mut self, struct_name: &str, func: &Function) {
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
-        let ret_ty = self.return_type_to_c(func.return_type.as_ref());
+        let ret_ty = self.return_type_to_c_with_self(func.return_type.as_ref(), Some(struct_name));
         self.write_indent();
         self.write(&format!("static {} {}(", ret_ty, mangled_name));
 
@@ -943,17 +991,21 @@ impl CGenerator {
         }
     }
 
-    /// Populate pointer_vars, slice_vars, and fixed_array_vars from function parameters
+    /// Populate pointer_vars, slice_vars, fixed_array_vars, and len_param_names from function parameters
     fn collect_pointer_params(&mut self, func: &Function) {
         self.pointer_vars.clear();
         self.slice_vars.clear();
         self.fixed_array_vars.clear();
+        self.len_param_names.clear();
+        self.var_renames.clear();
         for param in &func.params {
             if Self::is_pointer_param(&param.ty) {
                 self.pointer_vars.insert(param.name.name.clone());
             }
             if Self::param_needs_len(&param.ty) {
                 self.slice_vars.insert(param.name.name.clone());
+                self.len_param_names
+                    .insert(format!("{}_len", param.name.name));
             }
             if let Some(size) = Self::get_fixed_array_param_size(&param.ty) {
                 self.fixed_array_vars.insert(param.name.name.clone(), size);
@@ -992,7 +1044,7 @@ impl CGenerator {
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
-        let ret_ty = self.return_type_to_c(func.return_type.as_ref());
+        let ret_ty = self.return_type_to_c_with_self(func.return_type.as_ref(), Some(struct_name));
 
         self.write_indent();
         self.write(&format!("static {} {}(", ret_ty, mangled_name));
@@ -1339,12 +1391,24 @@ impl CGenerator {
     ) {
         use crate::parser::TypeKind;
 
+        // Check if this variable name conflicts with a generated _len parameter companion.
+        // If so, rename to avoid redeclaration errors in C.
+        let effective_name = if self.len_param_names.contains(&name.name) {
+            let renamed = format!("_local_{}", name.name);
+            self.var_renames.insert(name.name.clone(), renamed.clone());
+            renamed
+        } else {
+            name.name.clone()
+        };
+        // Use a temporary Ident-like struct for generating with the effective name
+        let name_str = &effective_name;
+
         match ty {
             Some(ty) => match &ty.kind {
                 TypeKind::Array { element, size } => {
                     let base_ty = self.type_to_c_base(ty);
                     self.write_indent();
-                    self.write(&format!("{} {}[{}]", base_ty, name.name, size));
+                    self.write(&format!("{} {}[{}]", base_ty, name_str, size));
 
                     if let Some(init) = init {
                         match &init.kind {
@@ -1358,7 +1422,7 @@ impl CGenerator {
                                     self.write_indent();
                                     self.write(&format!(
                                         "for (size_t __i = 0; __i < {}; __i++) {}[__i] = ",
-                                        size, name.name
+                                        size, name_str
                                     ));
                                     self.generate_expr(value);
                                     // No semicolon - we add it below
@@ -1402,9 +1466,9 @@ impl CGenerator {
                                 // For other expressions, try memcpy for arrays
                                 self.write(";\n");
                                 self.write_indent();
-                                self.write(&format!("memcpy({}, ", name.name));
+                                self.write(&format!("memcpy({}, ", name_str));
                                 self.generate_expr(init);
-                                self.write(&format!(", sizeof({}))", name.name));
+                                self.write(&format!(", sizeof({}))", name_str));
                             }
                         }
                     } else {
@@ -1422,18 +1486,18 @@ impl CGenerator {
                     let elem_ty = self.type_to_c(element);
                     self.write_indent();
                     if let Some(init) = init {
-                        self.write(&format!("{}* {} = ({}*)", elem_ty, name.name, elem_ty));
+                        self.write(&format!("{}* {} = ({}*)", elem_ty, name_str, elem_ty));
                         self.generate_expr(init);
                         self.write(";\n");
                     } else {
-                        self.write(&format!("{}* {} = NULL;\n", elem_ty, name.name));
+                        self.write(&format!("{}* {} = NULL;\n", elem_ty, name_str));
                     }
-                    self.writeln(&format!("size_t {}_len = 0;", name.name));
+                    self.writeln(&format!("size_t {}_len = 0;", name_str));
                     self.slice_vars.insert(name.name.clone());
                 }
                 TypeKind::Named(ident) => {
                     self.write_indent();
-                    self.write(&format!("{} {}", ident.name, name.name));
+                    self.write(&format!("{} {}", ident.name, name_str));
                     if let Some(init) = init {
                         self.write(" = ");
                         self.generate_expr(init);
@@ -1451,7 +1515,7 @@ impl CGenerator {
                             if matches!(ty.kind, crate::parser::TypeKind::Ref(_)) {
                                 self.write("const ");
                             }
-                            self.write(&format!("{}* {}", elem_ty, name.name));
+                            self.write(&format!("{}* {}", elem_ty, name_str));
                             if let Some(init) = init {
                                 self.write(" = ");
                                 self.generate_expr(init);
@@ -1460,7 +1524,7 @@ impl CGenerator {
                             }
                             self.write(";\n");
                             // Length companion for slices
-                            self.writeln(&format!("size_t {}_len = 0;", name.name));
+                            self.writeln(&format!("size_t {}_len = 0;", name_str));
                             self.slice_vars.insert(name.name.clone());
                         }
                         TypeKind::Array { element, .. } => {
@@ -1470,7 +1534,7 @@ impl CGenerator {
                             if matches!(ty.kind, crate::parser::TypeKind::Ref(_)) {
                                 self.write("const ");
                             }
-                            self.write(&format!("{}* {}", elem_ty, name.name));
+                            self.write(&format!("{}* {}", elem_ty, name_str));
                             if let Some(init) = init {
                                 self.write(" = ");
                                 self.generate_expr(init);
@@ -1484,7 +1548,7 @@ impl CGenerator {
                             if matches!(ty.kind, crate::parser::TypeKind::Ref(_)) {
                                 self.write("const ");
                             }
-                            self.write(&format!("{}* {}", ident.name, name.name));
+                            self.write(&format!("{}* {}", ident.name, name_str));
                             if let Some(init) = init {
                                 self.write(" = ");
                                 self.generate_expr(init);
@@ -1499,7 +1563,7 @@ impl CGenerator {
                             if matches!(ty.kind, crate::parser::TypeKind::Ref(_)) {
                                 self.write("const ");
                             }
-                            self.write(&format!("{}* {}", inner_ty, name.name));
+                            self.write(&format!("{}* {}", inner_ty, name_str));
                             if let Some(init) = init {
                                 self.write(" = ");
                                 self.generate_expr(init);
@@ -1513,7 +1577,7 @@ impl CGenerator {
                 TypeKind::ArrayRef { element, size } => {
                     let elem_ty = self.type_to_c(element);
                     self.write_indent();
-                    self.write(&format!("const {}* {}", elem_ty, name.name));
+                    self.write(&format!("const {}* {}", elem_ty, name_str));
                     if let Some(init) = init {
                         self.write(" = ");
                         self.generate_expr(init);
@@ -1521,13 +1585,13 @@ impl CGenerator {
                         self.write(" = NULL");
                     }
                     self.write(";\n");
-                    self.writeln(&format!("size_t {}_len = {};", name.name, size));
+                    self.writeln(&format!("size_t {}_len = {};", name_str, size));
                     self.slice_vars.insert(name.name.clone());
                 }
                 _ => {
                     let ty_str = self.type_to_c(ty);
                     self.write_indent();
-                    self.write(&format!("{} {}", ty_str, name.name));
+                    self.write(&format!("{} {}", ty_str, name_str));
                     if let Some(init) = init {
                         self.write(" = ");
                         self.generate_expr(init);
@@ -1543,13 +1607,13 @@ impl CGenerator {
                     // Try to infer the type
                     let inferred_ty = self.infer_c_type(init);
                     self.write_indent();
-                    self.write(&format!("{} {} = ", inferred_ty, name.name));
+                    self.write(&format!("{} {} = ", inferred_ty, name_str));
                     self.generate_expr(init);
                     self.write(";\n");
                 } else {
                     // No type, no init - default to int
                     self.write_indent();
-                    self.write(&format!("int {} = 0;\n", name.name));
+                    self.write(&format!("int {} = 0;\n", name_str));
                 }
             }
         }
@@ -1602,21 +1666,32 @@ impl CGenerator {
                     // Fixed-size array: use the known compile-time size
                     self.write(&format!("{}", size));
                 } else {
-                    // Variable - use companion _len variable
-                    self.write(&format!("{}_len", ident.name));
+                    // Variable - use companion _len variable (with rename if applicable)
+                    let effective = self
+                        .var_renames
+                        .get(&ident.name)
+                        .cloned()
+                        .unwrap_or_else(|| ident.name.clone());
+                    self.write(&format!("{}_len", effective));
                 }
             }
             ExprKind::Field { object, field } => {
-                // struct.field - use struct.field_len
-                let accessor = if let ExprKind::Ident(ident) = &object.kind
-                    && self.pointer_vars.contains(&ident.name)
-                {
-                    "->"
+                // Check if this field is a fixed-size array in the struct definition
+                if let Some(size) = self.get_struct_field_array_size(object, &field.name) {
+                    // Fixed-size array field: use the known compile-time size
+                    self.write(&format!("{}", size));
                 } else {
-                    "."
-                };
-                self.generate_expr(object);
-                self.write(&format!("{}{}_len", accessor, field.name));
+                    // struct.field - use struct.field_len
+                    let accessor = if let ExprKind::Ident(ident) = &object.kind
+                        && self.pointer_vars.contains(&ident.name)
+                    {
+                        "->"
+                    } else {
+                        "."
+                    };
+                    self.generate_expr(object);
+                    self.write(&format!("{}{}_len", accessor, field.name));
+                }
             }
             ExprKind::Slice {
                 start,
@@ -1756,7 +1831,12 @@ impl CGenerator {
                 self.write("}");
             }
             ExprKind::Ident(ident) => {
-                self.write(&ident.name);
+                // Check if this variable was renamed to avoid _len parameter conflicts
+                if let Some(renamed) = self.var_renames.get(&ident.name).cloned() {
+                    self.write(&renamed);
+                } else {
+                    self.write(&ident.name);
+                }
             }
             ExprKind::Binary { left, op, right } => {
                 // For array comparisons, use constant_time_eq
@@ -1875,24 +1955,40 @@ impl CGenerator {
                 // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
-                        // Convert .len() to companion _len variable
+                        // Convert .len() to companion _len variable or fixed array size
                         if let ExprKind::Ident(ident) = &object.kind {
-                            self.write(&format!("{}_len", ident.name));
+                            if let Some(&size) = self.fixed_array_vars.get(&ident.name) {
+                                self.write(&format!("{}", size));
+                            } else {
+                                let effective = self
+                                    .var_renames
+                                    .get(&ident.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| ident.name.clone());
+                                self.write(&format!("{}_len", effective));
+                            }
                         } else if let ExprKind::Field {
                             object: inner_obj,
                             field: inner_field,
                         } = &object.kind
                         {
-                            // Handle struct.field.len() -> struct.field_len or struct->field_len
-                            let accessor = if let ExprKind::Ident(ident) = &inner_obj.kind
-                                && self.pointer_vars.contains(&ident.name)
+                            // Handle struct.field.len()
+                            // Check if this field is a fixed-size array in the struct
+                            if let Some(size) =
+                                self.get_struct_field_array_size(inner_obj, &inner_field.name)
                             {
-                                "->"
+                                self.write(&format!("{}", size));
                             } else {
-                                "."
-                            };
-                            self.generate_expr(inner_obj);
-                            self.write(&format!("{}{}_len", accessor, inner_field.name));
+                                let accessor = if let ExprKind::Ident(ident) = &inner_obj.kind
+                                    && self.pointer_vars.contains(&ident.name)
+                                {
+                                    "->"
+                                } else {
+                                    "."
+                                };
+                                self.generate_expr(inner_obj);
+                                self.write(&format!("{}{}_len", accessor, inner_field.name));
+                            }
                         } else {
                             // Fallback - might not work for complex expressions
                             self.write("/* .len() */ 0");
@@ -2306,7 +2402,12 @@ impl CGenerator {
                     // Fixed-size array: use the known compile-time size
                     self.write(&format!("{}", size));
                 } else {
-                    self.write(&format!("{}_len", ident.name));
+                    let effective = self
+                        .var_renames
+                        .get(&ident.name)
+                        .cloned()
+                        .unwrap_or_else(|| ident.name.clone());
+                    self.write(&format!("{}_len", effective));
                 }
             }
             ExprKind::Bytes(s) => {
@@ -2337,16 +2438,21 @@ impl CGenerator {
                 self.write(")");
             }
             ExprKind::Field { object, field } => {
-                // Try object.field_len (use -> for pointer vars)
-                let accessor = if let ExprKind::Ident(ident) = &object.kind
-                    && self.pointer_vars.contains(&ident.name)
-                {
-                    "->"
+                // Check if this field is a fixed-size array in the struct definition
+                if let Some(size) = self.get_struct_field_array_size(object, &field.name) {
+                    self.write(&format!("{}", size));
                 } else {
-                    "."
-                };
-                self.generate_expr(object);
-                self.write(&format!("{}{}_len", accessor, field.name));
+                    // Try object.field_len (use -> for pointer vars)
+                    let accessor = if let ExprKind::Ident(ident) = &object.kind
+                        && self.pointer_vars.contains(&ident.name)
+                    {
+                        "->"
+                    } else {
+                        "."
+                    };
+                    self.generate_expr(object);
+                    self.write(&format!("{}{}_len", accessor, field.name));
+                }
             }
             ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Paren(inner) => {
                 self.generate_array_len_expr(inner);
