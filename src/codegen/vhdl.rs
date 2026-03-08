@@ -225,11 +225,62 @@ impl VhdlGenerator {
         }
     }
 
+    /// Check if a function is a runtime library function that should be skipped.
+    /// These functions use byte slices and other features that cannot be properly
+    /// represented in VHDL simulation.
+    fn is_runtime_function(name: &str) -> bool {
+        matches!(
+            name,
+            "rotr"
+                | "rotl"
+                | "read_u32_be"
+                | "read_u32_le"
+                | "write_u32_be"
+                | "write_u32_le"
+                | "write_u64_be"
+                | "write_u64_le"
+                | "constant_time_eq"
+                | "secure_zero"
+                | "bitreader_init"
+                | "bitreader_fill"
+                | "bitreader_read"
+                | "bitreader_peek"
+                | "bitreader_skip"
+                | "bitreader_read_bit"
+                | "bitreader_align"
+                | "bitreader_bytes_remaining"
+                | "bitreader_read_bytes"
+                | "bitwriter_init"
+                | "bitwriter_flush_bytes"
+                | "bitwriter_write"
+                | "bitwriter_write_bit"
+                | "bitwriter_align"
+                | "bitwriter_write_bytes"
+                | "bitwriter_bytes_written"
+                | "bitwriter_finish"
+        )
+    }
+
+    /// Check if a struct is a runtime library struct that should be skipped.
+    fn is_runtime_struct(name: &str) -> bool {
+        matches!(name, "BitReader" | "BitWriter")
+    }
+
     fn generate_item(&mut self, item: &Item) {
         match &item.kind {
-            ItemKind::Function(func) => self.generate_function(func),
+            ItemKind::Function(func) => {
+                if Self::is_runtime_function(&func.name.name) {
+                    return;
+                }
+                self.generate_function(func);
+            }
             ItemKind::Const(c) => self.generate_const(c),
-            ItemKind::Struct(s) => self.generate_struct(s),
+            ItemKind::Struct(s) => {
+                if Self::is_runtime_struct(&s.name.name) {
+                    return;
+                }
+                self.generate_struct(s);
+            }
             ItemKind::Layout(l) => self.generate_layout(l),
             ItemKind::Enum(e) => self.generate_enum(e),
             ItemKind::Test(test) => {

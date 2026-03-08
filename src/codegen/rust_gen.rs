@@ -363,28 +363,34 @@ impl RustGenerator {
         self.write_indent();
         self.write(&format!("fn {}(", mangled_name));
 
-        // Parameters
+        // Parameters - replace Self with the concrete struct name
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
             }
             // Handle self parameter
             if param.name.name == "self" {
-                self.write(&format!("self_: {}", Self::rust_type(&param.ty)));
+                self.write(&format!(
+                    "self_: {}",
+                    Self::rust_type_replacing_self(&param.ty, Some(struct_name))
+                ));
             } else {
                 self.write(&format!(
                     "{}: {}",
                     param.name.name,
-                    Self::rust_type(&param.ty)
+                    Self::rust_type_replacing_self(&param.ty, Some(struct_name))
                 ));
             }
         }
 
         self.write(")");
 
-        // Return type
+        // Return type - replace Self with the concrete struct name
         if let Some(ret_ty) = &func.return_type {
-            self.write(&format!(" -> {}", Self::rust_type(ret_ty)));
+            self.write(&format!(
+                " -> {}",
+                Self::rust_type_replacing_self(ret_ty, Some(struct_name))
+            ));
         }
 
         self.write(" {\n");
@@ -568,6 +574,11 @@ impl RustGenerator {
     }
 
     fn generate_function(&mut self, func: &Function) {
+        // Detect if this function was monomorphized from a method/generic
+        // If the function name contains "__", the prefix is the struct name
+        // Also check if any parameter or return type uses SelfType
+        let self_replacement = Self::infer_self_type_name(&func.name.name, func);
+
         self.write_indent();
         self.write(&format!("fn {}(", func.name.name));
 
@@ -578,12 +589,15 @@ impl RustGenerator {
             }
             // Handle self parameter
             if param.name.name == "self" {
-                self.write(&format!("self_: {}", Self::rust_type(&param.ty)));
+                self.write(&format!(
+                    "self_: {}",
+                    Self::rust_type_replacing_self(&param.ty, self_replacement.as_deref())
+                ));
             } else {
                 self.write(&format!(
                     "{}: {}",
                     param.name.name,
-                    Self::rust_type(&param.ty)
+                    Self::rust_type_replacing_self(&param.ty, self_replacement.as_deref())
                 ));
             }
         }
@@ -592,7 +606,10 @@ impl RustGenerator {
 
         // Return type
         if let Some(ret_ty) = &func.return_type {
-            self.write(&format!(" -> {}", Self::rust_type(ret_ty)));
+            self.write(&format!(
+                " -> {}",
+                Self::rust_type_replacing_self(ret_ty, self_replacement.as_deref())
+            ));
         }
 
         self.write(" {\n");
@@ -1724,36 +1741,69 @@ impl RustGenerator {
 
     /// Convert a parser type to a Rust type string
     fn rust_type(ty: &crate::parser::Type) -> String {
+        Self::rust_type_replacing_self(ty, None)
+    }
+
+    /// Convert a parser type to a Rust type string, optionally replacing `Self` with a concrete name
+    fn rust_type_replacing_self(ty: &crate::parser::Type, self_name: Option<&str>) -> String {
         use crate::parser::TypeKind;
         match &ty.kind {
             TypeKind::Primitive(p) => Self::rust_native_type(p.to_native()),
             TypeKind::Array { element, size } => {
-                format!("[{}; {}]", Self::rust_type(element), size)
+                format!(
+                    "[{}; {}]",
+                    Self::rust_type_replacing_self(element, self_name),
+                    size
+                )
             }
             TypeKind::Slice { element } => {
-                format!("&[{}]", Self::rust_type(element))
+                format!("&[{}]", Self::rust_type_replacing_self(element, self_name))
             }
             TypeKind::ArrayRef { element, size } => {
-                format!("&[{}; {}]", Self::rust_type(element), size)
+                format!(
+                    "&[{}; {}]",
+                    Self::rust_type_replacing_self(element, self_name),
+                    size
+                )
             }
             TypeKind::MutRef(inner) => {
                 // Handle MutRef(Slice(T)) => &mut [T] (not &mut &[T])
                 if let TypeKind::Slice { element } = &inner.kind {
-                    format!("&mut [{}]", Self::rust_type(element))
+                    format!(
+                        "&mut [{}]",
+                        Self::rust_type_replacing_self(element, self_name)
+                    )
                 } else {
-                    format!("&mut {}", Self::rust_type(inner))
+                    format!("&mut {}", Self::rust_type_replacing_self(inner, self_name))
                 }
             }
             TypeKind::Ref(inner) => {
                 // Handle Ref(Slice(T)) => &[T] (not &&[T])
                 if let TypeKind::Slice { element } = &inner.kind {
-                    format!("&[{}]", Self::rust_type(element))
+                    format!("&[{}]", Self::rust_type_replacing_self(element, self_name))
                 } else {
-                    format!("&{}", Self::rust_type(inner))
+                    format!("&{}", Self::rust_type_replacing_self(inner, self_name))
                 }
             }
-            TypeKind::Named(ident) => ident.name.clone(),
-            TypeKind::SelfType => "Self".to_string(),
+            TypeKind::Named(ident) => {
+                // Handle Named("Self") the same as SelfType
+                if ident.name == "Self" {
+                    if let Some(name) = self_name {
+                        name.to_string()
+                    } else {
+                        "Self".to_string()
+                    }
+                } else {
+                    ident.name.clone()
+                }
+            }
+            TypeKind::SelfType => {
+                if let Some(name) = self_name {
+                    name.to_string()
+                } else {
+                    "Self".to_string()
+                }
+            }
         }
     }
 
@@ -1838,6 +1888,43 @@ impl RustGenerator {
         }
     }
 
+    /// Infer the concrete type name that should replace `Self` in a function.
+    /// For functions with names like "StructName__method", the prefix is the struct name.
+    /// Also checks if any parameter or return type actually uses SelfType.
+    fn infer_self_type_name(func_name: &str, func: &Function) -> Option<String> {
+        // Check if any type in the function signature uses SelfType
+        let has_self_type = func.params.iter().any(|p| Self::type_contains_self(&p.ty))
+            || func
+                .return_type
+                .as_ref()
+                .is_some_and(Self::type_contains_self);
+
+        if !has_self_type {
+            return None;
+        }
+
+        // Try to extract struct name from mangled function name (e.g., "Sha256State__update")
+        if let Some(idx) = func_name.find("__") {
+            return Some(func_name[..idx].to_string());
+        }
+
+        None
+    }
+
+    /// Check if a type contains SelfType anywhere (either TypeKind::SelfType or Named("Self"))
+    fn type_contains_self(ty: &crate::parser::Type) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::SelfType => true,
+            TypeKind::Named(ident) if ident.name == "Self" => true,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => Self::type_contains_self(inner),
+            TypeKind::Array { element, .. }
+            | TypeKind::Slice { element }
+            | TypeKind::ArrayRef { element, .. } => Self::type_contains_self(element),
+            _ => false,
+        }
+    }
+
     /// Check if a type contains any references that need a lifetime annotation
     fn type_needs_lifetime(ty: &crate::parser::Type) -> bool {
         use crate::parser::TypeKind;
@@ -1858,10 +1945,20 @@ impl RustGenerator {
                 format!("&'a [{}]", Self::rust_type(element))
             }
             TypeKind::Ref(inner) => {
-                format!("&'a {}", Self::rust_type(inner))
+                // Handle Ref(Slice(T)) => &'a [T]
+                if let TypeKind::Slice { element } = &inner.kind {
+                    format!("&'a [{}]", Self::rust_type(element))
+                } else {
+                    format!("&'a {}", Self::rust_type(inner))
+                }
             }
             TypeKind::MutRef(inner) => {
-                format!("&'a mut {}", Self::rust_type(inner))
+                // Handle MutRef(Slice(T)) => &'a mut [T]
+                if let TypeKind::Slice { element } = &inner.kind {
+                    format!("&'a mut [{}]", Self::rust_type(element))
+                } else {
+                    format!("&'a mut {}", Self::rust_type(inner))
+                }
             }
             TypeKind::ArrayRef { element, size } => {
                 format!("&'a [{}; {}]", Self::rust_type(element), size)

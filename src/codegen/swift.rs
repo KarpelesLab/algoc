@@ -99,8 +99,9 @@ impl SwiftGenerator {
                 format!("[{}]", self.swift_type(element))
             }
             TypeKind::MutRef(inner) => {
-                // Swift uses inout at the function parameter level
-                format!("inout {}", self.swift_type(inner))
+                // Swift uses inout at the function parameter level only;
+                // for variable declarations we just use the inner type.
+                self.swift_type(inner)
             }
             TypeKind::Ref(inner) => self.swift_type(inner),
             TypeKind::Named(ident) => ident.name.clone(),
@@ -534,7 +535,8 @@ impl SwiftGenerator {
         for field in &l.fields {
             let ty_str = self.swift_type(&field.ty);
             let init = self.default_value_for_type(&field.ty);
-            self.writeln(&format!("var {}: {} = {}", field.name.name, ty_str, init));
+            let safe_field = Self::swift_safe_ident(&field.name.name);
+            self.writeln(&format!("var {}: {} = {}", safe_field, ty_str, init));
         }
         self.dedent();
         self.writeln("}");
@@ -542,10 +544,10 @@ impl SwiftGenerator {
 
         self.writeln(&format!(
             "func create_{}() -> {} {{",
-            l.name.name, l.name.name
+            safe_layout, safe_layout
         ));
         self.indent();
-        self.writeln(&format!("return {}()", l.name.name));
+        self.writeln(&format!("return {}()", safe_layout));
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -601,6 +603,12 @@ impl SwiftGenerator {
                 let init = self.default_value_for_type(element);
                 format!("[{}](repeating: {}, count: {})", elem_type, init, size)
             }
+            TypeKind::Slice { element } | TypeKind::ArrayRef { element, .. } => {
+                // Empty array of the element type, e.g. [UInt8]()
+                let elem_type = self.swift_type(element);
+                format!("[{}]()", elem_type)
+            }
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.default_value_for_type(inner),
             TypeKind::Named(ident) => {
                 format!("create_{}()", ident.name)
             }
@@ -740,10 +748,7 @@ impl SwiftGenerator {
                 // Add type annotation if we have one
                 if let Some(ty) = ty {
                     let type_str = self.swift_type(ty);
-                    // Don't add annotations for things that read as inout
-                    if !type_str.starts_with("inout") {
-                        self.write(&format!(": {}", type_str));
-                    }
+                    self.write(&format!(": {}", type_str));
                 }
 
                 self.write(" = ");
@@ -1018,7 +1023,7 @@ impl SwiftGenerator {
             }
             ExprKind::Field { object, field } => {
                 self.generate_expr(object);
-                self.write(&format!(".{}", field.name));
+                self.write(&format!(".{}", Self::swift_safe_ident(&field.name)));
             }
             ExprKind::Call { func, args } => {
                 // Check for Reader/Writer constructor calls
@@ -1144,7 +1149,7 @@ impl SwiftGenerator {
                         // Generate: StructName__method(&object, args...)
                         self.write(&format!("{}(", mangled_name));
                         // Pass self as inout if it's a mutable method
-                        self.write(&format!("&{}", obj_ident.name));
+                        self.write(&format!("&{}", Self::swift_safe_ident(&obj_ident.name)));
                         for arg in args {
                             self.write(", ");
                             self.generate_expr(arg);

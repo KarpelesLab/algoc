@@ -42,6 +42,8 @@ pub struct VerilogGenerator {
     var_types: HashMap<String, String>,
     /// Track integer variables that have been declared (to avoid re-declaring loop vars)
     declared_vars: Vec<HashMap<String, bool>>,
+    /// Current function name (for return value assignment in Verilog functions)
+    current_function_name: Option<String>,
 }
 
 impl VerilogGenerator {
@@ -54,6 +56,7 @@ impl VerilogGenerator {
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
             declared_vars: vec![HashMap::new()],
+            current_function_name: None,
         }
     }
 
@@ -161,18 +164,18 @@ impl VerilogGenerator {
                 let native = p.to_native();
                 let bits = native.bit_width();
                 if bits == 1 {
-                    "input reg".to_string()
+                    "input".to_string()
                 } else {
-                    format!("input reg [{}:0]", bits - 1)
+                    format!("input [{}:0]", bits - 1)
                 }
             }
             TypeKind::Array { element, size } => {
-                // Arrays as inputs aren't directly supported; use reg array
+                // Arrays as inputs aren't directly supported; flatten to wide input
                 let elem_bits = self.type_bit_width(element);
                 if elem_bits == 1 {
-                    format!("input reg [0:{}]", size - 1)
+                    format!("input [0:{}]", size - 1)
                 } else {
-                    format!("input reg [{}:0]", (elem_bits as u64) * size - 1)
+                    format!("input [{}:0]", (elem_bits as u64) * size - 1)
                 }
             }
             TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
@@ -181,7 +184,7 @@ impl VerilogGenerator {
                 // Just treat as input for simplicity
                 self.param_to_verilog(inner)
             }
-            _ => "input reg [31:0]".to_string(),
+            _ => "input [31:0]".to_string(),
         }
     }
 
@@ -213,11 +216,62 @@ impl VerilogGenerator {
         }
     }
 
+    /// Check if a function is a runtime library function that should be skipped.
+    /// These functions use byte slices and other features that cannot be properly
+    /// represented in Verilog.
+    fn is_runtime_function(name: &str) -> bool {
+        matches!(
+            name,
+            "rotr"
+                | "rotl"
+                | "read_u32_be"
+                | "read_u32_le"
+                | "write_u32_be"
+                | "write_u32_le"
+                | "write_u64_be"
+                | "write_u64_le"
+                | "constant_time_eq"
+                | "secure_zero"
+                | "bitreader_init"
+                | "bitreader_fill"
+                | "bitreader_read"
+                | "bitreader_peek"
+                | "bitreader_skip"
+                | "bitreader_read_bit"
+                | "bitreader_align"
+                | "bitreader_bytes_remaining"
+                | "bitreader_read_bytes"
+                | "bitwriter_init"
+                | "bitwriter_flush_bytes"
+                | "bitwriter_write"
+                | "bitwriter_write_bit"
+                | "bitwriter_align"
+                | "bitwriter_write_bytes"
+                | "bitwriter_bytes_written"
+                | "bitwriter_finish"
+        )
+    }
+
+    /// Check if a struct is a runtime library struct that should be skipped.
+    fn is_runtime_struct(name: &str) -> bool {
+        matches!(name, "BitReader" | "BitWriter")
+    }
+
     fn generate_item(&mut self, item: &Item) {
         match &item.kind {
-            ItemKind::Function(func) => self.generate_function(func),
+            ItemKind::Function(func) => {
+                if Self::is_runtime_function(&func.name.name) {
+                    return;
+                }
+                self.generate_function(func);
+            }
             ItemKind::Const(c) => self.generate_const(c),
-            ItemKind::Struct(s) => self.generate_struct(s),
+            ItemKind::Struct(s) => {
+                if Self::is_runtime_struct(&s.name.name) {
+                    return;
+                }
+                self.generate_struct(s);
+            }
             ItemKind::Layout(l) => self.generate_layout(l),
             ItemKind::Enum(e) => self.generate_enum(e),
             ItemKind::Test(test) => {
@@ -295,6 +349,7 @@ impl VerilogGenerator {
 
         if Self::is_void_function(func) {
             // Generate as task
+            self.current_function_name = None;
             self.write_indent();
             self.write(&format!("task {};", func.name.name));
             self.write("\n");
@@ -320,6 +375,7 @@ impl VerilogGenerator {
             self.writeln("endtask");
         } else {
             // Generate as function
+            self.current_function_name = Some(func.name.name.clone());
             let ret_ty = func.return_type.as_ref().unwrap();
             let ret_width = self.return_type_verilog(ret_ty);
             self.write_indent();
@@ -346,6 +402,7 @@ impl VerilogGenerator {
             self.dedent();
             self.writeln("endfunction");
         }
+        self.current_function_name = None;
         self.writeln("");
 
         self.pop_scope();
@@ -357,6 +414,7 @@ impl VerilogGenerator {
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
 
         if Self::is_void_function(func) {
+            self.current_function_name = None;
             self.write_indent();
             self.write(&format!("task {};", mangled_name));
             self.write("\n");
@@ -379,6 +437,7 @@ impl VerilogGenerator {
             self.dedent();
             self.writeln("endtask");
         } else {
+            self.current_function_name = Some(mangled_name.clone());
             let ret_ty = func.return_type.as_ref().unwrap();
             let ret_width = self.return_type_verilog(ret_ty);
             self.write_indent();
@@ -403,6 +462,7 @@ impl VerilogGenerator {
             self.dedent();
             self.writeln("endfunction");
         }
+        self.current_function_name = None;
         self.writeln("");
 
         self.pop_scope();
@@ -747,9 +807,12 @@ impl VerilogGenerator {
             StmtKind::Return(expr) => {
                 self.write_indent();
                 if let Some(expr) = expr {
-                    // In a function, assign to the function name (Verilog convention)
-                    // We'll use a special marker; the caller should track the function name
-                    self.write("__func_result = ");
+                    // In a Verilog function, return is done by assigning to the function name
+                    let func_name = self
+                        .current_function_name
+                        .clone()
+                        .unwrap_or_else(|| "__func_result".to_string());
+                    self.write(&format!("{} = ", func_name));
                     self.generate_expr(expr);
                     self.write(";\n");
                 } else {
@@ -1261,6 +1324,7 @@ impl CodeGenerator for VerilogGenerator {
         self.struct_methods.clear();
         self.var_types.clear();
         self.declared_vars = vec![HashMap::new()];
+        self.current_function_name = None;
 
         // Pre-pass: collect struct definitions and method mappings
         for item in &ast.ast.items {

@@ -1152,7 +1152,13 @@ impl PerlGenerator {
                     }
                 }
 
-                self.generate_expr(func);
+                // For function calls, emit the function name WITHOUT the $ sigil.
+                // In Perl, only variables get $; function calls are bare names.
+                if let ExprKind::Ident(ident) = &func.kind {
+                    self.write(&ident.name);
+                } else {
+                    self.generate_expr(func);
+                }
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {

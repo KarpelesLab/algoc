@@ -8,8 +8,8 @@ use super::CodeGenerator;
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
-    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
-    Type as ParserType, UnaryOp,
+    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, PrimitiveType,
+    Stmt, StmtKind, Type as ParserType, UnaryOp,
 };
 use std::collections::HashMap;
 
@@ -37,6 +37,8 @@ pub struct KotlinGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Variable element types for arrays/slices (for correct type conversion on assignment)
+    var_elem_types: HashMap<String, PrimitiveType>,
 }
 
 impl KotlinGenerator {
@@ -48,6 +50,7 @@ impl KotlinGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            var_elem_types: HashMap::new(),
         }
     }
 
@@ -55,6 +58,25 @@ impl KotlinGenerator {
     pub fn with_tests(mut self, include: bool) -> Self {
         self.include_tests = include;
         self
+    }
+
+    /// Extract the element primitive type from array/slice/ref types
+    fn element_primitive(ty: &ParserType) -> Option<PrimitiveType> {
+        match &ty.kind {
+            crate::parser::TypeKind::Array { element, .. }
+            | crate::parser::TypeKind::Slice { element }
+            | crate::parser::TypeKind::ArrayRef { element, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &element.kind {
+                    Some(*p)
+                } else {
+                    None
+                }
+            }
+            crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) => {
+                Self::element_primitive(inner)
+            }
+            _ => None,
+        }
     }
 
     fn write(&mut self, s: &str) {
@@ -360,6 +382,14 @@ impl KotlinGenerator {
     }
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
+        let saved_elem_types = self.var_elem_types.clone();
+        for param in &func.params {
+            if let Some(elem_prim) = Self::element_primitive(&param.ty) {
+                self.var_elem_types
+                    .insert(param.name.name.clone(), elem_prim);
+            }
+        }
+
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
         let mut params: Vec<String> = Vec::new();
         for param in &func.params {
@@ -378,6 +408,7 @@ impl KotlinGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.var_elem_types = saved_elem_types;
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
@@ -558,14 +589,66 @@ impl KotlinGenerator {
                     ),
                 }
             }
+            TypeKind::Slice { element } | TypeKind::ArrayRef { element, .. } => {
+                let elem_str = self.type_to_kotlin(element);
+                match elem_str.as_str() {
+                    "UByte" => "UByteArray(0)".to_string(),
+                    "UShort" => "UShortArray(0)".to_string(),
+                    "UInt" => "UIntArray(0)".to_string(),
+                    "ULong" => "ULongArray(0)".to_string(),
+                    _ => format!("emptyArray<{}>()", elem_str),
+                }
+            }
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.default_value_for_type(inner),
             TypeKind::Named(ident) => {
                 format!("{}()", ident.name)
             }
-            _ => "null".to_string(),
+            _ => "0u".to_string(),
+        }
+    }
+
+    /// Check if an assignment target is a UByte-typed location that needs .toUByte() conversion
+    fn target_needs_ubyte_conversion(&self, target: &Expr) -> bool {
+        match &target.kind {
+            ExprKind::Index { array, .. } => {
+                // Check if the array element type is UByte
+                if let ExprKind::Ident(ident) = &array.kind
+                    && let Some(elem_prim) = self.var_elem_types.get(&ident.name)
+                {
+                    return matches!(elem_prim.to_native(), PrimitiveType::U8 | PrimitiveType::I8);
+                }
+                if let ExprKind::Field { object, field } = &array.kind
+                    && let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name
+                            && let Some(elem_prim) = Self::element_primitive(&f.ty)
+                        {
+                            return matches!(
+                                elem_prim.to_native(),
+                                PrimitiveType::U8 | PrimitiveType::I8
+                            );
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
         }
     }
 
     fn generate_function(&mut self, func: &Function) {
+        // Track parameter element types for correct type conversion
+        let saved_elem_types = self.var_elem_types.clone();
+        for param in &func.params {
+            if let Some(elem_prim) = Self::element_primitive(&param.ty) {
+                self.var_elem_types
+                    .insert(param.name.name.clone(), elem_prim);
+            }
+        }
+
         self.write_indent();
 
         // Build parameter list
@@ -588,6 +671,7 @@ impl KotlinGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.var_elem_types = saved_elem_types;
     }
 
     fn generate_block(&mut self, block: &Block) {
@@ -610,6 +694,22 @@ impl KotlinGenerator {
                 {
                     self.var_types
                         .insert(name.name.clone(), type_ident.name.clone());
+                }
+
+                // Track element types for arrays/slices
+                if let Some(ty) = ty
+                    && let Some(elem_prim) = Self::element_primitive(ty)
+                {
+                    self.var_elem_types.insert(name.name.clone(), elem_prim);
+                }
+
+                // Infer element type from ArrayRepeat with cast
+                if let Some(init_expr) = init
+                    && let ExprKind::ArrayRepeat { value, .. } = &init_expr.kind
+                    && let ExprKind::Cast { ty, .. } = &value.kind
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    self.var_elem_types.insert(name.name.clone(), *p);
                 }
 
                 // Also infer type from static method calls like TypeName__new()
@@ -673,10 +773,19 @@ impl KotlinGenerator {
                     }
                 }
 
+                // Check if assigning to an index of a UByteArray - needs .toUByte()
+                let needs_to_ubyte = self.target_needs_ubyte_conversion(target);
+
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
-                self.generate_expr(value);
+                if needs_to_ubyte {
+                    self.write("(");
+                    self.generate_expr(value);
+                    self.write(").toUByte()");
+                } else {
+                    self.generate_expr(value);
+                }
                 self.write("\n");
             }
             StmtKind::CompoundAssign { target, op, value } => {
@@ -1971,6 +2080,7 @@ impl CodeGenerator for KotlinGenerator {
         self.struct_defs.clear();
         self.struct_methods.clear();
         self.var_types.clear();
+        self.var_elem_types.clear();
 
         // Pre-pass: collect struct field info and methods
         for item in &ast.ast.items {

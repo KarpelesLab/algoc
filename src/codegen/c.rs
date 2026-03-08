@@ -11,7 +11,7 @@ use crate::parser::{
     Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
     Type as ParserType, UnaryOp,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Struct field info for code generation
 #[derive(Clone)]
@@ -37,6 +37,8 @@ pub struct CGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Variables that are pointers (from &mut / & parameters), needing -> instead of .
+    pointer_vars: HashSet<String>,
 }
 
 impl CGenerator {
@@ -48,6 +50,7 @@ impl CGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            pointer_vars: HashSet::new(),
         }
     }
 
@@ -767,6 +770,31 @@ impl CGenerator {
         self.writeln("");
     }
 
+    /// Check if a parameter type results in a pointer to a struct/primitive (not array/slice)
+    /// and thus needs -> for field access instead of .
+    fn is_pointer_param(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                matches!(
+                    inner.kind,
+                    TypeKind::Named(_) | TypeKind::Primitive(_) | TypeKind::SelfType
+                )
+            }
+            _ => false,
+        }
+    }
+
+    /// Populate pointer_vars from function parameters
+    fn collect_pointer_params(&mut self, func: &Function) {
+        self.pointer_vars.clear();
+        for param in &func.params {
+            if Self::is_pointer_param(&param.ty) {
+                self.pointer_vars.insert(param.name.name.clone());
+            }
+        }
+    }
+
     fn generate_function(&mut self, func: &Function) {
         let ret_ty = self.return_type_to_c(func.return_type.as_ref());
 
@@ -789,6 +817,7 @@ impl CGenerator {
 
         self.write(") {\n");
         self.indent();
+        self.collect_pointer_params(func);
         self.generate_block(&func.body);
         self.dedent();
         self.writeln("}");
@@ -824,6 +853,9 @@ impl CGenerator {
 
         self.write(") {\n");
         self.indent();
+        self.collect_pointer_params(func);
+        // 'self' is always a pointer in methods
+        self.pointer_vars.insert("self".to_string());
         self.generate_block(&func.body);
         self.dedent();
         self.writeln("}");
@@ -1502,14 +1534,14 @@ impl CGenerator {
                 self.write(")");
             }
             ExprKind::Field { object, field } => {
-                // Check if this is accessing a struct through a pointer (self->field pattern)
+                // Check if the object is a pointer variable (from &mut / & params)
                 if let ExprKind::Ident(ident) = &object.kind
-                    && ident.name == "self"
+                    && self.pointer_vars.contains(&ident.name)
                 {
-                    self.write(&format!("self->{}", field.name));
+                    self.generate_expr(object);
+                    self.write(&format!("->{}", field.name));
                     return;
                 }
-                // Check if the object's type is a pointer (e.g., MutRef to struct)
                 self.generate_expr(object);
                 self.write(&format!(".{}", field.name));
             }
@@ -1561,13 +1593,18 @@ impl CGenerator {
                         && let Some(struct_name) = self.var_types.get(&var_ident.name).cloned()
                         && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
                     {
+                        let accessor = if self.pointer_vars.contains(&var_ident.name) {
+                            "->"
+                        } else {
+                            "."
+                        };
                         self.write("do { ");
                         for field_info in &fields {
                             if let Some(read_method) = self.get_read_method_for_type(&field_info.ty)
                             {
                                 self.write(&format!(
-                                    "{}.{} = {}(&",
-                                    var_ident.name, field_info.name, read_method
+                                    "{}{}{} = {}(&",
+                                    var_ident.name, accessor, field_info.name, read_method
                                 ));
                                 self.generate_expr(object);
                                 self.write("); ");
@@ -1588,6 +1625,11 @@ impl CGenerator {
                             && let Some(struct_name) = self.var_types.get(&var_ident.name).cloned()
                             && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
                         {
+                            let accessor = if self.pointer_vars.contains(&var_ident.name) {
+                                "->"
+                            } else {
+                                "."
+                            };
                             self.write("do { ");
                             for field_info in &fields {
                                 if let Some(write_method) =
@@ -1596,8 +1638,8 @@ impl CGenerator {
                                     self.write(&format!("{}(&", write_method));
                                     self.generate_expr(object);
                                     self.write(&format!(
-                                        ", {}.{}); ",
-                                        var_ident.name, field_info.name
+                                        ", {}{}{}); ",
+                                        var_ident.name, accessor, field_info.name
                                     ));
                                 }
                             }
@@ -1639,7 +1681,13 @@ impl CGenerator {
                     if reader_methods.contains(&field.name.as_str()) {
                         // Determine the class name for the method
                         let method_c_name = format!("Reader_{}", field.name);
-                        self.write(&format!("{}(&", method_c_name));
+                        // If the object is already a pointer, don't take its address
+                        let is_ptr = matches!(&object.kind, ExprKind::Ident(ident) if self.pointer_vars.contains(&ident.name));
+                        if is_ptr {
+                            self.write(&format!("{}(", method_c_name));
+                        } else {
+                            self.write(&format!("{}(&", method_c_name));
+                        }
                         self.generate_expr(object);
                         for arg in args {
                             self.write(", ");
@@ -1650,7 +1698,12 @@ impl CGenerator {
                     }
                     if writer_methods.contains(&field.name.as_str()) {
                         let method_c_name = format!("Writer_{}", field.name);
-                        self.write(&format!("{}(&", method_c_name));
+                        let is_ptr = matches!(&object.kind, ExprKind::Ident(ident) if self.pointer_vars.contains(&ident.name));
+                        if is_ptr {
+                            self.write(&format!("{}(", method_c_name));
+                        } else {
+                            self.write(&format!("{}(&", method_c_name));
+                        }
                         self.generate_expr(object);
                         for arg in args {
                             self.write(", ");
@@ -1666,8 +1719,13 @@ impl CGenerator {
                         && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
                         && let Some(mangled_name) = methods.get(&field.name)
                     {
-                        // Generate: StructName__method(&object, args...)
-                        self.write(&format!("{}(&", mangled_name));
+                        // Generate: StructName__method(&object, args...) or StructName__method(object, args...) if already a pointer
+                        let is_ptr = self.pointer_vars.contains(&obj_ident.name);
+                        if is_ptr {
+                            self.write(&format!("{}(", mangled_name));
+                        } else {
+                            self.write(&format!("{}(&", mangled_name));
+                        }
                         self.generate_expr(object);
                         for arg in args {
                             self.write(", ");
@@ -1926,9 +1984,16 @@ impl CGenerator {
                 self.write(")");
             }
             ExprKind::Field { object, field } => {
-                // Try object.field_len
+                // Try object.field_len (use -> for pointer vars)
+                let accessor = if let ExprKind::Ident(ident) = &object.kind
+                    && self.pointer_vars.contains(&ident.name)
+                {
+                    "->"
+                } else {
+                    "."
+                };
                 self.generate_expr(object);
-                self.write(&format!(".{}_len", field.name));
+                self.write(&format!("{}{}_len", accessor, field.name));
             }
             ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Paren(inner) => {
                 self.generate_array_len_expr(inner);

@@ -12,7 +12,7 @@ use crate::parser::{
     Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
     Type as ParserType, UnaryOp,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Struct field info for code generation
 #[derive(Clone)]
@@ -38,6 +38,10 @@ pub struct JavaGenerator {
     struct_methods: HashMap<String, MethodMap>,
     /// Variable types (for struct read/write generation)
     var_types: HashMap<String, String>,
+    /// Variables known to have byte (u8/i8) type
+    byte_vars: HashSet<String>,
+    /// Variables known to have byte[] (u8[]/i8[]) array type
+    byte_array_vars: HashSet<String>,
 }
 
 impl JavaGenerator {
@@ -49,6 +53,8 @@ impl JavaGenerator {
             struct_defs: HashMap::new(),
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
+            byte_vars: HashSet::new(),
+            byte_array_vars: HashSet::new(),
         }
     }
 
@@ -154,6 +160,33 @@ impl JavaGenerator {
         }
     }
 
+    /// Whether a type maps to Java `byte`
+    fn is_byte_primitive(ty: &ParserType) -> bool {
+        use crate::parser::{PrimitiveType, TypeKind};
+        if let TypeKind::Primitive(p) = &ty.kind {
+            matches!(p.to_native(), PrimitiveType::U8 | PrimitiveType::I8)
+        } else {
+            false
+        }
+    }
+
+    /// Whether a type maps to Java `byte[]` (array/slice/ref of u8/i8)
+    fn is_byte_array_type(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Array { element, .. }
+            | TypeKind::Slice { element }
+            | TypeKind::ArrayRef { element, .. } => Self::is_byte_primitive(element),
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => match &inner.kind {
+                TypeKind::Array { element, .. }
+                | TypeKind::Slice { element }
+                | TypeKind::ArrayRef { element, .. } => Self::is_byte_primitive(element),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Whether a primitive type is 64-bit (long) in Java
     fn is_long_type(p: &crate::parser::PrimitiveType) -> bool {
         use crate::parser::PrimitiveType;
@@ -162,6 +195,61 @@ impl JavaGenerator {
             n,
             PrimitiveType::U64 | PrimitiveType::I64 | PrimitiveType::U128 | PrimitiveType::I128
         )
+    }
+
+    /// Check if an assignment target expression refers to a byte-typed location.
+    /// Returns true if assigning to this target requires a `(byte)` cast on the value.
+    fn target_is_byte(&self, target: &Expr) -> bool {
+        match &target.kind {
+            ExprKind::Ident(ident) => self.byte_vars.contains(&ident.name),
+            ExprKind::Index { array, .. } => {
+                // Check if the array is a known byte array variable
+                if let ExprKind::Ident(ident) = &array.kind {
+                    self.byte_array_vars.contains(&ident.name)
+                } else if let ExprKind::Field { object, field } = &array.kind {
+                    // struct_field: check if the struct field is a byte array
+                    if let ExprKind::Ident(obj_ident) = &object.kind
+                        && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                        && let Some(fields) = self.struct_defs.get(struct_name)
+                    {
+                        for f in fields {
+                            if f.name == field.name && Self::is_byte_array_type(&f.ty) {
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                } else {
+                    false
+                }
+            }
+            ExprKind::Field { object, field } => {
+                // Check struct field type
+                if let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name && Self::is_byte_primitive(&f.ty) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Register byte type tracking for function/method parameters
+    fn register_param_byte_types(&mut self, params: &[crate::parser::Param]) {
+        for param in params {
+            if Self::is_byte_primitive(&param.ty) {
+                self.byte_vars.insert(param.name.name.clone());
+            } else if Self::is_byte_array_type(&param.ty) {
+                self.byte_array_vars.insert(param.name.name.clone());
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -307,7 +395,13 @@ impl JavaGenerator {
 
         self.write(") {\n");
         self.indent();
+        // Save and reset byte tracking for this function scope
+        let saved_byte_vars = std::mem::take(&mut self.byte_vars);
+        let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
+        self.register_param_byte_types(&func.params);
         self.generate_block(&func.body);
+        self.byte_vars = saved_byte_vars;
+        self.byte_array_vars = saved_byte_array_vars;
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -336,7 +430,12 @@ impl JavaGenerator {
 
         self.write(") {\n");
         self.indent();
+        let saved_byte_vars = std::mem::take(&mut self.byte_vars);
+        let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
+        self.register_param_byte_types(&func.params);
         self.generate_block(&func.body);
+        self.byte_vars = saved_byte_vars;
+        self.byte_array_vars = saved_byte_array_vars;
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -345,7 +444,11 @@ impl JavaGenerator {
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
         self.writeln(&format!("static void test_{}() {{", test.name.name));
         self.indent();
+        let saved_byte_vars = std::mem::take(&mut self.byte_vars);
+        let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
         self.generate_block(&test.body);
+        self.byte_vars = saved_byte_vars;
+        self.byte_array_vars = saved_byte_array_vars;
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -526,6 +629,14 @@ impl JavaGenerator {
                     self.var_types
                         .insert(name.name.clone(), type_ident.name.clone());
                 }
+                // Track byte and byte-array variables
+                if let Some(ty) = ty {
+                    if Self::is_byte_primitive(ty) {
+                        self.byte_vars.insert(name.name.clone());
+                    } else if Self::is_byte_array_type(ty) {
+                        self.byte_array_vars.insert(name.name.clone());
+                    }
+                }
                 // Infer type from static method calls like TypeName__new()
                 if let Some(init_expr) = init {
                     if let ExprKind::Call { func, .. } = &init_expr.kind
@@ -550,10 +661,17 @@ impl JavaGenerator {
 
                 self.write_indent();
                 // Determine Java type
+                let needs_byte_cast = ty.as_ref().is_some_and(Self::is_byte_primitive);
                 if let Some(ty) = ty {
                     self.write(&format!("{} {} = ", Self::java_type(ty), name.name));
                     if let Some(init) = init {
-                        self.generate_expr(init);
+                        if needs_byte_cast && Self::expr_may_widen_to_int(init) {
+                            self.write("(byte)(");
+                            self.generate_expr(init);
+                            self.write(")");
+                        } else {
+                            self.generate_expr(init);
+                        }
                     } else {
                         self.write(&self.default_value_for_type(ty));
                     }
@@ -641,31 +759,64 @@ impl JavaGenerator {
                     }
                 }
 
+                let needs_byte_cast = self.target_is_byte(target);
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
-                self.generate_expr(value);
+                if needs_byte_cast {
+                    self.write("(byte)(");
+                    self.generate_expr(value);
+                    self.write(")");
+                } else {
+                    self.generate_expr(value);
+                }
                 self.write(";\n");
             }
             StmtKind::CompoundAssign { target, op, value } => {
-                self.write_indent();
-                self.generate_expr(target);
-                let op_str = match op {
-                    BinaryOp::Add => "+=",
-                    BinaryOp::Sub => "-=",
-                    BinaryOp::Mul => "*=",
-                    BinaryOp::Div => "/=",
-                    BinaryOp::Rem => "%=",
-                    BinaryOp::BitAnd => "&=",
-                    BinaryOp::BitOr => "|=",
-                    BinaryOp::BitXor => "^=",
-                    BinaryOp::Shl => "<<=",
-                    BinaryOp::Shr => ">>>=",
-                    _ => "=",
-                };
-                self.write(&format!(" {} ", op_str));
-                self.generate_expr(value);
-                self.write(";\n");
+                let needs_byte_cast = self.target_is_byte(target);
+                if needs_byte_cast {
+                    // Expand compound assignment to avoid lossy int->byte narrowing.
+                    // E.g. `result |= x` becomes `result = (byte)(result | x)`
+                    let op_str = match op {
+                        BinaryOp::Add => " + ",
+                        BinaryOp::Sub => " - ",
+                        BinaryOp::Mul => " * ",
+                        BinaryOp::Div => " / ",
+                        BinaryOp::Rem => " % ",
+                        BinaryOp::BitAnd => " & ",
+                        BinaryOp::BitOr => " | ",
+                        BinaryOp::BitXor => " ^ ",
+                        BinaryOp::Shl => " << ",
+                        BinaryOp::Shr => " >>> ",
+                        _ => " | ",
+                    };
+                    self.write_indent();
+                    self.generate_expr(target);
+                    self.write(" = (byte)(");
+                    self.generate_expr(target);
+                    self.write(op_str);
+                    self.generate_expr(value);
+                    self.write(");\n");
+                } else {
+                    self.write_indent();
+                    self.generate_expr(target);
+                    let op_str = match op {
+                        BinaryOp::Add => "+=",
+                        BinaryOp::Sub => "-=",
+                        BinaryOp::Mul => "*=",
+                        BinaryOp::Div => "/=",
+                        BinaryOp::Rem => "%=",
+                        BinaryOp::BitAnd => "&=",
+                        BinaryOp::BitOr => "|=",
+                        BinaryOp::BitXor => "^=",
+                        BinaryOp::Shl => "<<=",
+                        BinaryOp::Shr => ">>>=",
+                        _ => "=",
+                    };
+                    self.write(&format!(" {} ", op_str));
+                    self.generate_expr(value);
+                    self.write(";\n");
+                }
             }
             StmtKind::If {
                 condition,
@@ -1587,6 +1738,54 @@ impl JavaGenerator {
     // Type inference helpers
     // -----------------------------------------------------------------------
 
+    /// Check if an expression could produce an `int` result when assigned to a `byte`.
+    /// This is true for binary ops, unary ops, and other expressions that Java widens.
+    /// Simple literals and explicit byte casts don't need wrapping.
+    fn expr_may_widen_to_int(expr: &Expr) -> bool {
+        match &expr.kind {
+            // Binary operations always produce at least int in Java
+            ExprKind::Binary { .. } => true,
+            // Unary bitwise not produces int in Java
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                ..
+            } => true,
+            ExprKind::Unary {
+                op: UnaryOp::Neg, ..
+            } => true,
+            // An explicit cast to byte is already fine
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    !matches!(
+                        p.to_native(),
+                        crate::parser::PrimitiveType::U8 | crate::parser::PrimitiveType::I8
+                    )
+                } else {
+                    true
+                }
+            }
+            // Array index on a byte array returns byte, no cast needed
+            ExprKind::Index { .. } => false,
+            // Integer literals that fit in byte don't strictly need it,
+            // but values > 127 do since byte is signed in Java
+            ExprKind::Integer(n) => *n > 127,
+            // Function calls - we don't know the return type, be conservative
+            ExprKind::Call { .. } => true,
+            // Parenthesized - check inner
+            ExprKind::Paren(inner) => Self::expr_may_widen_to_int(inner),
+            // Conditionals - check branches
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => Self::expr_may_widen_to_int(then_expr) || Self::expr_may_widen_to_int(else_expr),
+            // Variable references, field accesses - trust their declared type
+            ExprKind::Ident(_) | ExprKind::Field { .. } => false,
+            // Builtins, other - be conservative
+            _ => false,
+        }
+    }
+
     /// Infer the Java type string for an expression that has no explicit type annotation.
     fn infer_java_type(expr: &Expr) -> String {
         match &expr.kind {
@@ -1702,6 +1901,8 @@ impl CodeGenerator for JavaGenerator {
         self.struct_defs.clear();
         self.struct_methods.clear();
         self.var_types.clear();
+        self.byte_vars.clear();
+        self.byte_array_vars.clear();
 
         // Pre-pass: collect struct definitions and methods
         for item in &ast.ast.items {

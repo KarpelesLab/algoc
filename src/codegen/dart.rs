@@ -544,6 +544,7 @@ impl DartGenerator {
     }
 
     fn default_value_for_type(&self, ty: &crate::parser::Type) -> String {
+        #![allow(clippy::only_used_in_recursion)]
         use crate::parser::{PrimitiveType, TypeKind};
         match &ty.kind {
             TypeKind::Primitive(p) => {
@@ -574,10 +575,20 @@ impl DartGenerator {
                 },
                 _ => format!("List<dynamic>.filled({}, null)", size),
             },
+            TypeKind::Slice { element } | TypeKind::ArrayRef { element, .. } => {
+                match &element.kind {
+                    TypeKind::Primitive(p) => match p {
+                        PrimitiveType::U8 => "Uint8List(0)".to_string(),
+                        _ => "<int>[]".to_string(),
+                    },
+                    _ => "<dynamic>[]".to_string(),
+                }
+            }
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.default_value_for_type(inner),
             TypeKind::Named(ident) => {
                 format!("create_{}()", ident.name)
             }
-            _ => "null".to_string(),
+            _ => "0".to_string(),
         }
     }
 
@@ -652,7 +663,7 @@ impl DartGenerator {
                 } else if let Some(ty) = ty {
                     self.write(&self.default_value_for_type(ty));
                 } else {
-                    self.write("null");
+                    self.write("0");
                 }
                 self.write(";\n");
             }
