@@ -452,11 +452,6 @@ impl ScopeStack {
         self.global().get_enum(name)
     }
 
-    /// Look up an interface by name (only in global scope)
-    pub fn lookup_interface(&self, name: &str) -> Option<&InterfaceDef> {
-        self.global().get_interface(name)
-    }
-
     /// Consume the stack and return the global scope with all nested scopes
     pub fn into_global(mut self) -> Scope {
         // Pop all scopes except global, adding them as children

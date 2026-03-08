@@ -277,36 +277,36 @@ impl<'src> Parser<'src> {
                     let is_mut = self.match_keyword(Keyword::Mut);
 
                     // Check for 'self' keyword (parsed as ident)
-                    if let TokenKind::Ident(name) = &self.peek().kind {
-                        if name == "self" {
-                            self.advance(); // consume 'self'
-                            let span = start.merge(self.previous().span);
-                            let self_inner = Type {
-                                kind: TypeKind::SelfType,
+                    if let TokenKind::Ident(name) = &self.peek().kind
+                        && name == "self"
+                    {
+                        self.advance(); // consume 'self'
+                        let span = start.merge(self.previous().span);
+                        let self_inner = Type {
+                            kind: TypeKind::SelfType,
+                            span,
+                        };
+                        let self_type = if is_mut {
+                            Type {
+                                kind: TypeKind::MutRef(Box::new(self_inner)),
                                 span,
-                            };
-                            let self_type = if is_mut {
-                                Type {
-                                    kind: TypeKind::MutRef(Box::new(self_inner)),
-                                    span,
-                                }
-                            } else {
-                                Type {
-                                    kind: TypeKind::Ref(Box::new(self_inner)),
-                                    span,
-                                }
-                            };
-                            params.push(Param {
-                                name: Ident::new("self".to_string(), span),
-                                ty: self_type,
-                                span,
-                            });
-
-                            if !self.match_token(&TokenKind::Comma) {
-                                break;
                             }
-                            continue;
+                        } else {
+                            Type {
+                                kind: TypeKind::Ref(Box::new(self_inner)),
+                                span,
+                            }
+                        };
+                        params.push(Param {
+                            name: Ident::new("self".to_string(), span),
+                            ty: self_type,
+                            span,
+                        });
+
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
                         }
+                        continue;
                     }
 
                     // Not a self param, need to put back the & token context
@@ -318,24 +318,24 @@ impl<'src> Parser<'src> {
                 }
 
                 // Check for bare 'self' parameter
-                if let TokenKind::Ident(name) = &self.peek().kind {
-                    if name == "self" {
-                        let span = self.current_span();
-                        self.advance(); // consume 'self'
-                        params.push(Param {
-                            name: Ident::new("self".to_string(), span),
-                            ty: Type {
-                                kind: TypeKind::SelfType,
-                                span,
-                            },
+                if let TokenKind::Ident(name) = &self.peek().kind
+                    && name == "self"
+                {
+                    let span = self.current_span();
+                    self.advance(); // consume 'self'
+                    params.push(Param {
+                        name: Ident::new("self".to_string(), span),
+                        ty: Type {
+                            kind: TypeKind::SelfType,
                             span,
-                        });
+                        },
+                        span,
+                    });
 
-                        if !self.match_token(&TokenKind::Comma) {
-                            break;
-                        }
-                        continue;
+                    if !self.match_token(&TokenKind::Comma) {
+                        break;
                     }
+                    continue;
                 }
 
                 // Regular parameter: name: Type
@@ -507,7 +507,11 @@ impl<'src> Parser<'src> {
         self.expect(&TokenKind::RBrace, "expected '}' after interface methods")?;
 
         let span = start.merge(self.previous().span);
-        Ok(InterfaceDef { name, methods, span })
+        Ok(InterfaceDef {
+            name,
+            methods,
+            span,
+        })
     }
 
     fn parse_interface_method(&mut self) -> AlgocResult<InterfaceMethod> {
@@ -1513,10 +1517,7 @@ impl<'src> Parser<'src> {
                 // Check for arguments
                 let args = if self.match_token(&TokenKind::LParen) {
                     let args = self.parse_args()?;
-                    self.expect(
-                        &TokenKind::RParen,
-                        "expected ')' after arguments",
-                    )?;
+                    self.expect(&TokenKind::RParen, "expected ')' after arguments")?;
                     args
                 } else {
                     Vec::new()

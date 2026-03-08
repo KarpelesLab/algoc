@@ -1208,7 +1208,11 @@ impl PythonGenerator {
                 }
                 self.write(")");
             }
-            ExprKind::TypeStaticCall { type_name, method_name, args } => {
+            ExprKind::TypeStaticCall {
+                type_name,
+                method_name,
+                args,
+            } => {
                 // Should be resolved by monomorphization - generate placeholder
                 self.write(&format!("{}__{}", type_name.name, method_name.name));
                 self.write("(");

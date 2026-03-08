@@ -124,10 +124,8 @@ impl<'a> TypeChecker<'a> {
                     } = &sym.ty.kind
                     {
                         // Check return type (substituting Self -> struct_name)
-                        let expected_return = self.substitute_self_type(
-                            &iface_method.return_type,
-                            struct_name,
-                        );
+                        let expected_return =
+                            Self::substitute_self_type(&iface_method.return_type, struct_name);
                         if !expected_return.is_compatible_with(method_return) {
                             errors.push(format!(
                                 "method '{}' has wrong return type: expected {}, got {}",
@@ -139,7 +137,7 @@ impl<'a> TypeChecker<'a> {
                         let expected_params: Vec<Type> = iface_method
                             .param_types
                             .iter()
-                            .map(|t| self.substitute_self_type(t, struct_name))
+                            .map(|t| Self::substitute_self_type(t, struct_name))
                             .collect();
 
                         // For instance methods, the actual method has self as first param
@@ -170,10 +168,7 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
                     } else {
-                        errors.push(format!(
-                            "'{}' is not a method",
-                            iface_method.name
-                        ));
+                        errors.push(format!("'{}' is not a method", iface_method.name));
                     }
                 }
                 None => {
@@ -193,19 +188,17 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Substitute Self type with a concrete struct type
-    fn substitute_self_type(&self, ty: &Type, struct_name: &str) -> Type {
+    fn substitute_self_type(ty: &Type, struct_name: &str) -> Type {
         match &ty.kind {
             TypeKind::SelfType => Type::struct_type(struct_name.to_string()),
-            TypeKind::Ref { inner, mutable } => Type::reference(
-                self.substitute_self_type(inner, struct_name),
-                *mutable,
-            ),
-            TypeKind::Array { element, size } => Type::array(
-                self.substitute_self_type(element, struct_name),
-                *size,
-            ),
+            TypeKind::Ref { inner, mutable } => {
+                Type::reference(Self::substitute_self_type(inner, struct_name), *mutable)
+            }
+            TypeKind::Array { element, size } => {
+                Type::array(Self::substitute_self_type(element, struct_name), *size)
+            }
             TypeKind::Slice { element } => {
-                Type::slice(self.substitute_self_type(element, struct_name))
+                Type::slice(Self::substitute_self_type(element, struct_name))
             }
             _ => ty.clone(),
         }
@@ -292,7 +285,10 @@ impl<'a> TypeChecker<'a> {
                 self.scopes.pop();
                 self.current_return_type = None;
             }
-            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) | ItemKind::Interface(_) => {
+            ItemKind::Struct(_)
+            | ItemKind::Layout(_)
+            | ItemKind::Enum(_)
+            | ItemKind::Interface(_) => {
                 // Type definitions don't need checking beyond parsing
             }
             ItemKind::Use(_) => {

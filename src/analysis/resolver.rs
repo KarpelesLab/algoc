@@ -390,7 +390,10 @@ impl Resolver {
                 self.resolve_block(&t.body);
                 self.scopes.pop();
             }
-            ItemKind::Struct(_) | ItemKind::Layout(_) | ItemKind::Enum(_) | ItemKind::Interface(_) => {
+            ItemKind::Struct(_)
+            | ItemKind::Layout(_)
+            | ItemKind::Enum(_)
+            | ItemKind::Interface(_) => {
                 // Already handled in declare_item
             }
             ItemKind::Use(_) => {

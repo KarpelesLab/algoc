@@ -12,10 +12,12 @@ AlgoC is designed for implementing cryptographic algorithms, compression, codecs
 - **Type Safety** - Strong type system with integer widening, references, arrays, and slices
 - **Multiple Targets** - Generate code for JavaScript and Python
 - **Endian Types** - First-class endianness support with `u32be`, `u32le`, etc.
+- **Structs & Enums** - Aggregate types with methods via `impl` blocks and pattern matching
+- **Interfaces & Generics** - Trait-like interfaces with monomorphized generic functions
 - **Built-in Functions** - `rotr`, `rotl`, `bswap`, `read_u32_be`, `write_u64_be`, etc.
 - **Import System** - Modular code organization with `use` statements
-- **Test Framework** - Embedded test vectors for verification
-- **Standard Library** - Cryptographic (SHA-256, MD5) and compression (DEFLATE, gzip) implementations
+- **Test Framework** - Embedded test vectors with inline test execution
+- **Standard Library** - Crypto (SHA-256, SHA-1, MD5, AES, HMAC), compression (DEFLATE, gzip), image (PNG, BMP) implementations
 
 ## Installation
 
@@ -40,6 +42,12 @@ algoc compile stdlib/crypto/sha256.algoc -t js -o output.js
 
 # Include test functions in output
 algoc compile stdlib/crypto/sha256.algoc -t js --test
+
+# Run tests directly (compiles and streams to interpreter)
+algoc test stdlib/crypto/sha256.algoc -t js
+
+# Parse and dump AST (no type checking)
+algoc parse stdlib/crypto/sha256.algoc
 ```
 
 ## Example
@@ -90,30 +98,55 @@ test sha256_abc {
 }
 ```
 
+### Interfaces and Generics
+
+AlgoC supports trait-like interfaces and monomorphized generic functions:
+
+```algoc
+// Define a common interface for hash functions
+interface Hash {
+    static fn new() -> Self;
+    static fn block_size() -> u64;
+    static fn output_size() -> u64;
+    fn update(&mut self, data: &[u8]);
+    fn finalize(&mut self, output: &mut [u8]);
+    fn reset(&mut self);
+}
+
+// Generic HMAC that works with any hash implementing Hash
+fn hmac<H: Hash>(key: &[u8], message: &[u8], output: &mut [u8]) {
+    let mut hasher = H::new();
+    let block_size = H::block_size();
+    // ...
+}
+
+// Concrete usage - monomorphized at compile time
+fn hmac_sha256(key: &[u8], message: &[u8], output: &mut [u8; 32]) {
+    hmac::<Sha256State>(key, message, output);
+}
+```
+
 ## Supported Targets
 
 | Target | Status | Notes |
 |--------|--------|-------|
-| JavaScript | ✅ Working | Uses TypedArrays for byte buffers |
-| Python | ✅ Working | Uses bytearray for mutable buffers |
-| Go | 🚧 Planned | |
-| Rust | 🚧 Planned | |
-| C | 🚧 Planned | |
-| VHDL | 🚧 Planned | Hardware description language |
-| Verilog | 🚧 Planned | Hardware description language |
+| JavaScript | Working | Uses TypedArrays for byte buffers, BigInt for 64/128-bit |
+| Python | Working | Uses bytearray for mutable buffers |
 
 ## DSL Reference
 
 ### Types
 
 - **Integers**: `u8`, `u16`, `u32`, `u64`, `u128`, `i8`, `i16`, `i32`, `i64`, `i128`
-- **Endian Integers**: `u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le` (and signed variants)
+- **Endian Integers**: `u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le`, `u128be`, `u128le` (and signed variants)
 - **Boolean**: `bool`
 - **Arrays**: `T[N]` (e.g., `u32[64]`)
 - **Array Repeat**: `[value; N]` (e.g., `[0u8; 64]` creates 64 zero bytes)
 - **Slices**: `&[T]` (dynamically-sized view)
 - **References**: `&T`, `&mut T`
-- **Structs**: Named aggregate types
+- **Structs**: Named aggregate types with methods
+- **Enums**: Algebraic data types with optional data (`enum Color { Red, Rgb(u8, u8, u8) }`)
+- **Interfaces**: Trait-like protocol definitions
 
 ### Endian Casting
 
@@ -128,6 +161,40 @@ buf[0..4] as u32be = value;
 
 // Works with any endian type
 let le_value = data[offset..offset + 8] as u64le;
+```
+
+### Structs and Methods
+
+```algoc
+struct Counter {
+    value: u32
+}
+
+impl Counter {
+    fn new() -> Counter {
+        Counter { value: 0 }
+    }
+
+    fn increment(&mut self) {
+        self.value = self.value + 1;
+    }
+}
+```
+
+### Enums and Pattern Matching
+
+```algoc
+enum Option {
+    None,
+    Some(u32)
+}
+
+fn unwrap_or(opt: Option, default: u32) -> u32 {
+    match opt {
+        Option::None => default,
+        Option::Some(v) => v,
+    }
+}
 ```
 
 ### Built-in Functions
@@ -182,9 +249,12 @@ if condition {
 The `stdlib/` directory contains reference implementations:
 
 ### Cryptographic
-- **AES** (`stdlib/crypto/aes.algoc`) - FIPS 197 (AES-128, AES-192, AES-256)
 - **SHA-256** (`stdlib/crypto/sha256.algoc`) - FIPS 180-4 compliant
+- **SHA-1** (`stdlib/crypto/sha1.algoc`) - FIPS 180-4 compliant
 - **MD5** (`stdlib/crypto/md5.algoc`) - RFC 1321 implementation
+- **AES** (`stdlib/crypto/aes.algoc`) - FIPS 197 (AES-128, AES-192, AES-256)
+- **HMAC** (`stdlib/crypto/hmac.algoc`) - RFC 2104/4231, generic over any Hash implementation
+- **Hash Interface** (`stdlib/crypto/hash.algoc`) - Common interface for hash functions
 
 ### Compression
 - **DEFLATE** (`stdlib/compression/deflate.algoc`) - RFC 1951 decompression with Huffman decoding
@@ -194,8 +264,9 @@ The `stdlib/` directory contains reference implementations:
 - **CRC32** (`stdlib/hash/crc32.algoc`) - Checksum computation
 
 ### Image
-- **Pixmap** (`stdlib/image/pixmap.algoc`) - Shared image buffer structure with pixel format support
+- **PNG** (`stdlib/image/png.algoc`) - PNG encoder/decoder (RGB, RGBA, Grayscale; all 5 filter types)
 - **BMP** (`stdlib/image/bmp.algoc`) - Windows Bitmap encoder (24-bit and 32-bit)
+- **Pixmap** (`stdlib/image/pixmap.algoc`) - Shared pixel buffer abstraction
 
 ### Runtime
 - **runtime.algoc** (`stdlib/runtime.algoc`) - Bit manipulation utilities, endian helpers
@@ -221,8 +292,18 @@ Source (.algoc)
 └────┬─────┘
      │
      ▼
+┌───────────────┐
+│ Monomorphizer │  Generic function specialization
+└──────┬────────┘
+     │
+     ▼
+┌──────────┐
+│ Resolver │  Re-resolve with generated functions
+└────┬─────┘
+     │
+     ▼
 ┌─────────┐
-│ Checker │  Type checking
+│ Checker │  Type checking & inference
 └────┬────┘
      │
      ▼
@@ -236,7 +317,7 @@ Source (.algoc)
 └────┬────┘
      │
      ▼
-Output (.js, .py, .go, .rs, .c, .vhd, .v)
+Output (.js, .py)
 ```
 
 ## License

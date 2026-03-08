@@ -591,14 +591,20 @@ impl JavaScriptGenerator {
                         // Check if it's a StructName__new() call
                         if let Some(idx) = func_ident.name.find("__new") {
                             let struct_name = &func_ident.name[..idx];
-                            self.var_types.insert(name.name.clone(), struct_name.to_string());
+                            self.var_types
+                                .insert(name.name.clone(), struct_name.to_string());
                         }
                     }
                     // Also handle TypeStaticCall for H::new() style calls
-                    if let ExprKind::TypeStaticCall { type_name, method_name, .. } = &init_expr.kind
+                    if let ExprKind::TypeStaticCall {
+                        type_name,
+                        method_name,
+                        ..
+                    } = &init_expr.kind
                         && method_name.name == "new"
                     {
-                        self.var_types.insert(name.name.clone(), type_name.name.clone());
+                        self.var_types
+                            .insert(name.name.clone(), type_name.name.clone());
                     }
                 }
 
@@ -1365,7 +1371,11 @@ impl JavaScriptGenerator {
                 }
                 self.write(")");
             }
-            ExprKind::TypeStaticCall { type_name, method_name, args } => {
+            ExprKind::TypeStaticCall {
+                type_name,
+                method_name,
+                args,
+            } => {
                 // Should be resolved by monomorphization - generate placeholder
                 self.write(&format!("{}__{}", type_name.name, method_name.name));
                 self.write("(");

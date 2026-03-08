@@ -36,8 +36,6 @@ impl MonomorphKey {
 
 /// Monomorphization pass
 pub struct Monomorphizer<'a> {
-    /// Global scope for interface/struct lookups
-    global_scope: &'a Scope,
     /// Generic functions indexed by name
     generic_functions: HashMap<String, &'a Function>,
     /// Monomorphization requests found during traversal
@@ -49,9 +47,8 @@ pub struct Monomorphizer<'a> {
 }
 
 impl<'a> Monomorphizer<'a> {
-    pub fn new(global_scope: &'a Scope) -> Self {
+    pub fn new(_global_scope: &'a Scope) -> Self {
         Self {
-            global_scope,
             generic_functions: HashMap::new(),
             requests: HashSet::new(),
             generated: HashMap::new(),
@@ -63,11 +60,10 @@ impl<'a> Monomorphizer<'a> {
     pub fn monomorphize(mut self, ast: &'a Ast) -> AlgocResult<Ast> {
         // First pass: collect generic functions
         for item in &ast.items {
-            if let ItemKind::Function(func) = &item.kind {
-                if func.type_params.is_some() {
-                    self.generic_functions
-                        .insert(func.name.name.clone(), func);
-                }
+            if let ItemKind::Function(func) = &item.kind
+                && func.type_params.is_some()
+            {
+                self.generic_functions.insert(func.name.name.clone(), func);
             }
         }
 
@@ -79,10 +75,10 @@ impl<'a> Monomorphizer<'a> {
         // Generate specialized functions for each request
         let requests: Vec<_> = self.requests.iter().cloned().collect();
         for key in requests {
-            if !self.generated.contains_key(&key) {
-                if let Some(specialized) = self.generate_specialized(&key) {
-                    self.generated.insert(key, specialized);
-                }
+            if !self.generated.contains_key(&key)
+                && let Some(specialized) = self.generate_specialized(&key)
+            {
+                self.generated.insert(key, specialized);
             }
         }
 
@@ -121,7 +117,7 @@ impl<'a> Monomorphizer<'a> {
         }
 
         // Add generated specialized functions
-        for (_key, func) in &self.generated {
+        for func in self.generated.values() {
             new_items.push(Item {
                 kind: ItemKind::Function(func.clone()),
                 span: func.name.span,
@@ -161,10 +157,10 @@ impl<'a> Monomorphizer<'a> {
     fn scan_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Expr(expr) => self.scan_expr(expr),
-            StmtKind::Let { init, .. } => {
-                if let Some(init) = init {
-                    self.scan_expr(init);
-                }
+            StmtKind::Let {
+                init: Some(init), ..
+            } => {
+                self.scan_expr(init);
             }
             StmtKind::Assign { target, value } => {
                 self.scan_expr(target);
@@ -185,7 +181,9 @@ impl<'a> Monomorphizer<'a> {
                     self.scan_block(else_block);
                 }
             }
-            StmtKind::For { start, end, body, .. } => {
+            StmtKind::For {
+                start, end, body, ..
+            } => {
                 self.scan_expr(start);
                 self.scan_expr(end);
                 self.scan_block(body);
@@ -216,10 +214,8 @@ impl<'a> Monomorphizer<'a> {
             } => {
                 // Record this instantiation
                 if let ExprKind::Ident(ident) = &func.kind {
-                    let type_arg_names: Vec<String> = type_args
-                        .iter()
-                        .map(|t| self.type_to_name(t))
-                        .collect();
+                    let type_arg_names: Vec<String> =
+                        type_args.iter().map(Self::type_to_name).collect();
 
                     self.requests.insert(MonomorphKey {
                         func_name: ident.name.clone(),
@@ -285,7 +281,10 @@ impl<'a> Monomorphizer<'a> {
             ExprKind::Cast { expr, .. } => {
                 self.scan_expr(expr);
             }
-            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) | ExprKind::Paren(inner) => {
+            ExprKind::Ref(inner)
+            | ExprKind::MutRef(inner)
+            | ExprKind::Deref(inner)
+            | ExprKind::Paren(inner) => {
                 self.scan_expr(inner);
             }
             _ => {}
@@ -293,12 +292,12 @@ impl<'a> Monomorphizer<'a> {
     }
 
     /// Convert a Type to a simple name string for mangling
-    fn type_to_name(&self, ty: &Type) -> String {
+    fn type_to_name(ty: &Type) -> String {
         match &ty.kind {
             TypeKind::Named(ident) => ident.name.clone(),
             TypeKind::Primitive(p) => format!("{:?}", p),
             TypeKind::Array { element, size } => {
-                format!("{}_{}", self.type_to_name(element), size)
+                format!("{}_{}", Self::type_to_name(element), size)
             }
             _ => "unknown".to_string(),
         }
@@ -332,23 +331,23 @@ impl<'a> Monomorphizer<'a> {
             .iter()
             .map(|p| Param {
                 name: p.name.clone(),
-                ty: self.substitute_type(&p.ty, &subst),
+                ty: Self::substitute_type(&p.ty, &subst),
                 span: p.span,
             })
             .collect();
 
         if let Some(ref ret_ty) = specialized.return_type {
-            specialized.return_type = Some(self.substitute_type(ret_ty, &subst));
+            specialized.return_type = Some(Self::substitute_type(ret_ty, &subst));
         }
 
         // Transform the body: replace H::method() calls with ConcreteType::method()
-        specialized.body = self.transform_block(&specialized.body, &subst);
+        specialized.body = Self::transform_block(&specialized.body, &subst);
 
         Some(specialized)
     }
 
     /// Substitute type parameters in a type
-    fn substitute_type(&self, ty: &Type, subst: &HashMap<String, String>) -> Type {
+    fn substitute_type(ty: &Type, subst: &HashMap<String, String>) -> Type {
         match &ty.kind {
             TypeKind::Named(ident) => {
                 if let Some(concrete) = subst.get(&ident.name) {
@@ -361,23 +360,23 @@ impl<'a> Monomorphizer<'a> {
                 }
             }
             TypeKind::Ref(inner) => Type {
-                kind: TypeKind::Ref(Box::new(self.substitute_type(inner, subst))),
+                kind: TypeKind::Ref(Box::new(Self::substitute_type(inner, subst))),
                 span: ty.span,
             },
             TypeKind::MutRef(inner) => Type {
-                kind: TypeKind::MutRef(Box::new(self.substitute_type(inner, subst))),
+                kind: TypeKind::MutRef(Box::new(Self::substitute_type(inner, subst))),
                 span: ty.span,
             },
             TypeKind::Array { element, size } => Type {
                 kind: TypeKind::Array {
-                    element: Box::new(self.substitute_type(element, subst)),
+                    element: Box::new(Self::substitute_type(element, subst)),
                     size: *size,
                 },
                 span: ty.span,
             },
             TypeKind::Slice { element } => Type {
                 kind: TypeKind::Slice {
-                    element: Box::new(self.substitute_type(element, subst)),
+                    element: Box::new(Self::substitute_type(element, subst)),
                 },
                 span: ty.span,
             },
@@ -386,20 +385,20 @@ impl<'a> Monomorphizer<'a> {
     }
 
     /// Transform a block, substituting type parameter calls
-    fn transform_block(&self, block: &Block, subst: &HashMap<String, String>) -> Block {
+    fn transform_block(block: &Block, subst: &HashMap<String, String>) -> Block {
         Block {
             stmts: block
                 .stmts
                 .iter()
-                .map(|s| self.transform_stmt(s, subst))
+                .map(|s| Self::transform_stmt(s, subst))
                 .collect(),
             span: block.span,
         }
     }
 
-    fn transform_stmt(&self, stmt: &Stmt, subst: &HashMap<String, String>) -> Stmt {
+    fn transform_stmt(stmt: &Stmt, subst: &HashMap<String, String>) -> Stmt {
         let kind = match &stmt.kind {
-            StmtKind::Expr(expr) => StmtKind::Expr(self.transform_expr(expr, subst)),
+            StmtKind::Expr(expr) => StmtKind::Expr(Self::transform_expr(expr, subst)),
             StmtKind::Let {
                 name,
                 ty,
@@ -407,27 +406,27 @@ impl<'a> Monomorphizer<'a> {
                 init,
             } => StmtKind::Let {
                 name: name.clone(),
-                ty: ty.as_ref().map(|t| self.substitute_type(t, subst)),
+                ty: ty.as_ref().map(|t| Self::substitute_type(t, subst)),
                 mutable: *mutable,
-                init: init.as_ref().map(|e| self.transform_expr(e, subst)),
+                init: init.as_ref().map(|e| Self::transform_expr(e, subst)),
             },
             StmtKind::Assign { target, value } => StmtKind::Assign {
-                target: self.transform_expr(target, subst),
-                value: self.transform_expr(value, subst),
+                target: Self::transform_expr(target, subst),
+                value: Self::transform_expr(value, subst),
             },
             StmtKind::CompoundAssign { target, op, value } => StmtKind::CompoundAssign {
-                target: self.transform_expr(target, subst),
+                target: Self::transform_expr(target, subst),
                 op: *op,
-                value: self.transform_expr(value, subst),
+                value: Self::transform_expr(value, subst),
             },
             StmtKind::If {
                 condition,
                 then_block,
                 else_block,
             } => StmtKind::If {
-                condition: self.transform_expr(condition, subst),
-                then_block: self.transform_block(then_block, subst),
-                else_block: else_block.as_ref().map(|b| self.transform_block(b, subst)),
+                condition: Self::transform_expr(condition, subst),
+                then_block: Self::transform_block(then_block, subst),
+                else_block: else_block.as_ref().map(|b| Self::transform_block(b, subst)),
             },
             StmtKind::For {
                 var,
@@ -437,22 +436,22 @@ impl<'a> Monomorphizer<'a> {
                 body,
             } => StmtKind::For {
                 var: var.clone(),
-                start: self.transform_expr(start, subst),
-                end: self.transform_expr(end, subst),
+                start: Self::transform_expr(start, subst),
+                end: Self::transform_expr(end, subst),
                 inclusive: *inclusive,
-                body: self.transform_block(body, subst),
+                body: Self::transform_block(body, subst),
             },
             StmtKind::While { condition, body } => StmtKind::While {
-                condition: self.transform_expr(condition, subst),
-                body: self.transform_block(body, subst),
+                condition: Self::transform_expr(condition, subst),
+                body: Self::transform_block(body, subst),
             },
             StmtKind::Loop { body } => StmtKind::Loop {
-                body: self.transform_block(body, subst),
+                body: Self::transform_block(body, subst),
             },
             StmtKind::Return(expr) => {
-                StmtKind::Return(expr.as_ref().map(|e| self.transform_expr(e, subst)))
+                StmtKind::Return(expr.as_ref().map(|e| Self::transform_expr(e, subst)))
             }
-            StmtKind::Block(block) => StmtKind::Block(self.transform_block(block, subst)),
+            StmtKind::Block(block) => StmtKind::Block(Self::transform_block(block, subst)),
             StmtKind::Break => StmtKind::Break,
             StmtKind::Continue => StmtKind::Continue,
         };
@@ -462,7 +461,7 @@ impl<'a> Monomorphizer<'a> {
         }
     }
 
-    fn transform_expr(&self, expr: &Expr, subst: &HashMap<String, String>) -> Expr {
+    fn transform_expr(expr: &Expr, subst: &HashMap<String, String>) -> Expr {
         let kind = match &expr.kind {
             // Transform H::method() to ConcreteType::method()
             ExprKind::TypeStaticCall {
@@ -478,7 +477,10 @@ impl<'a> Monomorphizer<'a> {
                 ExprKind::TypeStaticCall {
                     type_name: new_type_name,
                     method_name: method_name.clone(),
-                    args: args.iter().map(|a| self.transform_expr(a, subst)).collect(),
+                    args: args
+                        .iter()
+                        .map(|a| Self::transform_expr(a, subst))
+                        .collect(),
                 }
             }
             // Transform generic calls to regular calls
@@ -488,10 +490,8 @@ impl<'a> Monomorphizer<'a> {
                 args,
             } => {
                 if let ExprKind::Ident(ident) = &func.kind {
-                    let type_arg_names: Vec<String> = type_args
-                        .iter()
-                        .map(|t| self.type_to_name(t))
-                        .collect();
+                    let type_arg_names: Vec<String> =
+                        type_args.iter().map(Self::type_to_name).collect();
                     let key = MonomorphKey {
                         func_name: ident.name.clone(),
                         type_args: type_arg_names,
@@ -503,7 +503,10 @@ impl<'a> Monomorphizer<'a> {
                             kind: ExprKind::Ident(Ident::new(mangled, ident.span)),
                             span: func.span,
                         }),
-                        args: args.iter().map(|a| self.transform_expr(a, subst)).collect(),
+                        args: args
+                            .iter()
+                            .map(|a| Self::transform_expr(a, subst))
+                            .collect(),
                     }
                 } else {
                     // Shouldn't happen but handle it
@@ -511,34 +514,40 @@ impl<'a> Monomorphizer<'a> {
                 }
             }
             ExprKind::Binary { left, op, right } => ExprKind::Binary {
-                left: Box::new(self.transform_expr(left, subst)),
+                left: Box::new(Self::transform_expr(left, subst)),
                 op: *op,
-                right: Box::new(self.transform_expr(right, subst)),
+                right: Box::new(Self::transform_expr(right, subst)),
             },
             ExprKind::Unary { op, operand } => ExprKind::Unary {
                 op: *op,
-                operand: Box::new(self.transform_expr(operand, subst)),
+                operand: Box::new(Self::transform_expr(operand, subst)),
             },
             ExprKind::Call { func, args } => ExprKind::Call {
-                func: Box::new(self.transform_expr(func, subst)),
-                args: args.iter().map(|a| self.transform_expr(a, subst)).collect(),
+                func: Box::new(Self::transform_expr(func, subst)),
+                args: args
+                    .iter()
+                    .map(|a| Self::transform_expr(a, subst))
+                    .collect(),
             },
             ExprKind::Index { array, index } => ExprKind::Index {
-                array: Box::new(self.transform_expr(array, subst)),
-                index: Box::new(self.transform_expr(index, subst)),
+                array: Box::new(Self::transform_expr(array, subst)),
+                index: Box::new(Self::transform_expr(index, subst)),
             },
             ExprKind::Field { object, field } => ExprKind::Field {
-                object: Box::new(self.transform_expr(object, subst)),
+                object: Box::new(Self::transform_expr(object, subst)),
                 field: field.clone(),
             },
             ExprKind::Array(elements) => ExprKind::Array(
-                elements.iter().map(|e| self.transform_expr(e, subst)).collect(),
+                elements
+                    .iter()
+                    .map(|e| Self::transform_expr(e, subst))
+                    .collect(),
             ),
             ExprKind::StructLit { name, fields } => ExprKind::StructLit {
                 name: name.clone(),
                 fields: fields
                     .iter()
-                    .map(|(n, v)| (n.clone(), self.transform_expr(v, subst)))
+                    .map(|(n, v)| (n.clone(), Self::transform_expr(v, subst)))
                     .collect(),
             },
             ExprKind::MethodCall {
@@ -547,36 +556,33 @@ impl<'a> Monomorphizer<'a> {
                 mangled_name,
                 args,
             } => ExprKind::MethodCall {
-                receiver: Box::new(self.transform_expr(receiver, subst)),
+                receiver: Box::new(Self::transform_expr(receiver, subst)),
                 method_name: method_name.clone(),
                 mangled_name: mangled_name.clone(),
-                args: args.iter().map(|a| self.transform_expr(a, subst)).collect(),
+                args: args
+                    .iter()
+                    .map(|a| Self::transform_expr(a, subst))
+                    .collect(),
             },
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => ExprKind::Conditional {
-                condition: Box::new(self.transform_expr(condition, subst)),
-                then_expr: Box::new(self.transform_expr(then_expr, subst)),
-                else_expr: Box::new(self.transform_expr(else_expr, subst)),
+                condition: Box::new(Self::transform_expr(condition, subst)),
+                then_expr: Box::new(Self::transform_expr(then_expr, subst)),
+                else_expr: Box::new(Self::transform_expr(else_expr, subst)),
             },
             ExprKind::Cast { expr: inner, ty } => ExprKind::Cast {
-                expr: Box::new(self.transform_expr(inner, subst)),
-                ty: self.substitute_type(ty, subst),
+                expr: Box::new(Self::transform_expr(inner, subst)),
+                ty: Self::substitute_type(ty, subst),
             },
-            ExprKind::Ref(inner) => {
-                ExprKind::Ref(Box::new(self.transform_expr(inner, subst)))
-            }
+            ExprKind::Ref(inner) => ExprKind::Ref(Box::new(Self::transform_expr(inner, subst))),
             ExprKind::MutRef(inner) => {
-                ExprKind::MutRef(Box::new(self.transform_expr(inner, subst)))
+                ExprKind::MutRef(Box::new(Self::transform_expr(inner, subst)))
             }
-            ExprKind::Deref(inner) => {
-                ExprKind::Deref(Box::new(self.transform_expr(inner, subst)))
-            }
-            ExprKind::Paren(inner) => {
-                ExprKind::Paren(Box::new(self.transform_expr(inner, subst)))
-            }
+            ExprKind::Deref(inner) => ExprKind::Deref(Box::new(Self::transform_expr(inner, subst))),
+            ExprKind::Paren(inner) => ExprKind::Paren(Box::new(Self::transform_expr(inner, subst))),
             _ => expr.kind.clone(),
         };
         Expr {
@@ -594,7 +600,7 @@ impl<'a> Monomorphizer<'a> {
                 type_params: func.type_params.clone(),
                 params: func.params.clone(),
                 return_type: func.return_type.clone(),
-                body: self.transform_block(&func.body, &empty_subst),
+                body: Self::transform_block(&func.body, &empty_subst),
                 is_static: func.is_static,
             }),
             ItemKind::Impl(impl_def) => ItemKind::Impl(crate::parser::ImplDef {
@@ -607,7 +613,7 @@ impl<'a> Monomorphizer<'a> {
                         type_params: m.type_params.clone(),
                         params: m.params.clone(),
                         return_type: m.return_type.clone(),
-                        body: self.transform_block(&m.body, &empty_subst),
+                        body: Self::transform_block(&m.body, &empty_subst),
                         is_static: m.is_static,
                     })
                     .collect(),
@@ -615,7 +621,7 @@ impl<'a> Monomorphizer<'a> {
             }),
             ItemKind::Test(test) => ItemKind::Test(crate::parser::TestDef {
                 name: test.name.clone(),
-                body: self.transform_block(&test.body, &empty_subst),
+                body: Self::transform_block(&test.body, &empty_subst),
                 span: test.span,
             }),
             _ => item.kind.clone(),
