@@ -689,13 +689,16 @@ impl DartGenerator {
         self.write_indent();
         self.write(&format!("{} {}(", return_type, func.name.name));
 
-        // Parameters
+        // Parameters - also track named/struct types for secure_zero detection
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
             }
             let ty = self.dart_type(&param.ty);
             self.write(&format!("{} {}", ty, param.name.name));
+            if let Some(struct_name) = Self::extract_named_type(&param.ty) {
+                self.var_types.insert(param.name.name.clone(), struct_name);
+            }
         }
 
         self.write(") {\n");
@@ -1056,6 +1059,22 @@ impl DartGenerator {
                         self.generate_expr(arg);
                     }
                     self.write(")");
+                    return;
+                }
+
+                // Handle secure_zero calls on non-u8 arrays (e.g., Uint32List)
+                // secure_zero expects Uint8List but state.h is Uint32List.
+                // Generate .fillRange(0, .length, 0) instead.
+                if let ExprKind::Ident(ident) = &func.kind
+                    && ident.name == "secure_zero"
+                    && args.len() == 1
+                    && let ExprKind::MutRef(inner) = &args[0].kind
+                    && self.is_non_u8_array_expr(inner)
+                {
+                    self.generate_expr(inner);
+                    self.write(".fillRange(0, ");
+                    self.generate_expr(inner);
+                    self.write(".length, 0)");
                     return;
                 }
 
@@ -1806,6 +1825,38 @@ impl DartGenerator {
             | TypeKind::Slice { element }
             | TypeKind::ArrayRef { element, .. } => Self::type_contains_self(element),
             _ => false,
+        }
+    }
+
+    /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
+    /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
+    fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
+        if let ExprKind::Field { object, field } = &expr.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+            && let Some(fields) = self.struct_defs.get(struct_name)
+        {
+            for f in fields {
+                if f.name == field.name
+                    && let TypeKind::Array { element, .. } = &f.ty.kind
+                {
+                    if let TypeKind::Primitive(p) = &element.kind {
+                        return *p != crate::parser::PrimitiveType::U8;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract the struct name from a type, unwrapping through references.
+    /// For `&mut Sha256State` or `Sha256State`, returns `Some("Sha256State")`.
+    fn extract_named_type(ty: &ParserType) -> Option<String> {
+        match &ty.kind {
+            TypeKind::Named(ident) => Some(ident.name.clone()),
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => Self::extract_named_type(inner),
+            _ => None,
         }
     }
 }

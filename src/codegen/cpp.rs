@@ -485,6 +485,8 @@ impl CppGenerator {
     }
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
+        self.var_types.clear();
+
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
 
         // Build return type
@@ -497,13 +499,16 @@ impl CppGenerator {
         self.write_indent();
         self.write(&format!("{} {}(", ret_type, mangled_name));
 
-        // Parameters
+        // Parameters - also track named/struct types for secure_zero detection
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
             }
             let cpp_ty = self.param_type_to_cpp(&param.ty);
             self.write(&format!("{} {}", cpp_ty, param.name.name));
+            if let Some(sname) = Self::extract_named_type(&param.ty) {
+                self.var_types.insert(param.name.name.clone(), sname);
+            }
         }
 
         self.write(") {\n");
@@ -841,7 +846,47 @@ impl CppGenerator {
         }
     }
 
+    /// Generate a forward declaration for a function (just the signature with semicolon)
+    fn generate_function_declaration(&mut self, func: &Function) {
+        let ret_type = if let Some(ret_ty) = &func.return_type {
+            self.type_to_cpp(ret_ty)
+        } else {
+            "void".to_string()
+        };
+        self.write_indent();
+        self.write(&format!("{} {}(", ret_type, func.name.name));
+        for (i, param) in func.params.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            let cpp_ty = self.param_type_to_cpp(&param.ty);
+            self.write(&format!("{} {}", cpp_ty, param.name.name));
+        }
+        self.write(");\n");
+    }
+
+    /// Generate a forward declaration for a method (mangled name)
+    fn generate_method_declaration(&mut self, mangled_name: &str, func: &Function) {
+        let ret_type = if let Some(ret_ty) = &func.return_type {
+            self.type_to_cpp(ret_ty)
+        } else {
+            "void".to_string()
+        };
+        self.write_indent();
+        self.write(&format!("{} {}(", ret_type, mangled_name));
+        for (i, param) in func.params.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            let cpp_ty = self.param_type_to_cpp(&param.ty);
+            self.write(&format!("{} {}", cpp_ty, param.name.name));
+        }
+        self.write(");\n");
+    }
+
     fn generate_function(&mut self, func: &Function) {
+        self.var_types.clear();
+
         // Build return type
         let ret_type = if let Some(ret_ty) = &func.return_type {
             self.type_to_cpp(ret_ty)
@@ -852,13 +897,16 @@ impl CppGenerator {
         self.write_indent();
         self.write(&format!("{} {}(", ret_type, func.name.name));
 
-        // Parameters
+        // Parameters - also track named/struct types for secure_zero detection
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
             }
             let cpp_ty = self.param_type_to_cpp(&param.ty);
             self.write(&format!("{} {}", cpp_ty, param.name.name));
+            if let Some(struct_name) = Self::extract_named_type(&param.ty) {
+                self.var_types.insert(param.name.name.clone(), struct_name);
+            }
         }
 
         self.write(") {\n");
@@ -1267,6 +1315,20 @@ impl CppGenerator {
                         self.generate_expr(arg);
                     }
                     self.write(")");
+                    return;
+                }
+
+                // Handle secure_zero calls on non-u8 arrays (e.g., std::array<uint32_t, 8>)
+                // secure_zero expects std::span<uint8_t> but state.h is array<uint32_t>.
+                // Generate .fill(0) instead.
+                if let ExprKind::Ident(ident) = &func.kind
+                    && ident.name == "secure_zero"
+                    && args.len() == 1
+                    && let ExprKind::MutRef(inner) = &args[0].kind
+                    && self.is_non_u8_array_expr(inner)
+                {
+                    self.generate_expr(inner);
+                    self.write(".fill(0)");
                     return;
                 }
 
@@ -1816,6 +1878,40 @@ impl CppGenerator {
         // Default to little endian, 32 bits
         (true, 32)
     }
+
+    /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
+    /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
+    fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
+        use crate::parser::TypeKind;
+        if let ExprKind::Field { object, field } = &expr.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+            && let Some(fields) = self.struct_defs.get(struct_name)
+        {
+            for f in fields {
+                if f.name == field.name
+                    && let TypeKind::Array { element, .. } = &f.ty.kind
+                {
+                    if let TypeKind::Primitive(p) = &element.kind {
+                        return *p != crate::parser::PrimitiveType::U8;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract the struct name from a type, unwrapping through references.
+    /// For `&mut Sha256State` or `&Sha256State` or `Sha256State`, returns `Some("Sha256State")`.
+    fn extract_named_type(ty: &ParserType) -> Option<String> {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Named(ident) => Some(ident.name.clone()),
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => Self::extract_named_type(inner),
+            _ => None,
+        }
+    }
 }
 
 /// Check if an expression is likely an array type (used for comparison)
@@ -1915,6 +2011,25 @@ impl CodeGenerator for CppGenerator {
             }
             if let ItemKind::Enum(e) = &item.kind {
                 self.writeln(&format!("struct {};", e.name.name));
+            }
+        }
+        self.writeln("");
+
+        // Forward declare all functions (so order of definition doesn't matter,
+        // e.g. hmac_sha256 can call hmac__Sha256State before its definition)
+        for item in &ast.ast.items {
+            match &item.kind {
+                ItemKind::Function(func) => {
+                    self.generate_function_declaration(func);
+                }
+                ItemKind::Impl(impl_def) => {
+                    for method in &impl_def.methods {
+                        let mangled_name =
+                            format!("{}__{}", impl_def.target.name, method.name.name);
+                        self.generate_method_declaration(&mangled_name, method);
+                    }
+                }
+                _ => {}
             }
         }
         self.writeln("");

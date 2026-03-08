@@ -42,6 +42,8 @@ pub struct GoGenerator {
     param_go_types: HashMap<String, String>,
     /// Function return types (function_name -> go_type)
     func_return_types: HashMap<String, String>,
+    /// Function parameter type signatures (function_name -> vec of go param types)
+    func_signatures: HashMap<String, Vec<String>>,
     /// Track which imports are needed
     needed_imports: HashSet<String>,
     /// Whether we need the assert helper
@@ -69,6 +71,7 @@ impl GoGenerator {
             var_go_types: HashMap::new(),
             param_go_types: HashMap::new(),
             func_return_types: HashMap::new(),
+            func_signatures: HashMap::new(),
             needed_imports: HashSet::new(),
             needs_assert: false,
             needs_bytes_equal: false,
@@ -966,6 +969,10 @@ impl GoGenerator {
         self.var_go_types.clear();
         self.param_go_types.clear();
 
+        // Record function signature for call-site type coercion
+        let sig: Vec<String> = func.params.iter().map(|p| self.go_type(&p.ty)).collect();
+        self.func_signatures.insert(func.name.name.clone(), sig);
+
         self.write_indent();
         self.write(&format!("func {}(", func.name.name));
 
@@ -1005,6 +1012,10 @@ impl GoGenerator {
         self.param_go_types.clear();
 
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
+
+        // Record function signature for call-site type coercion
+        let sig: Vec<String> = func.params.iter().map(|p| self.go_type(&p.ty)).collect();
+        self.func_signatures.insert(mangled_name.clone(), sig);
 
         self.write_indent();
         self.write(&format!("func {}(", mangled_name));
@@ -1050,8 +1061,18 @@ impl GoGenerator {
 
     fn generate_const(&mut self, c: &crate::parser::ConstDef) {
         self.write_indent();
-        self.write(&format!("var {} = ", c.name.name));
-        self.generate_expr(&c.value);
+        // Include the explicit Go type so constants have the correct type
+        // (e.g., `var MAX_MATCH uint32 = 258` instead of `var MAX_MATCH = 258`
+        // which would infer `int`)
+        let go_ty = self.go_type(&c.ty);
+        self.var_go_types.insert(c.name.name.clone(), go_ty.clone());
+        self.write(&format!("var {} {} = ", c.name.name, go_ty));
+        // Use type-aware expression generation for arrays
+        if matches!(c.ty.kind, crate::parser::TypeKind::Array { .. }) {
+            self.generate_expr_with_type(&c.value, &c.ty);
+        } else {
+            self.generate_expr(&c.value);
+        }
         self.write("\n\n");
     }
 
@@ -1279,6 +1300,11 @@ impl GoGenerator {
                     self.write_indent();
                     self.write(&format!("var {} interface{{}}\n", name.name));
                 }
+                // Emit `_ = name` to suppress Go "declared and not used" errors
+                // for variables that are declared for side-effects (e.g., consuming
+                // bytes from a stream) but never read.
+                self.write_indent();
+                self.write(&format!("_ = {}\n", name.name));
             }
             StmtKind::Expr(expr) => {
                 // Check if this is a call expression - if so, don't discard result
@@ -1455,8 +1481,15 @@ impl GoGenerator {
                 self.write(&format!("; {}++ {{\n", var.name));
                 // Register the loop variable's Go type so expressions
                 // inside the body can use it for type inference/coercion.
+                // When the end expression has a known type, use that type.
+                // Otherwise, the loop variable is untyped `int` (no entry,
+                // which overrides any previous `var_go_types` entry from
+                // an earlier scope with the same variable name).
                 if let Some(ref ty) = end_go_type {
                     self.var_go_types.insert(var.name.clone(), ty.clone());
+                } else {
+                    // Remove any stale type from a previous scope
+                    self.var_go_types.remove(&var.name);
                 }
                 self.indent();
                 self.generate_block(body);
@@ -1636,6 +1669,20 @@ impl GoGenerator {
                             let cr = if *r != wider { Some(wider) } else { None };
                             (cl, cr)
                         }
+                        // When one side is typed and the other is untyped (None),
+                        // cast the untyped side to match. This handles cases like
+                        // `uint32(x) == len` where len is an untyped int loop variable.
+                        (Some(l), None)
+                            if is_go_int_type(l)
+                                && !matches!(&right.kind, ExprKind::Integer(_)) =>
+                        {
+                            (None, Some(l.clone()))
+                        }
+                        (None, Some(r))
+                            if is_go_int_type(r) && !matches!(&left.kind, ExprKind::Integer(_)) =>
+                        {
+                            (Some(r.clone()), None)
+                        }
                         _ => (None, None),
                     };
 
@@ -1726,6 +1773,22 @@ impl GoGenerator {
                             self.generate_expr(arg);
                         }
                         self.write(")");
+                        return;
+                    }
+
+                    // Handle secure_zero calls on non-u8 arrays (e.g., [8]uint32)
+                    // secure_zero expects []uint8 but state.h is []uint32.
+                    // Generate a zeroing loop instead.
+                    if ident.name == "secure_zero"
+                        && args.len() == 1
+                        && let ExprKind::MutRef(inner) = &args[0].kind
+                        && self.is_non_u8_array_expr(inner)
+                    {
+                        self.write("func() { for _i := range ");
+                        self.generate_expr(inner);
+                        self.write(" { ");
+                        self.generate_expr(inner);
+                        self.write("[_i] = 0 } }()");
                         return;
                     }
                 }
@@ -1868,11 +1931,41 @@ impl GoGenerator {
                     }
                 }
 
+                // Look up function parameter types for call-site coercion
+                let func_name = if let ExprKind::Ident(ident) = &func.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
+                let param_types = func_name
+                    .as_ref()
+                    .and_then(|n| self.func_signatures.get(n).cloned());
+
                 self.generate_expr(func);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
+                    }
+                    // If the argument is a cast and the expected param type differs,
+                    // cast to the expected type instead
+                    if let Some(ref ptypes) = param_types
+                        && i < ptypes.len()
+                        && let ExprKind::Cast { expr: inner, .. } = &arg.kind
+                    {
+                        let arg_go_type = self.infer_expr_go_type(arg);
+                        let expected = &ptypes[i];
+                        if let Some(ref actual) = arg_go_type
+                            && actual != expected
+                            && is_go_int_type(actual)
+                            && is_go_int_type(expected)
+                        {
+                            // Re-cast to the expected parameter type
+                            self.write(&format!("{}(", expected));
+                            self.generate_expr(inner);
+                            self.write(")");
+                            continue;
+                        }
                     }
                     self.generate_expr(arg);
                 }
@@ -2409,6 +2502,29 @@ impl GoGenerator {
         }
         // Default to little endian, 32 bits
         (true, 32)
+    }
+
+    /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
+    /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
+    fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
+        use crate::parser::TypeKind;
+        if let ExprKind::Field { object, field } = &expr.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+            && let Some(fields) = self.struct_defs.get(struct_name)
+        {
+            for f in fields {
+                if f.name == field.name
+                    && let TypeKind::Array { element, .. } = &f.ty.kind
+                {
+                    if let TypeKind::Primitive(p) = &element.kind {
+                        return *p != crate::parser::PrimitiveType::U8;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

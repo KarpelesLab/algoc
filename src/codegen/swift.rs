@@ -49,6 +49,8 @@ pub struct SwiftGenerator {
     inout_params: std::collections::HashSet<String>,
     /// Function signatures: function name -> Vec<FuncParamInfo>
     func_param_info: HashMap<String, Vec<FuncParamInfo>>,
+    /// Current struct name for resolving SelfType (set during method/function generation)
+    current_struct_name: Option<String>,
 }
 
 impl SwiftGenerator {
@@ -62,6 +64,7 @@ impl SwiftGenerator {
             var_types: HashMap::new(),
             inout_params: std::collections::HashSet::new(),
             func_param_info: HashMap::new(),
+            current_struct_name: None,
         }
     }
 
@@ -116,8 +119,25 @@ impl SwiftGenerator {
                 self.swift_type(inner)
             }
             TypeKind::Ref(inner) => self.swift_type(inner),
-            TypeKind::Named(ident) => ident.name.clone(),
-            TypeKind::SelfType => "Self".to_string(),
+            TypeKind::Named(ident) => {
+                if ident.name == "Self" {
+                    // Named("Self") should resolve like SelfType
+                    if let Some(ref name) = self.current_struct_name {
+                        name.clone()
+                    } else {
+                        "Self".to_string()
+                    }
+                } else {
+                    ident.name.clone()
+                }
+            }
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_struct_name {
+                    name.clone()
+                } else {
+                    "Self".to_string()
+                }
+            }
         }
     }
 
@@ -442,6 +462,7 @@ impl SwiftGenerator {
     }
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
+        self.current_struct_name = Some(struct_name.to_string());
         self.inout_params.clear();
 
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
@@ -488,6 +509,7 @@ impl SwiftGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.current_struct_name = None;
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
@@ -622,13 +644,31 @@ impl SwiftGenerator {
             }
             TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.default_value_for_type(inner),
             TypeKind::Named(ident) => {
-                format!("create_{}()", ident.name)
+                if ident.name == "Self" {
+                    if let Some(ref name) = self.current_struct_name {
+                        format!("create_{}()", name)
+                    } else {
+                        "0".to_string()
+                    }
+                } else {
+                    format!("create_{}()", ident.name)
+                }
             }
-            _ => "0".to_string(),
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_struct_name {
+                    format!("create_{}()", name)
+                } else {
+                    "0".to_string()
+                }
+            }
         }
     }
 
     fn generate_function(&mut self, func: &Function) {
+        // Detect if this function was monomorphized from a method/generic
+        // If the function name contains "__", the prefix is the struct name
+        self.current_struct_name = Self::infer_self_type_name(&func.name.name);
+
         self.inout_params.clear();
 
         let func_safe_name = Self::swift_safe_ident(&func.name.name);
@@ -674,6 +714,7 @@ impl SwiftGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.current_struct_name = None;
     }
 
     /// Check if a type is a mutable reference
@@ -1841,6 +1882,15 @@ impl SwiftGenerator {
             return (little, bits);
         }
         (true, 32)
+    }
+
+    /// Infer the concrete type name that should replace `Self` in a function.
+    /// For functions with names like "StructName__method", the prefix is the struct name.
+    fn infer_self_type_name(func_name: &str) -> Option<String> {
+        if let Some(idx) = func_name.find("__") {
+            return Some(func_name[..idx].to_string());
+        }
+        None
     }
 }
 

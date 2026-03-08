@@ -536,8 +536,28 @@ impl ObjCGenerator {
                         }
                         crate::parser::TypeKind::MutRef(inner)
                         | crate::parser::TypeKind::Ref(inner) => {
-                            let inner_type = self.type_to_c(inner);
-                            self.write(&format!("{}* {}", inner_type, param.name.name));
+                            // For references to slices/arrays, inner already maps to a pointer type
+                            // (e.g. &mut [u8] -> Slice{u8} -> "uint8_t*"), so don't add another "*"
+                            match &inner.kind {
+                                crate::parser::TypeKind::Slice { element }
+                                | crate::parser::TypeKind::ArrayRef { element, .. } => {
+                                    let elem_type = self.type_to_c(element);
+                                    self.write(&format!("{}* {}", elem_type, param.name.name));
+                                }
+                                crate::parser::TypeKind::Array { .. } => {
+                                    let base = self.type_to_c_base(inner);
+                                    self.write(&format!("{}* {}", base, param.name.name));
+                                }
+                                _ => {
+                                    let inner_type = self.type_to_c(inner);
+                                    self.write(&format!("{}* {}", inner_type, param.name.name));
+                                }
+                            }
+                            // Track struct type for mutable/immutable references
+                            if let crate::parser::TypeKind::Named(ident) = &inner.kind {
+                                self.var_types
+                                    .insert(param.name.name.clone(), ident.name.clone());
+                            }
                         }
                         crate::parser::TypeKind::Named(ident) => {
                             self.write(&format!("struct {} {}", ident.name, param.name.name));
@@ -603,8 +623,28 @@ impl ObjCGenerator {
                         }
                         crate::parser::TypeKind::MutRef(inner)
                         | crate::parser::TypeKind::Ref(inner) => {
-                            let inner_type = self.type_to_c(inner);
-                            self.write(&format!("{}* {}", inner_type, param.name.name));
+                            // For references to slices/arrays, inner already maps to a pointer type
+                            // (e.g. &mut [u8] -> Slice{u8} -> "uint8_t*"), so don't add another "*"
+                            match &inner.kind {
+                                crate::parser::TypeKind::Slice { element }
+                                | crate::parser::TypeKind::ArrayRef { element, .. } => {
+                                    let elem_type = self.type_to_c(element);
+                                    self.write(&format!("{}* {}", elem_type, param.name.name));
+                                }
+                                crate::parser::TypeKind::Array { .. } => {
+                                    let base = self.type_to_c_base(inner);
+                                    self.write(&format!("{}* {}", base, param.name.name));
+                                }
+                                _ => {
+                                    let inner_type = self.type_to_c(inner);
+                                    self.write(&format!("{}* {}", inner_type, param.name.name));
+                                }
+                            }
+                            // Track struct type for mutable/immutable references
+                            if let crate::parser::TypeKind::Named(ident) = &inner.kind {
+                                self.var_types
+                                    .insert(param.name.name.clone(), ident.name.clone());
+                            }
                         }
                         crate::parser::TypeKind::Named(ident) => {
                             self.write(&format!("struct {} {}", ident.name, param.name.name));
@@ -1297,6 +1337,22 @@ impl ObjCGenerator {
                             self.generate_expr(arg);
                         }
                         self.write(")");
+                        return;
+                    }
+
+                    // Handle secure_zero calls on non-u8 arrays (e.g., uint32_t[8])
+                    // secure_zero expects uint8_t* but state.h is uint32_t[8].
+                    // Generate memset(state.h, 0, sizeof(state.h)) instead.
+                    if ident.name == "secure_zero"
+                        && args.len() == 1
+                        && let ExprKind::MutRef(inner) = &args[0].kind
+                        && self.is_non_u8_array_expr(inner)
+                    {
+                        self.write("memset(");
+                        self.generate_expr(inner);
+                        self.write(", 0, sizeof(");
+                        self.generate_expr(inner);
+                        self.write("))");
                         return;
                     }
                 }
@@ -2075,6 +2131,29 @@ impl ObjCGenerator {
         }
         // Default to big endian (network byte order), 32 bits
         (false, 32)
+    }
+
+    /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
+    /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
+    fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
+        use crate::parser::TypeKind;
+        if let ExprKind::Field { object, field } = &expr.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+            && let Some(fields) = self.struct_defs.get(struct_name)
+        {
+            for f in fields {
+                if f.name == field.name
+                    && let TypeKind::Array { element, .. } = &f.ty.kind
+                {
+                    if let TypeKind::Primitive(p) = &element.kind {
+                        return *p != crate::parser::PrimitiveType::U8;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

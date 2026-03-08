@@ -45,6 +45,8 @@ pub struct KotlinGenerator {
     current_return_type: Option<ParserType>,
     /// Function parameter types: func_name -> Vec<ParserType>
     func_param_types: HashMap<String, Vec<ParserType>>,
+    /// Current struct name for resolving SelfType (set during method/function generation)
+    current_struct_name: Option<String>,
 }
 
 impl KotlinGenerator {
@@ -60,6 +62,7 @@ impl KotlinGenerator {
             var_prim_types: HashMap::new(),
             current_return_type: None,
             func_param_types: HashMap::new(),
+            current_struct_name: None,
         }
     }
 
@@ -417,6 +420,7 @@ impl KotlinGenerator {
     }
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
+        self.current_struct_name = Some(struct_name.to_string());
         let saved_elem_types = self.var_elem_types.clone();
         let saved_prim_types = self.var_prim_types.clone();
         let saved_var_types = self.var_types.clone();
@@ -455,6 +459,7 @@ impl KotlinGenerator {
         self.var_prim_types = saved_prim_types;
         self.var_types = saved_var_types;
         self.current_return_type = saved_return_type;
+        self.current_struct_name = None;
     }
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
@@ -594,8 +599,25 @@ impl KotlinGenerator {
                 }
             }
             TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.type_to_kotlin(inner),
-            TypeKind::Named(ident) => ident.name.clone(),
-            TypeKind::SelfType => "Any".to_string(), // placeholder
+            TypeKind::Named(ident) => {
+                if ident.name == "Self" {
+                    // Named("Self") should resolve like SelfType
+                    if let Some(ref name) = self.current_struct_name {
+                        name.clone()
+                    } else {
+                        "Any".to_string()
+                    }
+                } else {
+                    ident.name.clone()
+                }
+            }
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_struct_name {
+                    name.clone()
+                } else {
+                    "Any".to_string()
+                }
+            }
         }
     }
 
@@ -648,9 +670,23 @@ impl KotlinGenerator {
             }
             TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.default_value_for_type(inner),
             TypeKind::Named(ident) => {
-                format!("{}()", ident.name)
+                if ident.name == "Self" {
+                    if let Some(ref name) = self.current_struct_name {
+                        format!("{}()", name)
+                    } else {
+                        "0u".to_string()
+                    }
+                } else {
+                    format!("{}()", ident.name)
+                }
             }
-            _ => "0u".to_string(),
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_struct_name {
+                    format!("{}()", name)
+                } else {
+                    "0u".to_string()
+                }
+            }
         }
     }
 
@@ -858,6 +894,10 @@ impl KotlinGenerator {
     }
 
     fn generate_function(&mut self, func: &Function) {
+        // Detect if this function was monomorphized from a method/generic
+        // If the function name contains "__", the prefix is the struct name
+        self.current_struct_name = Self::infer_self_type_name(&func.name.name);
+
         // Track parameter element types for correct type conversion
         let saved_elem_types = self.var_elem_types.clone();
         let saved_prim_types = self.var_prim_types.clone();
@@ -903,6 +943,7 @@ impl KotlinGenerator {
         self.var_prim_types = saved_prim_types;
         self.var_types = saved_var_types;
         self.current_return_type = saved_return_type;
+        self.current_struct_name = None;
     }
 
     fn generate_block(&mut self, block: &Block) {
@@ -2472,6 +2513,15 @@ impl KotlinGenerator {
         }
         // Default to little endian, 32 bits
         (true, 32)
+    }
+
+    /// Infer the concrete type name that should replace `Self` in a function.
+    /// For functions with names like "StructName__method", the prefix is the struct name.
+    fn infer_self_type_name(func_name: &str) -> Option<String> {
+        if let Some(idx) = func_name.find("__") {
+            return Some(func_name[..idx].to_string());
+        }
+        None
     }
 }
 

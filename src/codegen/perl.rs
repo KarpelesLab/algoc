@@ -103,6 +103,34 @@ impl PerlGenerator {
         }
     }
 
+    /// Check if an assignment target is an element of a u8 array.
+    /// Used to add `_u8()` masking for correct byte-range wrapping.
+    fn target_is_u8_element(&self, target: &Expr) -> bool {
+        if let ExprKind::Index { array, .. } = &target.kind {
+            // Check direct variable name
+            if let ExprKind::Ident(ident) = &array.kind
+                && let Some(elem_type) = self.var_elem_types.get(&ident.name)
+            {
+                return matches!(elem_type.to_native(), PrimitiveType::U8);
+            }
+            // Check struct field
+            if let ExprKind::Field { object, field } = &array.kind
+                && let ExprKind::Ident(obj_ident) = &object.kind
+                && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                && let Some(fields) = self.struct_defs.get(struct_name)
+            {
+                for f in fields {
+                    if f.name == field.name
+                        && let Some(elem_prim) = Self::element_primitive(&f.ty)
+                    {
+                        return matches!(elem_prim.to_native(), PrimitiveType::U8);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Generate the runtime helper functions
     fn generate_runtime(&mut self) {
         self.writeln("# AlgoC Runtime Helpers");
@@ -712,39 +740,72 @@ impl PerlGenerator {
                         return;
                     }
                 }
+                let needs_u8_mask = self.target_is_u8_element(target);
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
+                if needs_u8_mask {
+                    self.write("_u8(");
+                }
                 self.generate_expr(value);
+                if needs_u8_mask {
+                    self.write(")");
+                }
                 self.write(";\n");
             }
             StmtKind::CompoundAssign { target, op, value } => {
-                self.write_indent();
-                self.generate_expr(target);
-                let op_str = match op {
-                    BinaryOp::Add => " += ",
-                    BinaryOp::Sub => " -= ",
-                    BinaryOp::Mul => " *= ",
-                    BinaryOp::Div => {
-                        // Perl / is float division; use int()
-                        self.write(" = int(");
-                        self.generate_expr(target);
-                        self.write(" / ");
-                        self.generate_expr(value);
-                        self.write(");\n");
-                        return;
-                    }
-                    BinaryOp::Rem => " %= ",
-                    BinaryOp::BitAnd => " &= ",
-                    BinaryOp::BitOr => " |= ",
-                    BinaryOp::BitXor => " ^= ",
-                    BinaryOp::Shl => " <<= ",
-                    BinaryOp::Shr => " >>= ",
-                    _ => " = ",
-                };
-                self.write(op_str);
-                self.generate_expr(value);
-                self.write(";\n");
+                let needs_u8_mask = self.target_is_u8_element(target);
+                if needs_u8_mask {
+                    // Expand compound assignment with u8 masking:
+                    // target op= value  ->  target = _u8(target op value)
+                    let op_str = match op {
+                        BinaryOp::Add => " + ",
+                        BinaryOp::Sub => " - ",
+                        BinaryOp::Mul => " * ",
+                        BinaryOp::Div => " / ",
+                        BinaryOp::Rem => " % ",
+                        BinaryOp::BitAnd => " & ",
+                        BinaryOp::BitOr => " | ",
+                        BinaryOp::BitXor => " ^ ",
+                        BinaryOp::Shl => " << ",
+                        BinaryOp::Shr => " >> ",
+                        _ => " + ", // fallback
+                    };
+                    self.write_indent();
+                    self.generate_expr(target);
+                    self.write(" = _u8(");
+                    self.generate_expr(target);
+                    self.write(op_str);
+                    self.generate_expr(value);
+                    self.write(");\n");
+                } else {
+                    self.write_indent();
+                    self.generate_expr(target);
+                    let op_str = match op {
+                        BinaryOp::Add => " += ",
+                        BinaryOp::Sub => " -= ",
+                        BinaryOp::Mul => " *= ",
+                        BinaryOp::Div => {
+                            // Perl / is float division; use int()
+                            self.write(" = int(");
+                            self.generate_expr(target);
+                            self.write(" / ");
+                            self.generate_expr(value);
+                            self.write(");\n");
+                            return;
+                        }
+                        BinaryOp::Rem => " %= ",
+                        BinaryOp::BitAnd => " &= ",
+                        BinaryOp::BitOr => " |= ",
+                        BinaryOp::BitXor => " ^= ",
+                        BinaryOp::Shl => " <<= ",
+                        BinaryOp::Shr => " >>= ",
+                        _ => " = ",
+                    };
+                    self.write(op_str);
+                    self.generate_expr(value);
+                    self.write(";\n");
+                }
             }
             StmtKind::If {
                 condition,

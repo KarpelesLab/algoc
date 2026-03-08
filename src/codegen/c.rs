@@ -8,7 +8,7 @@ use super::CodeGenerator;
 use crate::analysis::AnalyzedAst;
 use crate::errors::AlgocResult;
 use crate::parser::{
-    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, Stmt, StmtKind,
+    Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, ItemKind, Stmt, StmtKind,
     Type as ParserType, UnaryOp,
 };
 use std::collections::{HashMap, HashSet};
@@ -50,7 +50,8 @@ pub struct CGenerator {
     /// Variables that are slices/arrays (need _len companion when passed to functions)
     slice_vars: HashSet<String>,
     /// Variables that are fixed-size arrays (decay to pointers, no & needed)
-    fixed_array_vars: HashSet<String>,
+    /// Maps variable name to known array size.
+    fixed_array_vars: HashMap<String, u64>,
 }
 
 impl CGenerator {
@@ -65,7 +66,7 @@ impl CGenerator {
             pointer_vars: HashSet::new(),
             func_signatures: HashMap::new(),
             slice_vars: HashSet::new(),
-            fixed_array_vars: HashSet::new(),
+            fixed_array_vars: HashMap::new(),
         }
     }
 
@@ -599,36 +600,130 @@ impl CGenerator {
     }
 
     fn generate_ast(&mut self, ast: &Ast) {
+        // Pass 1: Emit type definitions (structs, enums, layouts, consts)
         for item in &ast.items {
-            self.generate_item(item);
+            match &item.kind {
+                ItemKind::Struct(s) => self.generate_struct(s),
+                ItemKind::Layout(l) => self.generate_layout(l),
+                ItemKind::Enum(e) => self.generate_enum(e),
+                ItemKind::Const(c) => self.generate_const(c),
+                _ => {}
+            }
+        }
+
+        // Pass 2: Emit forward declarations for all functions and methods
+        // This ensures monomorphized functions (appended at end) can be called
+        // by functions defined earlier in the file.
+        self.generate_forward_declarations(ast);
+
+        // Pass 3: Emit function/method/test definitions
+        for item in &ast.items {
+            match &item.kind {
+                ItemKind::Function(func) => self.generate_function(func),
+                ItemKind::Impl(impl_def) => {
+                    for method in &impl_def.methods {
+                        self.generate_method(&impl_def.target.name, method);
+                    }
+                }
+                ItemKind::Test(test) => {
+                    if self.include_tests {
+                        self.generate_test(test);
+                    }
+                }
+                ItemKind::Use(_)
+                | ItemKind::Interface(_)
+                | ItemKind::Struct(_)
+                | ItemKind::Layout(_)
+                | ItemKind::Enum(_)
+                | ItemKind::Const(_) => {
+                    // Already handled in pass 1 or not needed
+                }
+            }
         }
     }
 
-    fn generate_item(&mut self, item: &Item) {
-        match &item.kind {
-            ItemKind::Function(func) => self.generate_function(func),
-            ItemKind::Const(c) => self.generate_const(c),
-            ItemKind::Struct(s) => self.generate_struct(s),
-            ItemKind::Layout(l) => self.generate_layout(l),
-            ItemKind::Enum(e) => self.generate_enum(e),
-            ItemKind::Test(test) => {
-                if self.include_tests {
-                    self.generate_test(test);
+    /// Generate forward declarations for all functions and methods.
+    /// This allows functions to reference each other regardless of definition order,
+    /// which is especially important for monomorphized functions that are appended
+    /// at the end of the AST but called by functions defined earlier.
+    fn generate_forward_declarations(&mut self, ast: &Ast) {
+        let mut has_decls = false;
+
+        for item in &ast.items {
+            match &item.kind {
+                ItemKind::Function(func) => {
+                    self.generate_forward_decl(func);
+                    has_decls = true;
                 }
-            }
-            ItemKind::Use(_) => {
-                // Use statements are handled during loading, items are already merged
-            }
-            ItemKind::Impl(impl_def) => {
-                // Generate methods as standalone functions with mangled names
-                for method in &impl_def.methods {
-                    self.generate_method(&impl_def.target.name, method);
+                ItemKind::Impl(impl_def) => {
+                    for method in &impl_def.methods {
+                        self.generate_method_forward_decl(&impl_def.target.name, method);
+                        has_decls = true;
+                    }
                 }
-            }
-            ItemKind::Interface(_) => {
-                // Interfaces are compile-time only, no runtime representation
+                ItemKind::Test(test) => {
+                    if self.include_tests {
+                        self.writeln(&format!("static void test_{}(void);", test.name.name));
+                        has_decls = true;
+                    }
+                }
+                _ => {}
             }
         }
+
+        if has_decls {
+            self.writeln("");
+        }
+    }
+
+    /// Generate a forward declaration for a standalone function
+    fn generate_forward_decl(&mut self, func: &Function) {
+        let ret_ty = self.return_type_to_c(func.return_type.as_ref());
+        self.write_indent();
+        self.write(&format!("static {} {}(", ret_ty, func.name.name));
+
+        let mut first = true;
+        for param in &func.params {
+            if !first {
+                self.write(", ");
+            }
+            first = false;
+            self.generate_param_decl(param);
+        }
+
+        if first {
+            self.write("void");
+        }
+
+        self.write(");\n");
+    }
+
+    /// Generate a forward declaration for a method (mangled name)
+    fn generate_method_forward_decl(&mut self, struct_name: &str, func: &Function) {
+        let mangled_name = format!("{}__{}", struct_name, func.name.name);
+        let ret_ty = self.return_type_to_c(func.return_type.as_ref());
+        self.write_indent();
+        self.write(&format!("static {} {}(", ret_ty, mangled_name));
+
+        let mut first = true;
+        for param in &func.params {
+            if !first {
+                self.write(", ");
+            }
+            first = false;
+
+            if param.name.name == "self" {
+                self.write(&format!("{}* self", struct_name));
+            } else {
+                self.generate_param_decl(param);
+            }
+        }
+
+        if first {
+            self.write("void");
+        }
+
+        self.write(");\n");
     }
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
@@ -831,16 +926,20 @@ impl CGenerator {
         }
     }
 
-    /// Check if a parameter type is a fixed-size array (or ref to one).
+    /// Get the fixed array size from a parameter type, if it's a fixed-size array (or ref to one).
     /// These decay to pointers in C and should not have `&` taken.
-    fn is_fixed_array_param(ty: &ParserType) -> bool {
+    fn get_fixed_array_param_size(ty: &ParserType) -> Option<u64> {
         use crate::parser::TypeKind;
         match &ty.kind {
-            TypeKind::Array { .. } => true,
+            TypeKind::Array { size, .. } => Some(*size),
             TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
-                matches!(inner.kind, TypeKind::Array { .. })
+                if let TypeKind::Array { size, .. } = &inner.kind {
+                    Some(*size)
+                } else {
+                    None
+                }
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -856,8 +955,8 @@ impl CGenerator {
             if Self::param_needs_len(&param.ty) {
                 self.slice_vars.insert(param.name.name.clone());
             }
-            if Self::is_fixed_array_param(&param.ty) {
-                self.fixed_array_vars.insert(param.name.name.clone());
+            if let Some(size) = Self::get_fixed_array_param_size(&param.ty) {
+                self.fixed_array_vars.insert(param.name.name.clone(), size);
             }
         }
     }
@@ -1315,7 +1414,7 @@ impl CGenerator {
 
                     // Fixed-size arrays don't need a companion _len variable
                     // since the size is known at compile time
-                    self.fixed_array_vars.insert(name.name.clone());
+                    self.fixed_array_vars.insert(name.name.clone(), *size);
                     let _ = element;
                 }
                 TypeKind::Slice { element } => {
@@ -1499,8 +1598,13 @@ impl CGenerator {
                 self.generate_arg_len_expr(inner);
             }
             ExprKind::Ident(ident) => {
-                // Variable - use companion _len variable
-                self.write(&format!("{}_len", ident.name));
+                if let Some(&size) = self.fixed_array_vars.get(&ident.name) {
+                    // Fixed-size array: use the known compile-time size
+                    self.write(&format!("{}", size));
+                } else {
+                    // Variable - use companion _len variable
+                    self.write(&format!("{}_len", ident.name));
+                }
             }
             ExprKind::Field { object, field } => {
                 // struct.field - use struct.field_len
@@ -2004,7 +2108,7 @@ impl CGenerator {
                 // But for fixed-size arrays, the name already decays to a pointer
                 match &inner.kind {
                     ExprKind::Ident(ident)
-                        if self.fixed_array_vars.contains(&ident.name)
+                        if self.fixed_array_vars.contains_key(&ident.name)
                             || self.slice_vars.contains(&ident.name) =>
                     {
                         self.generate_expr(inner);
@@ -2023,7 +2127,7 @@ impl CGenerator {
                 // But for fixed-size arrays, the name already decays to a pointer
                 match &inner.kind {
                     ExprKind::Ident(ident)
-                        if self.fixed_array_vars.contains(&ident.name)
+                        if self.fixed_array_vars.contains_key(&ident.name)
                             || self.slice_vars.contains(&ident.name) =>
                     {
                         self.generate_expr(inner);
@@ -2198,12 +2302,9 @@ impl CGenerator {
     fn generate_array_len_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Ident(ident) => {
-                if self.fixed_array_vars.contains(&ident.name) {
-                    // Fixed-size array: use sizeof to compute length
-                    self.write(&format!(
-                        "sizeof({}) / sizeof({}[0])",
-                        ident.name, ident.name
-                    ));
+                if let Some(&size) = self.fixed_array_vars.get(&ident.name) {
+                    // Fixed-size array: use the known compile-time size
+                    self.write(&format!("{}", size));
                 } else {
                     self.write(&format!("{}_len", ident.name));
                 }

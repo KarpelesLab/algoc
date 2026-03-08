@@ -53,6 +53,8 @@ pub struct JavaGenerator {
     loop_var_counter: usize,
     /// Map from original loop variable names to renamed versions
     loop_var_renames: HashMap<String, String>,
+    /// Current struct name for resolving SelfType (set during method/function generation)
+    current_struct_name: Option<String>,
 }
 
 impl JavaGenerator {
@@ -71,6 +73,7 @@ impl JavaGenerator {
             func_param_types: HashMap::new(),
             loop_var_counter: 0,
             loop_var_renames: HashMap::new(),
+            current_struct_name: None,
         }
     }
 
@@ -109,7 +112,7 @@ impl JavaGenerator {
     // -----------------------------------------------------------------------
 
     /// Map an AlgoC type to its Java representation.
-    fn java_type(ty: &ParserType) -> String {
+    fn java_type(&self, ty: &ParserType) -> String {
         use crate::parser::TypeKind;
 
         match &ty.kind {
@@ -117,7 +120,7 @@ impl JavaGenerator {
             TypeKind::Array { element, .. }
             | TypeKind::Slice { element }
             | TypeKind::ArrayRef { element, .. } => {
-                format!("{}[]", Self::java_type(element))
+                format!("{}[]", self.java_type(element))
             }
             TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
                 match &inner.kind {
@@ -128,13 +131,30 @@ impl JavaGenerator {
                     TypeKind::Array { element, .. }
                     | TypeKind::Slice { element }
                     | TypeKind::ArrayRef { element, .. } => {
-                        format!("{}[]", Self::java_type(element))
+                        format!("{}[]", self.java_type(element))
                     }
-                    _ => Self::java_type(inner),
+                    _ => self.java_type(inner),
                 }
             }
-            TypeKind::Named(ident) => ident.name.clone(),
-            TypeKind::SelfType => "Object".to_string(),
+            TypeKind::Named(ident) => {
+                if ident.name == "Self" {
+                    // Named("Self") should resolve like SelfType
+                    if let Some(ref name) = self.current_struct_name {
+                        name.clone()
+                    } else {
+                        "Object".to_string()
+                    }
+                } else {
+                    ident.name.clone()
+                }
+            }
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_struct_name {
+                    name.clone()
+                } else {
+                    "Object".to_string()
+                }
+            }
         }
     }
 
@@ -169,9 +189,26 @@ impl JavaGenerator {
                 }
             }
             TypeKind::Array { element, size } => {
-                format!("new {}[{}]", Self::java_type(element), size)
+                format!("new {}[{}]", self.java_type(element), size)
             }
-            TypeKind::Named(ident) => format!("new {}()", ident.name),
+            TypeKind::Named(ident) => {
+                if ident.name == "Self" {
+                    if let Some(ref name) = self.current_struct_name {
+                        format!("new {}()", name)
+                    } else {
+                        "null".to_string()
+                    }
+                } else {
+                    format!("new {}()", ident.name)
+                }
+            }
+            TypeKind::SelfType => {
+                if let Some(ref name) = self.current_struct_name {
+                    format!("new {}()", name)
+                } else {
+                    "null".to_string()
+                }
+            }
             _ => "null".to_string(),
         }
     }
@@ -456,10 +493,14 @@ impl JavaGenerator {
     // -----------------------------------------------------------------------
 
     fn generate_function(&mut self, func: &Function) {
+        // Detect if this function was monomorphized from a method/generic
+        // If the function name contains "__", the prefix is the struct name
+        self.current_struct_name = Self::infer_self_type_name(&func.name.name);
+
         self.write_indent();
         // Return type
         if let Some(ret_ty) = &func.return_type {
-            self.write(&format!("static {} ", Self::java_type(ret_ty)));
+            self.write(&format!("static {} ", self.java_type(ret_ty)));
         } else {
             self.write("static void ");
         }
@@ -471,16 +512,17 @@ impl JavaGenerator {
             }
             self.write(&format!(
                 "{} {}",
-                Self::java_type(&param.ty),
+                self.java_type(&param.ty),
                 param.name.name
             ));
         }
 
         self.write(") {\n");
         self.indent();
-        // Save and reset tracking for this function scope
-        let saved_byte_vars = std::mem::take(&mut self.byte_vars);
-        let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
+        // Save tracking state for this function scope.
+        // Clone (not take) byte vars so that global constants remain visible.
+        let saved_byte_vars = self.byte_vars.clone();
+        let saved_byte_array_vars = self.byte_array_vars.clone();
         let saved_var_types_func = self.var_types.clone();
         let saved_return_type = self.current_return_type.take();
         let saved_declared_vars = std::mem::take(&mut self.declared_vars);
@@ -492,16 +534,18 @@ impl JavaGenerator {
         self.var_types = saved_var_types_func;
         self.current_return_type = saved_return_type;
         self.declared_vars = saved_declared_vars;
+        self.current_struct_name = None;
         self.dedent();
         self.writeln("}");
         self.writeln("");
     }
 
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
+        self.current_struct_name = Some(struct_name.to_string());
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
         self.write_indent();
         if let Some(ret_ty) = &func.return_type {
-            self.write(&format!("static {} ", Self::java_type(ret_ty)));
+            self.write(&format!("static {} ", self.java_type(ret_ty)));
         } else {
             self.write("static void ");
         }
@@ -513,15 +557,15 @@ impl JavaGenerator {
             }
             self.write(&format!(
                 "{} {}",
-                Self::java_type(&param.ty),
+                self.java_type(&param.ty),
                 param.name.name
             ));
         }
 
         self.write(") {\n");
         self.indent();
-        let saved_byte_vars = std::mem::take(&mut self.byte_vars);
-        let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
+        let saved_byte_vars = self.byte_vars.clone();
+        let saved_byte_array_vars = self.byte_array_vars.clone();
         let saved_var_types_method = self.var_types.clone();
         let saved_return_type = self.current_return_type.take();
         let saved_declared_vars = std::mem::take(&mut self.declared_vars);
@@ -546,6 +590,7 @@ impl JavaGenerator {
         self.var_types = saved_var_types_method;
         self.current_return_type = saved_return_type;
         self.declared_vars = saved_declared_vars;
+        self.current_struct_name = None;
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -554,8 +599,8 @@ impl JavaGenerator {
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
         self.writeln(&format!("static void test_{}() {{", test.name.name));
         self.indent();
-        let saved_byte_vars = std::mem::take(&mut self.byte_vars);
-        let saved_byte_array_vars = std::mem::take(&mut self.byte_array_vars);
+        let saved_byte_vars = self.byte_vars.clone();
+        let saved_byte_array_vars = self.byte_array_vars.clone();
         let saved_return_type = self.current_return_type.take();
         let saved_declared_vars = std::mem::take(&mut self.declared_vars);
         self.generate_block(&test.body);
@@ -569,10 +614,16 @@ impl JavaGenerator {
     }
 
     fn generate_const(&mut self, c: &crate::parser::ConstDef) {
+        // Track byte/byte-array constants for cast/comparison handling
+        if Self::is_byte_primitive(&c.ty) {
+            self.byte_vars.insert(c.name.name.clone());
+        } else if Self::is_byte_array_type(&c.ty) {
+            self.byte_array_vars.insert(c.name.name.clone());
+        }
         self.write_indent();
         self.write(&format!(
             "static final {} {} = ",
-            Self::java_type(&c.ty),
+            self.java_type(&c.ty),
             c.name.name
         ));
         self.generate_expr_with_type_hint(&c.value, Some(&c.ty));
@@ -583,7 +634,7 @@ impl JavaGenerator {
         self.writeln(&format!("static class {} {{", s.name.name));
         self.indent();
         for field in &s.fields {
-            let jt = Self::java_type(&field.ty);
+            let jt = self.java_type(&field.ty);
             let def = self.default_value_for_type(&field.ty);
             self.writeln(&format!("{} {} = {};", jt, field.name.name, def));
         }
@@ -614,7 +665,7 @@ impl JavaGenerator {
         self.writeln(&format!("static class {} {{", l.name.name));
         self.indent();
         for field in &l.fields {
-            let jt = Self::java_type(&field.ty);
+            let jt = self.java_type(&field.ty);
             let def = self.default_value_for_type(&field.ty);
             self.writeln(&format!("{} {} = {};", jt, field.name.name, def));
         }
@@ -751,6 +802,22 @@ impl JavaGenerator {
                         self.byte_array_vars.insert(name.name.clone());
                     }
                 }
+                // Also infer byte array type from init expression when no
+                // explicit type is given: [0u8; n], hex literals, bytes
+                // literals, and byte array literals all produce byte[].
+                if ty.is_none()
+                    && let Some(init_expr) = init
+                {
+                    // Unwrap Ref/MutRef to get the actual expression
+                    let unwrapped = match &init_expr.kind {
+                        ExprKind::Ref(inner) | ExprKind::MutRef(inner) => inner.as_ref(),
+                        _ => init_expr,
+                    };
+                    let inferred = self.infer_java_type(unwrapped);
+                    if inferred == "byte[]" {
+                        self.byte_array_vars.insert(name.name.clone());
+                    }
+                }
                 // Infer type from static method calls like TypeName__new()
                 if let Some(init_expr) = init {
                     if let ExprKind::Call { func, .. } = &init_expr.kind
@@ -782,7 +849,7 @@ impl JavaGenerator {
                 let needs_short_cast =
                     !needs_byte_cast && ty.as_ref().is_some_and(Self::is_short_primitive);
                 if let Some(ty) = ty {
-                    self.write(&format!("{} {} = ", Self::java_type(ty), name.name));
+                    self.write(&format!("{} {} = ", self.java_type(ty), name.name));
                     if let Some(init) = init {
                         if needs_byte_cast && Self::expr_may_widen_to_int(init) {
                             self.write("(byte)(");
@@ -800,7 +867,7 @@ impl JavaGenerator {
                     }
                 } else if let Some(init) = init {
                     // No explicit type - infer from init expression
-                    let inferred_type = Self::infer_java_type(init);
+                    let inferred_type = self.infer_java_type(init);
                     self.write(&format!("{} {} = ", inferred_type, name.name));
                     self.generate_expr(init);
                 } else {
@@ -1003,7 +1070,16 @@ impl JavaGenerator {
 
                 self.write_indent();
                 self.write(&format!("for ({} {} = ", type_str, java_var_name));
-                self.generate_expr(start);
+                if !use_long && !matches!(start.kind, ExprKind::Integer(_)) {
+                    // Cast start to int in case the expression evaluates to long
+                    // at runtime (e.g., a variable initialized from a function
+                    // returning u64). Integer literals are already int-compatible.
+                    self.write("(int)(");
+                    self.generate_expr(start);
+                    self.write(")");
+                } else {
+                    self.generate_expr(start);
+                }
                 self.write(&format!("; {} {} ", java_var_name, cmp));
                 self.generate_expr(end);
                 self.write(&format!("; {}++) {{\n", java_var_name));
@@ -1125,7 +1201,7 @@ impl JavaGenerator {
                         if is_byte_el {
                             self.write("new byte[0]");
                         } else {
-                            self.write(&format!("new {}[0]", Self::java_type(element)));
+                            self.write(&format!("new {}[0]", self.java_type(element)));
                         }
                     } else if is_byte_el {
                         self.write("new byte[]{");
@@ -1138,7 +1214,7 @@ impl JavaGenerator {
                         }
                         self.write("}");
                     } else {
-                        let elem_type = Self::java_type(element);
+                        let elem_type = self.java_type(element);
                         self.write(&format!("new {}[]{{", elem_type));
                         for (i, elem) in elements.iter().enumerate() {
                             if i > 0 {
@@ -1163,7 +1239,7 @@ impl JavaGenerator {
                         self.generate_expr(count);
                         self.write(")]");
                     } else {
-                        let elem_type = Self::java_type(element);
+                        let elem_type = self.java_type(element);
                         self.write(&format!("new {}[(int)(", elem_type));
                         self.generate_expr(count);
                         self.write(")]");
@@ -1184,10 +1260,17 @@ impl JavaGenerator {
     fn generate_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Integer(n) => {
-                // Integers that fit in int use plain literals,
-                // those that need long get an L suffix.
-                if *n > i32::MAX as u128 {
+                // Integers that fit in int use plain literals.
+                // Values > i32::MAX but <= u32::MAX represent unsigned 32-bit
+                // values: emit (int)valueL which reinterprets the bits as signed
+                // int (e.g., 0xFFFFFFFF -> -1). This avoids lossy conversion
+                // errors in int context while auto-widening harmlessly in long
+                // context.
+                // Values > u32::MAX truly need long.
+                if *n > u32::MAX as u128 {
                     self.write(&format!("{}L", n));
+                } else if *n > i32::MAX as u128 {
+                    self.write(&format!("(int){}L", n));
                 } else {
                     self.write(&format!("{}", n));
                 }
@@ -1242,8 +1325,28 @@ impl JavaGenerator {
                     }
                 }
 
+                // When comparing byte values with integer values, Java's signed
+                // byte semantics cause issues: byte 0x89 is -119, not 137.
+                // Mask byte operands with & 0xFF for unsigned comparison.
+                let is_comparison = matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                );
+                let left_is_byte = is_comparison && self.expr_produces_byte(left);
+                let right_is_byte = is_comparison && self.expr_produces_byte(right);
                 self.write("(");
-                self.generate_expr(left);
+                if left_is_byte {
+                    self.write("(");
+                    self.generate_expr(left);
+                    self.write(" & 0xFF)");
+                } else {
+                    self.generate_expr(left);
+                }
                 let op_str = match op {
                     BinaryOp::Add => " + ",
                     BinaryOp::Sub => " - ",
@@ -1265,7 +1368,13 @@ impl JavaGenerator {
                     BinaryOp::Or => " || ",
                 };
                 self.write(op_str);
-                self.generate_expr(right);
+                if right_is_byte {
+                    self.write("(");
+                    self.generate_expr(right);
+                    self.write(" & 0xFF)");
+                } else {
+                    self.generate_expr(right);
+                }
                 self.write(")");
             }
             ExprKind::Unary { op, operand } => {
@@ -1282,9 +1391,19 @@ impl JavaGenerator {
             ExprKind::Index { array, index } => {
                 self.generate_expr(array);
                 self.write("[");
-                self.write("(int)(");
-                self.generate_expr(index);
-                self.write(")");
+                if self.expr_produces_byte(index) {
+                    // Byte values in Java are signed (-128..127). When used as
+                    // an array index, they must be masked with & 0xFF to get the
+                    // unsigned value (0..255), otherwise negative bytes produce
+                    // negative indices causing ArrayIndexOutOfBoundsException.
+                    self.write("(");
+                    self.generate_expr(index);
+                    self.write(" & 0xFF)");
+                } else {
+                    self.write("(int)(");
+                    self.generate_expr(index);
+                    self.write(")");
+                }
                 self.write("]");
             }
             ExprKind::Slice {
@@ -1451,7 +1570,7 @@ impl JavaGenerator {
                                 .as_ref()
                                 .and_then(|types| types.get(arg_idx + 1));
                             if let Some(ty) = type_hint {
-                                if Self::is_byte_primitive(ty) && Self::expr_may_widen_to_int(arg) {
+                                if Self::is_byte_primitive(ty) && !Self::expr_is_already_byte(arg) {
                                     self.write("(byte)(");
                                     self.generate_expr(arg);
                                     self.write(")");
@@ -1463,6 +1582,26 @@ impl JavaGenerator {
                             }
                         }
                         self.write(")");
+                        return;
+                    }
+                }
+
+                // Handle secure_zero calls on non-u8 arrays (e.g., int[])
+                // secure_zero expects byte[] but state.h is int[].
+                // Generate Arrays.fill(arr, 0) instead.
+                if let ExprKind::Ident(ident) = &func.kind
+                    && ident.name == "secure_zero"
+                    && args.len() == 1
+                {
+                    // Unwrap &mut ref
+                    let inner = match &args[0].kind {
+                        ExprKind::MutRef(inner) | ExprKind::Ref(inner) => inner.as_ref(),
+                        _ => &args[0],
+                    };
+                    if self.is_non_u8_array_expr(inner) {
+                        self.write("java.util.Arrays.fill(");
+                        self.generate_expr(inner);
+                        self.write(", 0)");
                         return;
                     }
                 }
@@ -1487,8 +1626,11 @@ impl JavaGenerator {
                     // Use type hint from parameter types if available
                     let type_hint = param_types.as_ref().and_then(|types| types.get(i));
                     if let Some(ty) = type_hint {
-                        if Self::is_byte_primitive(ty) && Self::expr_may_widen_to_int(arg) {
-                            // Argument needs (byte) cast for byte parameter
+                        if Self::is_byte_primitive(ty) && !Self::expr_is_already_byte(arg) {
+                            // Java method invocation context never allows
+                            // narrowing conversion, so we must always add
+                            // (byte) cast unless the expression already
+                            // produces a byte value.
                             self.write("(byte)(");
                             self.generate_expr(arg);
                             self.write(")");
@@ -2137,8 +2279,101 @@ impl JavaGenerator {
         }
     }
 
+    /// Check whether an expression is already known to produce a Java `byte` value.
+    /// Used to avoid redundant `(byte)` casts in method invocation context.
+    fn expr_is_already_byte(expr: &Expr) -> bool {
+        match &expr.kind {
+            // An explicit cast to u8/i8 already produces byte
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    matches!(
+                        p.to_native(),
+                        crate::parser::PrimitiveType::U8 | crate::parser::PrimitiveType::I8
+                    )
+                } else {
+                    false
+                }
+            }
+            // Parenthesized - check inner
+            ExprKind::Paren(inner) => Self::expr_is_already_byte(inner),
+            _ => false,
+        }
+    }
+
+    /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
+    /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
+    fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
+        use crate::parser::TypeKind;
+        if let ExprKind::Field { object, field } = &expr.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+            && let Some(fields) = self.struct_defs.get(struct_name)
+        {
+            for f in fields {
+                if f.name == field.name
+                    && let TypeKind::Array { element, .. } = &f.ty.kind
+                    && let TypeKind::Primitive(p) = &element.kind
+                {
+                    return p.to_native() != crate::parser::PrimitiveType::U8;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if an expression produces a Java `byte` value.
+    /// This is important for array indexing: byte is signed in Java (-128..127),
+    /// so using it directly as an index can produce negative indices.
+    fn expr_produces_byte(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // Array index on a byte array produces byte
+            ExprKind::Index { array, .. } => {
+                if let Some(ident_name) = Self::extract_object_ident_name(array)
+                    && self.byte_array_vars.contains(ident_name)
+                {
+                    return true;
+                }
+                // Check struct field byte arrays
+                if let ExprKind::Field { object, field } = &array.kind
+                    && let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name
+                            && let crate::parser::TypeKind::Array { element, .. } = &f.ty.kind
+                        {
+                            return Self::is_byte_primitive(element);
+                        }
+                    }
+                }
+                false
+            }
+            // A variable declared as byte
+            ExprKind::Ident(ident) => self.byte_vars.contains(&ident.name),
+            // An explicit cast to byte
+            ExprKind::Cast { ty, .. } => Self::is_byte_primitive(ty),
+            // A field that is byte type
+            ExprKind::Field { object, field } => {
+                if let ExprKind::Ident(obj_ident) = &object.kind
+                    && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                    && let Some(fields) = self.struct_defs.get(struct_name)
+                {
+                    for f in fields {
+                        if f.name == field.name {
+                            return Self::is_byte_primitive(&f.ty);
+                        }
+                    }
+                }
+                false
+            }
+            ExprKind::Paren(inner) => self.expr_produces_byte(inner),
+            _ => false,
+        }
+    }
+
     /// Infer the Java type string for an expression that has no explicit type annotation.
-    fn infer_java_type(expr: &Expr) -> String {
+    fn infer_java_type(&self, expr: &Expr) -> String {
         match &expr.kind {
             ExprKind::Integer(n) => {
                 if *n > i32::MAX as u128 {
@@ -2174,7 +2409,7 @@ impl JavaGenerator {
                     "int[]".to_string()
                 }
             }
-            ExprKind::Cast { ty, .. } => Self::java_type(ty),
+            ExprKind::Cast { ty, .. } => self.java_type(ty),
             ExprKind::StructLit { name, .. } => name.name.clone(),
             ExprKind::Call { func, .. } => {
                 if let ExprKind::Ident(ident) = &func.kind {
@@ -2192,7 +2427,7 @@ impl JavaGenerator {
                 }
                 "var".to_string()
             }
-            ExprKind::Paren(inner) => Self::infer_java_type(inner),
+            ExprKind::Paren(inner) => self.infer_java_type(inner),
             ExprKind::Slice { .. } => "byte[]".to_string(),
             ExprKind::EnumVariant { enum_name, .. } => enum_name.name.clone(),
             _ => "var".to_string(), // Java 10+ local variable type inference
@@ -2237,6 +2472,15 @@ impl JavaGenerator {
             return (little, bits);
         }
         (true, 32)
+    }
+
+    /// Infer the concrete type name that should replace `Self` in a function.
+    /// For functions with names like "StructName__method", the prefix is the struct name.
+    fn infer_self_type_name(func_name: &str) -> Option<String> {
+        if let Some(idx) = func_name.find("__") {
+            return Some(func_name[..idx].to_string());
+        }
+        None
     }
 }
 
@@ -2301,6 +2545,15 @@ impl CodeGenerator for JavaGenerator {
                         func.params.iter().map(|p| p.ty.clone()).collect();
                     self.func_param_types
                         .insert(func.name.name.clone(), param_types);
+                }
+                ItemKind::Const(c) => {
+                    // Track byte/byte-array constants in pre-pass so they're
+                    // available for cast/comparison handling in all functions.
+                    if Self::is_byte_primitive(&c.ty) {
+                        self.byte_vars.insert(c.name.name.clone());
+                    } else if Self::is_byte_array_type(&c.ty) {
+                        self.byte_array_vars.insert(c.name.name.clone());
+                    }
                 }
                 _ => {}
             }

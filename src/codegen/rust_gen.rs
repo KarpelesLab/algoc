@@ -607,6 +607,54 @@ impl RustGenerator {
         }
     }
 
+    /// Generate the default value for a type, using struct definitions to check
+    /// if a named type needs inline struct literal instead of create_*().
+    fn default_value_for_type_aware(&self, ty: &crate::parser::Type) -> String {
+        if let crate::parser::TypeKind::Named(ident) = &ty.kind
+            && let Some(fields) = self.struct_defs.get(&ident.name)
+            && fields.iter().any(|f| Self::type_needs_lifetime(&f.ty))
+        {
+            // Struct has reference fields - can't use create_*()
+            // Generate inline struct literal with safe defaults for each field
+            let mut init = format!("{} {{ ", ident.name);
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    init.push_str(", ");
+                }
+                init.push_str(&f.name);
+                init.push_str(": ");
+                init.push_str(&Self::default_value_for_ref_field(&f.ty));
+            }
+            init.push_str(" }");
+            return init;
+        }
+        Self::default_value_for_type(ty)
+    }
+
+    /// Generate a default value for a field that may be a reference type.
+    /// For reference types, produces a valid (but empty) reference.
+    fn default_value_for_ref_field(ty: &crate::parser::Type) -> String {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Ref(inner) => {
+                if let TypeKind::Slice { .. } = &inner.kind {
+                    "&[]".to_string()
+                } else {
+                    format!("&{}", Self::default_value_for_ref_field(inner))
+                }
+            }
+            TypeKind::MutRef(inner) => {
+                if let TypeKind::Slice { .. } = &inner.kind {
+                    "&mut []".to_string()
+                } else {
+                    format!("&mut {}", Self::default_value_for_ref_field(inner))
+                }
+            }
+            TypeKind::Slice { .. } => "&[]".to_string(),
+            _ => Self::default_value_for_type(ty),
+        }
+    }
+
     fn generate_function(&mut self, func: &Function) {
         // Clear per-function type tracking
         self.var_rust_types.clear();
@@ -803,6 +851,24 @@ impl RustGenerator {
                         .insert(name.name.clone(), "Vec<u8>".to_string());
                 }
 
+                // For struct literal initializers, detect borrow conflicts where
+                // a mutable ref variable is used both as a field value and in another
+                // field's initializer (e.g., output: output, out_size: output.len()).
+                // Hoist the conflicting expressions to temporaries.
+                let struct_lit_temps = if let Some(init) = init
+                    && let ExprKind::StructLit { fields, .. } = &init.kind
+                {
+                    self.find_struct_lit_borrow_conflicts(fields)
+                } else {
+                    Vec::new()
+                };
+                for (temp_name, _, temp_expr) in &struct_lit_temps {
+                    self.write_indent();
+                    self.write(&format!("let {} = ", temp_name));
+                    self.generate_expr(temp_expr);
+                    self.write(";\n");
+                }
+
                 self.write_indent();
                 if *mutable {
                     self.write("let mut ");
@@ -839,10 +905,16 @@ impl RustGenerator {
                     if needs_ref || needs_slice_ref {
                         self.write("&");
                     }
-                    self.generate_expr(init);
+                    // If we hoisted struct literal temporaries, generate the struct
+                    // literal using the temp names in place of conflicting expressions
+                    if !struct_lit_temps.is_empty() {
+                        self.generate_struct_lit_with_temps(init, &struct_lit_temps);
+                    } else {
+                        self.generate_expr(init);
+                    }
                     self.type_hint = old_hint;
                 } else if let Some(ty) = ty {
-                    self.write(&Self::default_value_for_type(ty));
+                    self.write(&self.default_value_for_type_aware(ty));
                 } else {
                     self.write("Default::default()");
                 }
@@ -2695,6 +2767,103 @@ impl RustGenerator {
         None
     }
 
+    /// Find borrow conflicts in struct literal initialization.
+    /// When a struct literal uses a mutable ref variable both as a field value and in
+    /// another field's initializer (e.g., `output: output, out_size: output.len()`),
+    /// the conflicting expressions need to be hoisted to temporaries.
+    /// Returns (temp_name, field_index, expr) triples for expressions that need hoisting.
+    fn find_struct_lit_borrow_conflicts(
+        &self,
+        fields: &[(crate::parser::Ident, Expr)],
+    ) -> Vec<(String, usize, Expr)> {
+        // First, find field values that are plain identifiers (potential mutable ref sources)
+        let mut field_ident_vars: Vec<&str> = Vec::new();
+        for (_, value) in fields {
+            if let ExprKind::Ident(ident) = &value.kind {
+                field_ident_vars.push(&ident.name);
+            }
+        }
+
+        if field_ident_vars.is_empty() {
+            return Vec::new();
+        }
+
+        // Now find field values that reference those same identifiers
+        // (e.g., output.len(), output.something)
+        let mut temps: Vec<(String, usize, Expr)> = Vec::new();
+        let mut temp_counter = 0;
+        for (field_idx, (_field_name, value)) in fields.iter().enumerate() {
+            // Skip plain identifiers - those are the source, not the conflict
+            if matches!(&value.kind, ExprKind::Ident(_)) {
+                continue;
+            }
+            // Check if this expression uses any of the field ident vars
+            if Self::expr_uses_any_ident(value, &field_ident_vars) {
+                let temp_name = format!("__temp_{}", temp_counter);
+                temp_counter += 1;
+                temps.push((temp_name, field_idx, value.clone()));
+            }
+        }
+        temps
+    }
+
+    /// Check if an expression references any of the given identifiers
+    fn expr_uses_any_ident(expr: &Expr, idents: &[&str]) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(ident) => idents.contains(&ident.name.as_str()),
+            ExprKind::Field { object, .. } => Self::expr_uses_any_ident(object, idents),
+            ExprKind::Call { func, args } => {
+                Self::expr_uses_any_ident(func, idents)
+                    || args.iter().any(|a| Self::expr_uses_any_ident(a, idents))
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_uses_any_ident(left, idents) || Self::expr_uses_any_ident(right, idents)
+            }
+            ExprKind::Unary { operand, .. } => Self::expr_uses_any_ident(operand, idents),
+            ExprKind::Cast { expr: inner, .. }
+            | ExprKind::Paren(inner)
+            | ExprKind::Ref(inner)
+            | ExprKind::MutRef(inner)
+            | ExprKind::Deref(inner) => Self::expr_uses_any_ident(inner, idents),
+            ExprKind::Index { array, index } => {
+                Self::expr_uses_any_ident(array, idents) || Self::expr_uses_any_ident(index, idents)
+            }
+            ExprKind::Builtin { args, .. } => {
+                args.iter().any(|a| Self::expr_uses_any_ident(a, idents))
+            }
+            _ => false,
+        }
+    }
+
+    /// Generate a struct literal expression, substituting hoisted temporaries
+    /// for expressions that would cause borrow conflicts.
+    fn generate_struct_lit_with_temps(&mut self, init: &Expr, temps: &[(String, usize, Expr)]) {
+        if let ExprKind::StructLit { name, fields } = &init.kind {
+            self.write(&format!("{} {{ ", name.name));
+            for (i, (field_name, value)) in fields.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.write(&format!("{}: ", field_name.name));
+                // Check if this field was hoisted to a temp by index
+                let mut replaced = false;
+                for (temp_name, field_idx, _) in temps {
+                    if *field_idx == i {
+                        self.write(temp_name);
+                        replaced = true;
+                        break;
+                    }
+                }
+                if !replaced {
+                    self.generate_expr(value);
+                }
+            }
+            self.write(" }");
+        } else {
+            self.generate_expr(init);
+        }
+    }
+
     /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
     /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
     fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
@@ -2753,35 +2922,114 @@ impl RustGenerator {
     }
 
     /// Check if a function needs lifetime annotations.
-    /// This is needed when a function has a struct-with-lifetime parameter
-    /// and also has reference parameters that could be stored in that struct.
+    /// This is needed when a function has a &mut struct-with-lifetime parameter
+    /// AND the function body actually stores another reference parameter into
+    /// that struct (e.g., an init function). Functions that merely read/modify
+    /// the struct don't need shared lifetime annotations.
     fn function_needs_lifetime(&self, func: &Function) -> bool {
-        let has_struct_with_lifetime = func.params.iter().any(|p| {
-            // Check if parameter is &mut SomeStruct where SomeStruct has lifetime fields
-            match &p.ty.kind {
-                crate::parser::TypeKind::MutRef(inner) => {
-                    if let crate::parser::TypeKind::Named(ident) = &inner.kind {
-                        // Check if this struct has any fields that need lifetimes
-                        if let Some(fields) = self.struct_defs.get(&ident.name) {
-                            return fields.iter().any(|f| Self::type_needs_lifetime(&f.ty));
-                        }
-                    }
-                    false
+        // Find parameters that are &mut StructWithLifetime
+        let struct_params: Vec<(&str, &str)> = func
+            .params
+            .iter()
+            .filter_map(|p| {
+                if let crate::parser::TypeKind::MutRef(inner) = &p.ty.kind
+                    && let crate::parser::TypeKind::Named(ident) = &inner.kind
+                    && let Some(fields) = self.struct_defs.get(&ident.name)
+                    && fields.iter().any(|f| Self::type_needs_lifetime(&f.ty))
+                {
+                    Some((p.name.name.as_str(), ident.name.as_str()))
+                } else {
+                    None
                 }
-                _ => false,
+            })
+            .collect();
+
+        if struct_params.is_empty() {
+            return false;
+        }
+
+        // Find reference parameters (non-struct refs that could be stored)
+        let ref_param_names: Vec<&str> = func
+            .params
+            .iter()
+            .filter(|p| {
+                matches!(
+                    &p.ty.kind,
+                    crate::parser::TypeKind::Slice { .. }
+                        | crate::parser::TypeKind::Ref(_)
+                        | crate::parser::TypeKind::ArrayRef { .. }
+                ) || matches!(&p.ty.kind, crate::parser::TypeKind::MutRef(inner) if matches!(&inner.kind, crate::parser::TypeKind::Slice { .. }))
+            })
+            .map(|p| p.name.name.as_str())
+            .collect();
+
+        if ref_param_names.is_empty() {
+            return false;
+        }
+
+        // Check if the function body assigns a reference parameter to a field
+        // of a struct parameter (indicating the reference is stored in the struct)
+        let struct_param_names: Vec<&str> = struct_params.iter().map(|(name, _)| *name).collect();
+        Self::body_stores_ref_in_struct(&func.body, &struct_param_names, &ref_param_names)
+    }
+
+    /// Check if a block contains any assignment that stores a reference parameter
+    /// into a field of a struct parameter (e.g., `reader.data = data;`)
+    fn body_stores_ref_in_struct(
+        block: &Block,
+        struct_params: &[&str],
+        ref_params: &[&str],
+    ) -> bool {
+        for stmt in &block.stmts {
+            if Self::stmt_stores_ref_in_struct(stmt, struct_params, ref_params) {
+                return true;
             }
-        });
+        }
+        false
+    }
 
-        let has_ref_param = func.params.iter().any(|p| {
-            matches!(
-                &p.ty.kind,
-                crate::parser::TypeKind::Slice { .. }
-                    | crate::parser::TypeKind::Ref(_)
-                    | crate::parser::TypeKind::ArrayRef { .. }
-            ) || matches!(&p.ty.kind, crate::parser::TypeKind::MutRef(inner) if matches!(&inner.kind, crate::parser::TypeKind::Slice { .. }))
-        });
+    /// Check if a statement stores a reference parameter into a struct field
+    fn stmt_stores_ref_in_struct(stmt: &Stmt, struct_params: &[&str], ref_params: &[&str]) -> bool {
+        match &stmt.kind {
+            StmtKind::Assign { target, value } => {
+                // Check if target is struct_param.field and value involves a ref param
+                if let ExprKind::Field { object, .. } = &target.kind
+                    && let ExprKind::Ident(obj_ident) = &object.kind
+                    && struct_params.contains(&obj_ident.name.as_str())
+                    && Self::expr_references_params(value, ref_params)
+                {
+                    return true;
+                }
+                false
+            }
+            StmtKind::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                if Self::body_stores_ref_in_struct(then_block, struct_params, ref_params) {
+                    return true;
+                }
+                if let Some(eb) = else_block
+                    && Self::body_stores_ref_in_struct(eb, struct_params, ref_params)
+                {
+                    return true;
+                }
+                false
+            }
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Loop { body } => {
+                Self::body_stores_ref_in_struct(body, struct_params, ref_params)
+            }
+            _ => false,
+        }
+    }
 
-        has_struct_with_lifetime && has_ref_param
+    /// Check if an expression references any of the given parameter names
+    fn expr_references_params(expr: &Expr, params: &[&str]) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(ident) => params.contains(&ident.name.as_str()),
+            _ => false,
+        }
     }
 
     /// Check if a type contains any references that need a lifetime annotation

@@ -40,6 +40,10 @@ pub struct PhpGenerator {
     mutref_params: HashMap<String, Vec<bool>>,
     /// Names of constants (accessed without $ prefix in PHP)
     const_names: HashSet<String>,
+    /// Element types for arrays/slices (variable name -> element primitive type)
+    var_elem_types: HashMap<String, PrimitiveType>,
+    /// Primitive types for scalar variables (variable name -> primitive type)
+    var_prim_types: HashMap<String, PrimitiveType>,
 }
 
 /// Prefix for all user-defined function names to avoid collisions with PHP built-ins
@@ -56,6 +60,8 @@ impl PhpGenerator {
             var_types: HashMap::new(),
             mutref_params: HashMap::new(),
             const_names: HashSet::new(),
+            var_elem_types: HashMap::new(),
+            var_prim_types: HashMap::new(),
         }
     }
 
@@ -68,6 +74,148 @@ impl PhpGenerator {
     /// Returns the PHP-safe function name by adding the prefix
     fn php_func_name(name: &str) -> String {
         format!("{}{}", PHP_FUNC_PREFIX, name)
+    }
+
+    /// Extract the element primitive type from an array/slice type.
+    fn element_primitive(ty: &ParserType) -> Option<PrimitiveType> {
+        match &ty.kind {
+            crate::parser::TypeKind::Array { element, .. }
+            | crate::parser::TypeKind::Slice { element }
+            | crate::parser::TypeKind::ArrayRef { element, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &element.kind {
+                    Some(*p)
+                } else {
+                    None
+                }
+            }
+            crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) => {
+                Self::element_primitive(inner)
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if an assignment target is an element of a u8 array.
+    /// Used to add `_u8()` masking for correct byte-range wrapping.
+    fn target_is_u8_element(&self, target: &Expr) -> bool {
+        if let ExprKind::Index { array, .. } = &target.kind {
+            // Check direct variable name
+            if let ExprKind::Ident(ident) = &array.kind
+                && let Some(elem_type) = self.var_elem_types.get(&ident.name)
+            {
+                return matches!(elem_type.to_native(), PrimitiveType::U8);
+            }
+            // Check struct field (e.g. writer.data[i])
+            if let ExprKind::Field { object, field } = &array.kind
+                && let ExprKind::Ident(obj_ident) = &object.kind
+                && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                && let Some(fields) = self.struct_defs.get(struct_name)
+            {
+                for f in fields {
+                    if f.name == field.name
+                        && let Some(elem_prim) = Self::element_primitive(&f.ty)
+                    {
+                        return matches!(elem_prim.to_native(), PrimitiveType::U8);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if an assignment target is a struct field of `&mut` type.
+    /// Used to emit PHP references (`&`) so mutations propagate back.
+    fn target_is_mutref_field(&self, target: &Expr) -> bool {
+        if let ExprKind::Field { object, field } = &target.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+            && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+            && let Some(fields) = self.struct_defs.get(struct_name)
+        {
+            for f in fields {
+                if f.name == field.name {
+                    return matches!(f.ty.kind, crate::parser::TypeKind::MutRef(_));
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if an expression involves signed integer types (i8, i16, i32).
+    /// When true, we must NOT apply `_u32()` masking as it destroys the sign.
+    fn expr_uses_signed(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    let native = p.to_native();
+                    matches!(
+                        native,
+                        PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32
+                    )
+                } else {
+                    false
+                }
+            }
+            ExprKind::Ident(ident) => {
+                if let Some(prim) = self.var_prim_types.get(&ident.name) {
+                    let native = prim.to_native();
+                    matches!(
+                        native,
+                        PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32
+                    )
+                } else {
+                    false
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_uses_signed(left) || self.expr_uses_signed(right)
+            }
+            ExprKind::Unary { operand, .. } => self.expr_uses_signed(operand),
+            ExprKind::Paren(inner) => self.expr_uses_signed(inner),
+            _ => false,
+        }
+    }
+
+    /// Check if an expression involves 64-bit types (u64/i64).
+    /// This extends the standalone `expr_uses_u64` by also checking variable identifiers
+    /// via `var_prim_types`, which the standalone function cannot do.
+    fn expr_is_u64(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    let native = p.to_native();
+                    matches!(
+                        native,
+                        PrimitiveType::U64
+                            | PrimitiveType::I64
+                            | PrimitiveType::U128
+                            | PrimitiveType::I128
+                    )
+                } else {
+                    false
+                }
+            }
+            ExprKind::Ident(ident) => {
+                if let Some(prim) = self.var_prim_types.get(&ident.name) {
+                    let native = prim.to_native();
+                    matches!(
+                        native,
+                        PrimitiveType::U64
+                            | PrimitiveType::I64
+                            | PrimitiveType::U128
+                            | PrimitiveType::I128
+                    )
+                } else {
+                    false
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_is_u64(left) || self.expr_is_u64(right)
+            }
+            ExprKind::Unary { operand, .. } => self.expr_is_u64(operand),
+            ExprKind::Paren(inner) => self.expr_is_u64(inner),
+            ExprKind::Integer(n) => *n > 0xFFFFFFFF,
+            _ => false,
+        }
     }
 
     fn write(&mut self, s: &str) {
@@ -103,7 +251,10 @@ impl PhpGenerator {
         self.writeln("function _u8($x) { return $x & 0xFF; }");
         self.writeln("function _u16($x) { return $x & 0xFFFF; }");
         self.writeln("function _u32($x) { return $x & 0xFFFFFFFF; }");
-        self.writeln("function _u64($x) { return $x & 0xFFFFFFFFFFFFFFFF; }");
+        // PHP integers are already 64-bit signed, so _u64 is effectively a no-op
+        // (masking with 0xFFFFFFFFFFFFFFFF would overflow to float).
+        // We just return the value, keeping it within int range.
+        self.writeln("function _u64($x) { return (int)$x; }");
         self.writeln("");
 
         // Unsigned right shift helper (PHP >> is arithmetic)
@@ -669,6 +820,10 @@ impl PhpGenerator {
     }
 
     fn generate_function(&mut self, func: &Function) {
+        // Save element types and prim types for function scope (clone to keep globals visible)
+        let saved_elem_types = self.var_elem_types.clone();
+        let saved_prim_types = self.var_prim_types.clone();
+
         // Track which parameters need pass-by-reference
         let mut params = Vec::new();
         let mut is_mutref = Vec::new();
@@ -690,7 +845,7 @@ impl PhpGenerator {
         self.write(") {\n");
         self.indent();
 
-        // Track struct types for parameters
+        // Track struct types and element types for parameters
         for param in &func.params {
             if let crate::parser::TypeKind::Named(type_ident) = &param.ty.kind {
                 self.var_types
@@ -702,6 +857,15 @@ impl PhpGenerator {
                 self.var_types
                     .insert(param.name.name.clone(), type_ident.name.clone());
             }
+            // Track element types for array/slice parameters
+            if let Some(elem_prim) = Self::element_primitive(&param.ty) {
+                self.var_elem_types
+                    .insert(param.name.name.clone(), elem_prim);
+            }
+            // Track primitive types for scalar parameters (e.g. i32 vs u32)
+            if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
+                self.var_prim_types.insert(param.name.name.clone(), *p);
+            }
         }
 
         self.generate_block(&func.body);
@@ -709,6 +873,8 @@ impl PhpGenerator {
         self.dedent();
         self.writeln("}");
         self.writeln("");
+        self.var_elem_types = saved_elem_types;
+        self.var_prim_types = saved_prim_types;
     }
 
     fn generate_block(&mut self, block: &Block) {
@@ -749,6 +915,29 @@ impl PhpGenerator {
                         self.var_types
                             .insert(name.name.clone(), type_name.name.clone());
                     }
+                }
+
+                // Track element types for arrays/slices
+                if let Some(ty) = ty
+                    && let Some(elem_prim) = Self::element_primitive(ty)
+                {
+                    self.var_elem_types.insert(name.name.clone(), elem_prim);
+                }
+
+                // Infer element type from ArrayRepeat with cast
+                if let Some(init_expr) = init
+                    && let ExprKind::ArrayRepeat { value, .. } = &init_expr.kind
+                    && let ExprKind::Cast { ty, .. } = &value.kind
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    self.var_elem_types.insert(name.name.clone(), *p);
+                }
+
+                // Track primitive types for scalar variables (e.g. i32 vs u32)
+                if let Some(ty) = ty
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    self.var_prim_types.insert(name.name.clone(), *p);
                 }
 
                 self.write_indent();
@@ -800,19 +989,113 @@ impl PhpGenerator {
                     return;
                 }
 
+                let needs_u8_mask = self.target_is_u8_element(target);
+                // Check if target is a struct field of &mut type - needs PHP reference
+                let needs_ref = self.target_is_mutref_field(target);
                 self.write_indent();
                 self.generate_assign_target(target);
                 self.write(" = ");
+                if needs_ref {
+                    self.write("&");
+                }
+                if needs_u8_mask {
+                    self.write("_u8(");
+                }
                 self.generate_expr(value);
+                if needs_u8_mask {
+                    self.write(")");
+                }
                 self.write(";\n");
             }
             StmtKind::CompoundAssign { target, op, value } => {
-                self.write_indent();
-                // PHP's >> is arithmetic, so Shr needs special handling
-                if matches!(op, BinaryOp::Shr) {
-                    // target = _ushr32(target, value)
+                // Check if target is a u8 element - needs _u8() masking
+                let needs_u8_mask = self.target_is_u8_element(target);
+                if needs_u8_mask {
+                    // Expand compound assignment with u8 masking:
+                    // target op= value  ->  target = _u8(target op value)
+                    let op_str = match op {
+                        BinaryOp::Add => " + ",
+                        BinaryOp::Sub => " - ",
+                        BinaryOp::Mul => " * ",
+                        BinaryOp::Div => " / ",
+                        BinaryOp::Rem => " % ",
+                        BinaryOp::BitAnd => " & ",
+                        BinaryOp::BitOr => " | ",
+                        BinaryOp::BitXor => " ^ ",
+                        BinaryOp::Shl => " << ",
+                        BinaryOp::Shr => " >> ",
+                        _ => " + ", // fallback
+                    };
+                    self.write_indent();
                     self.generate_assign_target(target);
-                    self.write(" = _ushr32(");
+                    self.write(" = _u8(");
+                    self.generate_expr(target);
+                    self.write(op_str);
+                    self.generate_expr(value);
+                    self.write(");\n");
+                    return;
+                }
+
+                self.write_indent();
+
+                // Check if 64-bit operations
+                let uses_u64 = self.expr_is_u64(target) || self.expr_is_u64(value);
+                let uses_signed = self.expr_uses_signed(target) || self.expr_uses_signed(value);
+
+                // Determine if this operation needs u32/u64 masking
+                // Skip masking for signed types to preserve sign semantics
+                let is_maskable_op = matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                );
+                let needs_mask = is_maskable_op && !uses_signed;
+
+                if matches!(op, BinaryOp::Shr) && !uses_signed {
+                    // PHP's >> is arithmetic, so unsigned Shr needs special handling
+                    self.generate_assign_target(target);
+                    if uses_u64 {
+                        self.write(" = _ushr(");
+                    } else {
+                        self.write(" = _ushr32(");
+                    }
+                    self.generate_expr(target);
+                    self.write(", ");
+                    self.generate_expr(value);
+                    self.write(");\n");
+                } else if needs_mask {
+                    // Convert target op= value to target = _u32(target op value)
+                    // to ensure proper masking after arithmetic
+                    self.generate_assign_target(target);
+                    if uses_u64 {
+                        self.write(" = _u64(");
+                    } else {
+                        self.write(" = _u32(");
+                    }
+                    self.generate_expr(target);
+                    let op_str = match op {
+                        BinaryOp::Add => " + ",
+                        BinaryOp::Sub => " - ",
+                        BinaryOp::Mul => " * ",
+                        BinaryOp::BitAnd => " & ",
+                        BinaryOp::BitOr => " | ",
+                        BinaryOp::BitXor => " ^ ",
+                        BinaryOp::Shl => " << ",
+                        _ => unreachable!(),
+                    };
+                    self.write(op_str);
+                    self.generate_expr(value);
+                    self.write(");\n");
+                } else if matches!(op, BinaryOp::Div) {
+                    // Integer division: target = intdiv(target, value)
+                    self.generate_assign_target(target);
+                    self.write(" = intdiv(");
                     self.generate_expr(target);
                     self.write(", ");
                     self.generate_expr(value);
@@ -820,16 +1103,7 @@ impl PhpGenerator {
                 } else {
                     self.generate_assign_target(target);
                     let op_str = match op {
-                        BinaryOp::Add => "+=",
-                        BinaryOp::Sub => "-=",
-                        BinaryOp::Mul => "*=",
-                        BinaryOp::Div => "/=",
                         BinaryOp::Rem => "%=",
-                        BinaryOp::BitAnd => "&=",
-                        BinaryOp::BitOr => "|=",
-                        BinaryOp::BitXor => "^=",
-                        BinaryOp::Shl => "<<=",
-                        BinaryOp::Shr => ">>=", // Won't reach here
                         _ => "=",
                     };
                     self.write(&format!(" {} ", op_str));
@@ -1007,50 +1281,123 @@ impl PhpGenerator {
 
                 // Handle PHP-specific right shift (arithmetic)
                 if matches!(op, BinaryOp::Shr) {
-                    self.write("_ushr32(");
+                    let uses_signed = self.expr_uses_signed(left) || self.expr_uses_signed(right);
+                    if uses_signed {
+                        // For signed types, PHP's arithmetic >> is correct
+                        self.write("(");
+                        self.generate_expr(left);
+                        self.write(" >> ");
+                        self.generate_expr(right);
+                        self.write(")");
+                    } else {
+                        // For unsigned types, need logical shift
+                        let uses_u64 = self.expr_is_u64(left) || self.expr_is_u64(right);
+                        if uses_u64 {
+                            self.write("_ushr(");
+                        } else {
+                            self.write("_ushr32(");
+                        }
+                        self.generate_expr(left);
+                        self.write(", ");
+                        self.generate_expr(right);
+                        self.write(")");
+                    }
+                    return;
+                }
+
+                // PHP integers are 64-bit, so arithmetic/bitwise ops on u32 values
+                // can overflow. Wrap in _u32() or _u64() masking.
+                // But NOT for signed types (i8/i16/i32) where masking destroys the sign.
+                let is_maskable_op = matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                );
+                let uses_signed = self.expr_uses_signed(left) || self.expr_uses_signed(right);
+                let needs_mask = is_maskable_op && !uses_signed;
+
+                let uses_u64 = self.expr_is_u64(left) || self.expr_is_u64(right);
+
+                if needs_mask {
+                    if uses_u64 {
+                        self.write("_u64(");
+                    } else {
+                        self.write("_u32(");
+                    }
+                }
+                // Use intdiv() for integer division to avoid PHP float results
+                if matches!(op, BinaryOp::Div) {
+                    self.write("intdiv(");
                     self.generate_expr(left);
                     self.write(", ");
                     self.generate_expr(right);
                     self.write(")");
-                    return;
+                } else {
+                    self.write("(");
+                    self.generate_expr(left);
+                    let op_str = match op {
+                        BinaryOp::Add => " + ",
+                        BinaryOp::Sub => " - ",
+                        BinaryOp::Mul => " * ",
+                        BinaryOp::Div => unreachable!(), // Handled above
+                        BinaryOp::Rem => " % ",
+                        BinaryOp::BitAnd => " & ",
+                        BinaryOp::BitOr => " | ",
+                        BinaryOp::BitXor => " ^ ",
+                        BinaryOp::Shl => " << ",
+                        BinaryOp::Shr => " >> ", // Won't reach here due to early return
+                        BinaryOp::Eq => " === ",
+                        BinaryOp::Ne => " !== ",
+                        BinaryOp::Lt => " < ",
+                        BinaryOp::Le => " <= ",
+                        BinaryOp::Gt => " > ",
+                        BinaryOp::Ge => " >= ",
+                        BinaryOp::And => " && ",
+                        BinaryOp::Or => " || ",
+                    };
+                    self.write(op_str);
+                    self.generate_expr(right);
+                    self.write(")");
                 }
-
-                self.write("(");
-                self.generate_expr(left);
-                let op_str = match op {
-                    BinaryOp::Add => " + ",
-                    BinaryOp::Sub => " - ",
-                    BinaryOp::Mul => " * ",
-                    BinaryOp::Div => " / ",
-                    BinaryOp::Rem => " % ",
-                    BinaryOp::BitAnd => " & ",
-                    BinaryOp::BitOr => " | ",
-                    BinaryOp::BitXor => " ^ ",
-                    BinaryOp::Shl => " << ",
-                    BinaryOp::Shr => " >> ", // Won't reach here due to early return
-                    BinaryOp::Eq => " === ",
-                    BinaryOp::Ne => " !== ",
-                    BinaryOp::Lt => " < ",
-                    BinaryOp::Le => " <= ",
-                    BinaryOp::Gt => " > ",
-                    BinaryOp::Ge => " >= ",
-                    BinaryOp::And => " && ",
-                    BinaryOp::Or => " || ",
-                };
-                self.write(op_str);
-                self.generate_expr(right);
-                self.write(")");
+                if needs_mask {
+                    self.write(")");
+                }
             }
             ExprKind::Unary { op, operand } => {
-                let op_str = match op {
-                    UnaryOp::Neg => "-",
-                    UnaryOp::Not => "!",
-                    UnaryOp::BitNot => "~",
-                };
-                self.write(op_str);
-                self.write("(");
-                self.generate_expr(operand);
-                self.write(")");
+                match op {
+                    UnaryOp::Neg => {
+                        self.write("-(");
+                        self.generate_expr(operand);
+                        self.write(")");
+                    }
+                    UnaryOp::Not => {
+                        self.write("!(");
+                        self.generate_expr(operand);
+                        self.write(")");
+                    }
+                    UnaryOp::BitNot => {
+                        // PHP's ~ on 64-bit integers needs masking to 32-bit
+                        // But not for signed types where we want to preserve sign
+                        if self.expr_uses_signed(operand) {
+                            self.write("~(");
+                            self.generate_expr(operand);
+                            self.write(")");
+                        } else if self.expr_is_u64(operand) {
+                            self.write("_u64(~(");
+                            self.generate_expr(operand);
+                            self.write("))");
+                        } else {
+                            self.write("_u32(~(");
+                            self.generate_expr(operand);
+                            self.write("))");
+                        }
+                    }
+                }
             }
             ExprKind::Index { array, index } => {
                 self.generate_expr(array);
@@ -1304,13 +1651,26 @@ impl PhpGenerator {
                 self.generate_expr(inner);
                 self.write(")");
             }
-            ExprKind::StructLit { name: _, fields } => {
+            ExprKind::StructLit { name, fields } => {
                 self.write("[");
+                // Look up struct definition to check for &mut fields
+                let struct_fields = self.struct_defs.get(&name.name).cloned();
                 for (i, (field_name, value)) in fields.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
                     self.write(&format!("'{}' => ", field_name.name));
+                    // Check if this field is a &mut type - use PHP reference
+                    let is_mutref = struct_fields.as_ref().is_some_and(|fields| {
+                        fields.iter().any(|f| {
+                            f.name == field_name.name
+                                && matches!(f.ty.kind, crate::parser::TypeKind::MutRef(_))
+                        })
+                    });
+                    if is_mutref {
+                        // Use PHP reference so mutations propagate back
+                        self.write("&");
+                    }
                     self.generate_expr(value);
                 }
                 self.write("]");
@@ -1748,6 +2108,8 @@ impl CodeGenerator for PhpGenerator {
         self.var_types.clear();
         self.mutref_params.clear();
         self.const_names.clear();
+        self.var_elem_types.clear();
+        self.var_prim_types.clear();
 
         // Pre-pass: collect struct field info and methods for read/write generation
         for item in &ast.ast.items {
