@@ -42,6 +42,8 @@ pub struct RustGenerator {
     param_rust_types: HashMap<String, String>,
     /// Function return types (function_name -> rust_type)
     func_return_types: HashMap<String, String>,
+    /// Function parameter types (function_name -> vec of rust_types)
+    func_param_types: HashMap<String, Vec<String>>,
     /// Context type hint for expression generation (e.g., from let binding)
     /// Used as fallback for wrapping suffix inference
     type_hint: Option<String>,
@@ -59,6 +61,7 @@ impl RustGenerator {
             var_rust_types: HashMap::new(),
             param_rust_types: HashMap::new(),
             func_return_types: HashMap::new(),
+            func_param_types: HashMap::new(),
             type_hint: None,
         }
     }
@@ -373,6 +376,17 @@ impl RustGenerator {
     fn generate_method(&mut self, struct_name: &str, func: &crate::parser::Function) {
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
 
+        // Collect parameter types for this method
+        {
+            let param_types: Vec<String> = func
+                .params
+                .iter()
+                .map(|p| Self::rust_param_type(&p.ty, Some(struct_name)))
+                .collect();
+            self.func_param_types
+                .insert(mangled_name.clone(), param_types);
+        }
+
         self.write_indent();
         self.write(&format!("fn {}(", mangled_name));
 
@@ -603,11 +617,20 @@ impl RustGenerator {
         // Also check if any parameter or return type uses SelfType
         let self_replacement = Self::infer_self_type_name(&func.name.name, func);
 
-        // Pre-pass: collect return type for this function
+        // Pre-pass: collect return type and parameter types for this function
         if let Some(ret_ty) = &func.return_type {
             let rust_ty = Self::rust_type_replacing_self(ret_ty, self_replacement.as_deref());
             self.func_return_types
                 .insert(func.name.name.clone(), rust_ty);
+        }
+        {
+            let param_types: Vec<String> = func
+                .params
+                .iter()
+                .map(|p| Self::rust_param_type(&p.ty, self_replacement.as_deref()))
+                .collect();
+            self.func_param_types
+                .insert(func.name.name.clone(), param_types);
         }
 
         // Check if function needs lifetime annotations:
@@ -677,8 +700,9 @@ impl RustGenerator {
                 };
                 self.var_types.insert(param_name, type_ident.name.clone());
             }
-            // Also handle &mut StructName
-            if let crate::parser::TypeKind::MutRef(inner) = &param.ty.kind
+            // Also handle &StructName and &mut StructName
+            if let crate::parser::TypeKind::MutRef(inner) | crate::parser::TypeKind::Ref(inner) =
+                &param.ty.kind
                 && let crate::parser::TypeKind::Named(type_ident) = &inner.kind
             {
                 let param_name = if param.name.name == "self" {
@@ -723,6 +747,12 @@ impl RustGenerator {
                 if let Some(ty) = ty {
                     let rust_ty = Self::rust_type(ty);
                     self.var_rust_types.insert(name.name.clone(), rust_ty);
+                } else if let Some(init_expr) = init {
+                    // No type annotation - try to infer from init expression
+                    let inferred = self.infer_expr_rust_type(init_expr);
+                    if !inferred.is_empty() {
+                        self.var_rust_types.insert(name.name.clone(), inferred);
+                    }
                 }
 
                 // Also infer type from static method calls like TypeName__new()
@@ -745,6 +775,16 @@ impl RustGenerator {
                         self.var_types
                             .insert(name.name.clone(), type_name.name.clone());
                     }
+                }
+
+                // Track variables initialized from hex/bytes/array literals as array type
+                // so we can auto-borrow them at call sites
+                if ty.is_none()
+                    && let Some(init_expr) = init
+                    && Self::expr_is_array_literal(init_expr)
+                {
+                    self.var_rust_types
+                        .insert(name.name.clone(), "[u8]".to_string());
                 }
 
                 // Determine if the declared type should be adjusted for the init expression
@@ -809,6 +849,40 @@ impl RustGenerator {
                 self.write(";\n");
             }
             StmtKind::Expr(expr) => {
+                // Check if this is a function call with borrow conflicts:
+                // e.g., fn(state, &state.block) where state is &mut Struct
+                // Rust's borrow checker requires copying the field first.
+                if let ExprKind::Call { func, args } = &expr.kind {
+                    let copies = self.find_borrow_conflicts(args);
+                    for (var_name, field_name) in &copies {
+                        self.write_indent();
+                        self.write(&format!(
+                            "let {field_name}_copy = {var_name}.{field_name};\n"
+                        ));
+                    }
+                    if !copies.is_empty() {
+                        // Generate the call with copied field references
+                        self.write_indent();
+                        self.generate_expr(func);
+                        self.write("(");
+                        for (i, arg) in args.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            // Replace &var.field with &field_copy
+                            if let Some(replacement) = self.find_replacement_for_arg(arg, &copies) {
+                                self.write(&replacement);
+                            } else {
+                                if self.arg_needs_borrow(arg) {
+                                    self.write("&");
+                                }
+                                self.generate_expr(arg);
+                            }
+                        }
+                        self.write(");\n");
+                        return;
+                    }
+                }
                 self.write_indent();
                 self.generate_expr(expr);
                 self.write(";\n");
@@ -829,31 +903,50 @@ impl RustGenerator {
                     }
                 }
 
+                // Check if we need a type cast for integer type mismatch
+                let target_rust_type = if let ExprKind::Ident(ident) = &target.kind {
+                    self.var_rust_types.get(&ident.name).cloned()
+                } else {
+                    None
+                };
+
                 self.write_indent();
                 self.generate_expr(target);
                 self.write(" = ");
-                self.generate_expr(value);
+
+                // If target has a known integer type, wrap the value in a cast
+                // to handle u64 -> u32 and similar mismatches
+                if let Some(ref target_ty) = target_rust_type
+                    && Self::is_rust_int_type(target_ty)
+                {
+                    let value_type = self.infer_expr_rust_type(value);
+                    if !value_type.is_empty() && value_type != *target_ty {
+                        self.write("(");
+                        self.generate_expr(value);
+                        self.write(&format!(") as {}", target_ty));
+                    } else {
+                        self.generate_expr(value);
+                    }
+                } else {
+                    self.generate_expr(value);
+                }
                 self.write(";\n");
             }
             StmtKind::CompoundAssign { target, op, value } => {
                 // For wrapping arithmetic, we need to expand compound assignments
                 match op {
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
-                        // Infer the target type for proper literal suffixes
-                        let suffix = self.infer_wrapping_suffix(target, value);
+                        let method = match op {
+                            BinaryOp::Add => "wrapping_add",
+                            BinaryOp::Sub => "wrapping_sub",
+                            BinaryOp::Mul => "wrapping_mul",
+                            _ => unreachable!(),
+                        };
                         self.write_indent();
                         self.generate_expr(target);
                         self.write(" = ");
-                        self.generate_typed_expr(target, &suffix);
-                        let method = match op {
-                            BinaryOp::Add => ".wrapping_add(",
-                            BinaryOp::Sub => ".wrapping_sub(",
-                            BinaryOp::Mul => ".wrapping_mul(",
-                            _ => unreachable!(),
-                        };
-                        self.write(method);
-                        self.generate_typed_expr(value, &suffix);
-                        self.write(");\n");
+                        self.generate_wrapping_binop(target, value, method);
+                        self.write(";\n");
                     }
                     BinaryOp::Shl => {
                         self.write_indent();
@@ -874,6 +967,15 @@ impl RustGenerator {
                         self.write(" as u32);\n");
                     }
                     _ => {
+                        // For non-wrapping compound ops, check for type mismatch
+                        let target_ty = self.infer_expr_rust_type(target);
+                        let value_ty = self.infer_expr_rust_type(value);
+                        let value_is_lit = matches!(value.kind, ExprKind::Integer(_));
+                        let target_is_int =
+                            !target_ty.is_empty() && Self::is_rust_int_type(&target_ty);
+                        let value_is_int =
+                            !value_ty.is_empty() && Self::is_rust_int_type(&value_ty);
+
                         self.write_indent();
                         self.generate_expr(target);
                         let op_str = match op {
@@ -885,7 +987,15 @@ impl RustGenerator {
                             _ => " = ",
                         };
                         self.write(op_str);
-                        self.generate_expr(value);
+                        if target_is_int && value_is_int && target_ty != value_ty {
+                            self.write("(");
+                            self.generate_expr(value);
+                            self.write(&format!(" as {})", target_ty));
+                        } else if target_is_int && value_is_lit {
+                            self.generate_typed_expr(value, &target_ty);
+                        } else {
+                            self.generate_expr(value);
+                        }
                         self.write(";\n");
                     }
                 }
@@ -917,20 +1027,52 @@ impl RustGenerator {
                 inclusive,
                 body,
             } => {
-                // Track the loop variable as u64 (consistent with AlgoC semantics)
+                // Infer the loop variable type from the bounds.
+                // Try to determine the type from the end expression first,
+                // then fall back to the start expression, then default to u64.
+                let end_type = self.infer_expr_rust_type(end);
+                let start_type = self.infer_expr_rust_type(start);
+                let loop_type = if !end_type.is_empty() && Self::is_rust_int_type(&end_type) {
+                    end_type.clone()
+                } else if !start_type.is_empty() && Self::is_rust_int_type(&start_type) {
+                    start_type.clone()
+                } else {
+                    "u64".to_string()
+                };
+
+                // Track the loop variable type
                 self.var_rust_types
-                    .insert(var.name.clone(), "u64".to_string());
+                    .insert(var.name.clone(), loop_type.clone());
 
                 self.write_indent();
                 self.write(&format!("for {} in ", var.name));
-                // Add type suffix to integer literal bounds to avoid ambiguous type
-                self.generate_typed_expr(start, "u64");
+                // Generate start bound with proper type
+                if matches!(&start.kind, ExprKind::Integer(_)) {
+                    self.generate_typed_expr(start, &loop_type);
+                } else if !start_type.is_empty() && start_type == loop_type {
+                    self.generate_expr(start);
+                } else if !start_type.is_empty() && Self::is_rust_int_type(&start_type) {
+                    self.write("(");
+                    self.generate_expr(start);
+                    self.write(&format!(" as {})", loop_type));
+                } else {
+                    self.generate_typed_expr(start, &loop_type);
+                }
                 if *inclusive {
                     self.write("..=");
                 } else {
                     self.write("..");
                 }
-                self.generate_typed_expr(end, "u64");
+                // Generate end bound with proper type
+                if matches!(&end.kind, ExprKind::Integer(_)) {
+                    self.generate_typed_expr(end, &loop_type);
+                } else if !end_type.is_empty() && end_type == loop_type {
+                    self.generate_expr(end);
+                } else {
+                    self.write("(");
+                    self.generate_expr(end);
+                    self.write(&format!(" as {})", loop_type));
+                }
                 self.write(" {\n");
                 self.indent();
                 self.generate_block(body);
@@ -1038,44 +1180,28 @@ impl RustGenerator {
                 match op {
                     // Wrapping arithmetic
                     BinaryOp::Add => {
-                        let suffix = self.infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, &suffix);
-                        self.write(".wrapping_add(");
-                        self.generate_typed_expr(right, &suffix);
-                        self.write(")");
+                        self.generate_wrapping_binop(left, right, "wrapping_add");
                     }
                     BinaryOp::Sub => {
-                        let suffix = self.infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, &suffix);
-                        self.write(".wrapping_sub(");
-                        self.generate_typed_expr(right, &suffix);
-                        self.write(")");
+                        self.generate_wrapping_binop(left, right, "wrapping_sub");
                     }
                     BinaryOp::Mul => {
-                        let suffix = self.infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, &suffix);
-                        self.write(".wrapping_mul(");
-                        self.generate_typed_expr(right, &suffix);
-                        self.write(")");
+                        self.generate_wrapping_binop(left, right, "wrapping_mul");
                     }
                     BinaryOp::Shl => {
-                        let suffix = self.infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, &suffix);
+                        self.generate_wrapping_binop_receiver(left, right);
                         self.write(".wrapping_shl(");
                         self.generate_expr(right);
                         self.write(" as u32)");
                     }
                     BinaryOp::Shr => {
-                        let suffix = self.infer_wrapping_suffix(left, right);
-                        self.generate_typed_expr(left, &suffix);
+                        self.generate_wrapping_binop_receiver(left, right);
                         self.write(".wrapping_shr(");
                         self.generate_expr(right);
                         self.write(" as u32)");
                     }
                     // All other binary ops use standard operators
                     _ => {
-                        self.write("(");
-                        self.generate_expr(left);
                         let op_str = match op {
                             BinaryOp::Div => " / ",
                             BinaryOp::Rem => " % ",
@@ -1092,9 +1218,75 @@ impl RustGenerator {
                             BinaryOp::Or => " || ",
                             _ => unreachable!(),
                         };
-                        self.write(op_str);
-                        self.generate_expr(right);
-                        self.write(")");
+
+                        // For logical ops, no type harmonization needed
+                        let is_logical = matches!(op, BinaryOp::And | BinaryOp::Or);
+
+                        if is_logical {
+                            self.write("(");
+                            self.generate_expr(left);
+                            self.write(op_str);
+                            self.generate_expr(right);
+                            self.write(")");
+                        } else {
+                            // For arithmetic/comparison/bitwise ops, harmonize integer types
+                            let left_ty = self.infer_expr_rust_type(left);
+                            let right_ty = self.infer_expr_rust_type(right);
+
+                            let left_is_int =
+                                !left_ty.is_empty() && Self::is_rust_int_type(&left_ty);
+                            let right_is_int =
+                                !right_ty.is_empty() && Self::is_rust_int_type(&right_ty);
+                            let left_is_lit = matches!(left.kind, ExprKind::Integer(_));
+                            let right_is_lit = matches!(right.kind, ExprKind::Integer(_));
+
+                            if left_is_int && right_is_int && left_ty != right_ty {
+                                // Types differ: cast to the wider type
+                                let target = Self::wider_int_type(&left_ty, &right_ty);
+                                self.write("(");
+                                if left_is_lit {
+                                    self.generate_typed_expr(left, target);
+                                } else if left_ty != target {
+                                    self.write("(");
+                                    self.generate_expr(left);
+                                    self.write(&format!(" as {})", target));
+                                } else {
+                                    self.generate_expr(left);
+                                }
+                                self.write(op_str);
+                                if right_is_lit {
+                                    self.generate_typed_expr(right, target);
+                                } else if right_ty != target {
+                                    self.write("(");
+                                    self.generate_expr(right);
+                                    self.write(&format!(" as {})", target));
+                                } else {
+                                    self.generate_expr(right);
+                                }
+                                self.write(")");
+                            } else if left_is_int && right_is_lit && !right_is_int {
+                                // Right is a literal without known type, give it left's type
+                                self.write("(");
+                                self.generate_expr(left);
+                                self.write(op_str);
+                                self.generate_typed_expr(right, &left_ty);
+                                self.write(")");
+                            } else if right_is_int && left_is_lit && !left_is_int {
+                                // Left is a literal without known type, give it right's type
+                                self.write("(");
+                                self.generate_typed_expr(left, &right_ty);
+                                self.write(op_str);
+                                self.generate_expr(right);
+                                self.write(")");
+                            } else {
+                                // Default: no type info or already matching
+                                self.write("(");
+                                self.generate_expr(left);
+                                self.write(op_str);
+                                self.generate_expr(right);
+                                self.write(")");
+                            }
+                        }
                     }
                 }
             }
@@ -1152,6 +1344,24 @@ impl RustGenerator {
                     }
                     self.write(")");
                     return;
+                }
+
+                // Handle secure_zero calls on non-u8 arrays
+                // secure_zero(&mut x) where x is [u32; N] can't be called directly in Rust
+                // because secure_zero takes &mut [u8]. Generate .fill(0) instead.
+                if let ExprKind::Ident(ident) = &func.kind
+                    && ident.name == "secure_zero"
+                    && args.len() == 1
+                    && let ExprKind::MutRef(inner) = &args[0].kind
+                {
+                    // Check if the inner expression refers to a non-u8 array field
+                    let is_non_u8_array = self.is_non_u8_array_expr(inner);
+                    if is_non_u8_array {
+                        // Generate: x.fill(0) instead of secure_zero(&mut x)
+                        self.generate_expr(inner);
+                        self.write(".fill(0)");
+                        return;
+                    }
                 }
 
                 // Check for method calls like slice.len() or reader.read_u32()
@@ -1275,9 +1485,22 @@ impl RustGenerator {
                             && let Some(mangled_name) = methods.get(&field.name)
                         {
                             self.write(&format!("{}(", mangled_name));
+                            // Instance methods take &mut self, so add &mut if receiver
+                            // is a local variable (not already a reference parameter)
+                            let is_param_ref = self
+                                .param_rust_types
+                                .get(obj_name)
+                                .is_some_and(|t| t.starts_with("&mut "));
+                            if !is_param_ref {
+                                self.write("&mut ");
+                            }
                             self.generate_expr(object);
                             for arg in args {
                                 self.write(", ");
+                                // Auto-borrow slice/array/Vec arguments
+                                if self.arg_needs_borrow(arg) {
+                                    self.write("&");
+                                }
                                 self.generate_expr(arg);
                             }
                             self.write(")");
@@ -1347,6 +1570,17 @@ impl RustGenerator {
                 }
 
                 // Regular function call
+                // Look up parameter types for integer cast harmonization
+                let func_name = if let ExprKind::Ident(ident) = &func.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
+                let param_types = func_name
+                    .as_ref()
+                    .and_then(|name| self.func_param_types.get(name))
+                    .cloned();
+
                 self.generate_expr(func);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
@@ -1356,6 +1590,22 @@ impl RustGenerator {
                     // Auto-borrow Vec arguments that will be passed to slice parameters
                     if self.arg_needs_borrow(arg) {
                         self.write("&");
+                    }
+                    // Check if argument type differs from parameter type
+                    if let Some(ref ptypes) = param_types
+                        && let Some(expected_ty) = ptypes.get(i)
+                    {
+                        let arg_ty = self.infer_expr_rust_type(arg);
+                        if Self::is_rust_int_type(expected_ty)
+                            && !arg_ty.is_empty()
+                            && Self::is_rust_int_type(&arg_ty)
+                            && arg_ty != *expected_ty
+                        {
+                            self.write("(");
+                            self.generate_expr(arg);
+                            self.write(&format!(" as {})", expected_ty));
+                            continue;
+                        }
                     }
                     self.generate_expr(arg);
                 }
@@ -1488,11 +1738,21 @@ impl RustGenerator {
                 args,
                 ..
             } => {
-                // Generate: mangled_name(receiver, args...)
+                // Generate: mangled_name(&mut receiver, args...)
+                // Instance methods in algoc take &mut self, so the receiver needs &mut
+                // unless it's already a reference or mutable reference.
                 self.write(&format!("{}(", mangled_name));
+                let needs_mut_ref = matches!(&receiver.kind, ExprKind::Ident(_));
+                if needs_mut_ref {
+                    self.write("&mut ");
+                }
                 self.generate_expr(receiver);
                 for arg in args {
                     self.write(", ");
+                    // Auto-borrow arguments: arrays/slices need & when passed to &[u8] params
+                    if self.arg_needs_borrow(arg) {
+                        self.write("&");
+                    }
                     self.generate_expr(arg);
                 }
                 self.write(")");
@@ -2025,12 +2285,47 @@ impl RustGenerator {
                 }
                 String::new()
             }
-            ExprKind::Binary { left, right, .. } => {
+            ExprKind::Binary { left, right, op } => {
                 let lt = self.infer_expr_rust_type(left);
+                let rt = self.infer_expr_rust_type(right);
+
+                // For shift ops, the result type is the receiver (left) type,
+                // NOT the shift amount type
+                if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                    return lt;
+                }
+
+                // For comparison/logical ops, result is bool
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::And
+                        | BinaryOp::Or
+                ) {
+                    return "bool".to_string();
+                }
+
+                // For arithmetic/bitwise ops, use the wider type
+                let lt_is_int = !lt.is_empty() && Self::is_rust_int_type(&lt);
+                let rt_is_int = !rt.is_empty() && Self::is_rust_int_type(&rt);
+                if lt_is_int && rt_is_int {
+                    return Self::wider_int_type(&lt, &rt).to_string();
+                }
+                if lt_is_int {
+                    return lt;
+                }
+                if rt_is_int {
+                    return rt;
+                }
                 if !lt.is_empty() {
                     return lt;
                 }
-                self.infer_expr_rust_type(right)
+                rt
             }
             ExprKind::Paren(inner) => self.infer_expr_rust_type(inner),
             ExprKind::Unary { operand, .. } => self.infer_expr_rust_type(operand),
@@ -2041,6 +2336,12 @@ impl RustGenerator {
                     && args.is_empty()
                 {
                     return "u64".to_string();
+                }
+                // Look up return type by function name
+                if let ExprKind::Ident(ident) = &func.kind
+                    && let Some(ret_ty) = self.func_return_types.get(&ident.name)
+                {
+                    return ret_ty.clone();
                 }
                 String::new()
             }
@@ -2060,16 +2361,10 @@ impl RustGenerator {
             return String::new();
         }
 
-        // Use context type hint first if available (e.g., from let binding).
-        // This takes priority because the declared type of the variable is the
-        // most authoritative source of what type the expression should produce.
-        if let Some(ref hint) = self.type_hint
-            && Self::is_rust_int_type(hint)
-        {
-            return hint.clone();
-        }
-
-        // Try to infer from the non-literal side using static analysis
+        // Try to infer from the non-literal side using static analysis FIRST.
+        // The actual type of the operand is more authoritative than the type hint
+        // from an outer let binding, because the wrapping operation must match
+        // the operand's type (e.g., u32.wrapping_sub(1u32), not 1u8).
         if left_is_lit && !right_is_lit {
             let s = Self::infer_int_type_suffix(right);
             if !s.is_empty() {
@@ -2092,6 +2387,15 @@ impl RustGenerator {
             }
         }
 
+        // Fall back to context type hint if available (e.g., from let binding).
+        // This is a last resort because the declared type of the outer variable
+        // may differ from the operand types (e.g., let x: u8 = arr[i - 1]).
+        if let Some(ref hint) = self.type_hint
+            && Self::is_rust_int_type(hint)
+        {
+            return hint.clone();
+        }
+
         // Both are literals or we couldn't infer - default to u64
         // (most common integer type in crypto code)
         "u64".to_string()
@@ -2105,6 +2409,26 @@ impl RustGenerator {
         )
     }
 
+    /// Get the bit width of an integer type (for widening casts)
+    fn int_type_width(ty: &str) -> u32 {
+        match ty {
+            "u8" | "i8" => 8,
+            "u16" | "i16" => 16,
+            "u32" | "i32" => 32,
+            "u64" | "i64" => 64,
+            "u128" | "i128" => 128,
+            _ => 0,
+        }
+    }
+
+    /// Determine the wider of two integer types. Returns the wider type string.
+    /// Prefers unsigned types when widths are equal.
+    fn wider_int_type<'a>(a: &'a str, b: &'a str) -> &'a str {
+        let wa = Self::int_type_width(a);
+        let wb = Self::int_type_width(b);
+        if wa >= wb { a } else { b }
+    }
+
     /// Generate an integer literal with an explicit type suffix if needed.
     /// `suffix` is the type suffix to add (e.g., "u32", "u64").
     fn generate_typed_expr(&mut self, expr: &Expr, suffix: &str) {
@@ -2116,6 +2440,80 @@ impl RustGenerator {
             }
         } else {
             self.generate_expr(expr);
+        }
+    }
+
+    /// Generate a wrapping binary operation (wrapping_add, wrapping_sub, wrapping_mul)
+    /// with proper type harmonization. When both operands are non-literal but have
+    /// different integer types, casts the narrower to the wider.
+    fn generate_wrapping_binop(&mut self, left: &Expr, right: &Expr, method: &str) {
+        let suffix = self.infer_wrapping_suffix(left, right);
+
+        let left_is_lit = matches!(left.kind, ExprKind::Integer(_));
+        let right_is_lit = matches!(right.kind, ExprKind::Integer(_));
+
+        if !suffix.is_empty() || left_is_lit || right_is_lit {
+            // At least one literal - use typed expr with suffix
+            self.generate_typed_expr(left, &suffix);
+            self.write(&format!(".{}(", method));
+            self.generate_typed_expr(right, &suffix);
+            self.write(")");
+        } else {
+            // Both non-literal - check for type mismatch
+            let left_ty = self.infer_expr_rust_type(left);
+            let right_ty = self.infer_expr_rust_type(right);
+            let left_is_int = !left_ty.is_empty() && Self::is_rust_int_type(&left_ty);
+            let right_is_int = !right_ty.is_empty() && Self::is_rust_int_type(&right_ty);
+
+            if left_is_int && right_is_int && left_ty != right_ty {
+                let target = Self::wider_int_type(&left_ty, &right_ty);
+                if left_ty != target {
+                    self.write("(");
+                    self.generate_expr(left);
+                    self.write(&format!(" as {})", target));
+                } else {
+                    self.generate_expr(left);
+                }
+                self.write(&format!(".{}(", method));
+                if right_ty != target {
+                    self.write("(");
+                    self.generate_expr(right);
+                    self.write(&format!(" as {})", target));
+                } else {
+                    self.generate_expr(right);
+                }
+                self.write(")");
+            } else {
+                self.generate_expr(left);
+                self.write(&format!(".{}(", method));
+                self.generate_expr(right);
+                self.write(")");
+            }
+        }
+    }
+
+    /// Generate the receiver (left side) of a wrapping shift operation with proper type suffix.
+    /// For shifts, only the receiver needs the type suffix, the shift amount is always cast to u32.
+    fn generate_wrapping_binop_receiver(&mut self, left: &Expr, _right: &Expr) {
+        if let ExprKind::Integer(_) = &left.kind {
+            // Left is a literal receiver - determine type from context, NOT from shift amount.
+            let left_suffix = {
+                let lt = self.infer_expr_rust_type(left);
+                if !lt.is_empty() && Self::is_rust_int_type(&lt) {
+                    lt
+                } else if let Some(ref hint) = self.type_hint {
+                    if Self::is_rust_int_type(hint) {
+                        hint.clone()
+                    } else {
+                        "u64".to_string()
+                    }
+                } else {
+                    "u64".to_string()
+                }
+            };
+            self.generate_typed_expr(left, &left_suffix);
+        } else {
+            self.generate_expr(left);
         }
     }
 
@@ -2217,11 +2615,128 @@ impl RustGenerator {
 
     /// Check if a function argument needs auto-borrowing.
     /// This is needed when passing a Vec-typed variable to a function expecting a slice.
+    /// Find borrow conflicts in function call arguments.
+    /// Returns a list of (var_name, field_name) pairs that need to be copied before the call.
+    /// This handles cases like `fn(state, &state.block)` where `state` is `&mut Struct`.
+    fn find_borrow_conflicts(&self, args: &[Expr]) -> Vec<(String, String)> {
+        // Find identifiers passed as mutable references (either explicit &mut or
+        // variables whose type is &mut Struct)
+        let mut mut_ref_idents: Vec<String> = Vec::new();
+        for arg in args {
+            match &arg.kind {
+                ExprKind::Ident(ident) => {
+                    let name = if ident.name == "self" {
+                        "self_".to_string()
+                    } else {
+                        ident.name.clone()
+                    };
+                    // Check if this variable is known to be a mutable struct reference
+                    if self.var_types.contains_key(&name)
+                        || self
+                            .param_rust_types
+                            .get(&name)
+                            .is_some_and(|t| t.starts_with("&mut "))
+                    {
+                        mut_ref_idents.push(name);
+                    }
+                }
+                ExprKind::MutRef(inner) => {
+                    if let ExprKind::Ident(ident) = &inner.kind {
+                        let name = if ident.name == "self" {
+                            "self_".to_string()
+                        } else {
+                            ident.name.clone()
+                        };
+                        mut_ref_idents.push(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Find field borrows that conflict with the mutable references
+        let mut conflicts: Vec<(String, String)> = Vec::new();
+        for arg in args {
+            if let ExprKind::Ref(inner) = &arg.kind
+                && let ExprKind::Field { object, field } = &inner.kind
+                && let ExprKind::Ident(obj_ident) = &object.kind
+            {
+                let obj_name = if obj_ident.name == "self" {
+                    "self_".to_string()
+                } else {
+                    obj_ident.name.clone()
+                };
+                if mut_ref_idents.contains(&obj_name) {
+                    conflicts.push((obj_name, field.name.clone()));
+                }
+            }
+        }
+        conflicts
+    }
+
+    /// Find a replacement string for a function argument that has a borrow conflict.
+    /// Returns Some("&field_copy") if the argument matches a conflict, None otherwise.
+    fn find_replacement_for_arg(&self, arg: &Expr, copies: &[(String, String)]) -> Option<String> {
+        if let ExprKind::Ref(inner) = &arg.kind
+            && let ExprKind::Field { object, field } = &inner.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+        {
+            let obj_name = if obj_ident.name == "self" {
+                "self_"
+            } else {
+                &obj_ident.name
+            };
+            for (var_name, field_name) in copies {
+                if var_name == obj_name && field_name == &field.name {
+                    return Some(format!("&{field_name}_copy"));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if an expression refers to a non-u8 array (e.g., state.h where h: [u32; 8]).
+    /// Used to detect secure_zero calls on non-u8 arrays that need special handling.
+    fn is_non_u8_array_expr(&self, expr: &Expr) -> bool {
+        use crate::parser::TypeKind;
+        if let ExprKind::Field { object, field } = &expr.kind
+            && let ExprKind::Ident(obj_ident) = &object.kind
+        {
+            let obj_name = if obj_ident.name == "self" {
+                "self_"
+            } else {
+                &obj_ident.name
+            };
+            if let Some(struct_name) = self.var_types.get(obj_name)
+                && let Some(fields) = self.struct_defs.get(struct_name)
+            {
+                for f in fields {
+                    if f.name == field.name {
+                        // Check if field type is Array with non-u8 element
+                        if let TypeKind::Array { element, .. } = &f.ty.kind {
+                            if let TypeKind::Primitive(p) = &element.kind {
+                                return *p != crate::parser::PrimitiveType::U8;
+                            }
+                            return true; // Non-primitive element -> non-u8
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn arg_needs_borrow(&self, arg: &Expr) -> bool {
+        // Vec<T>, array variables, and fixed-size arrays need & to become &[T] at call sites
         if let ExprKind::Ident(ident) = &arg.kind
             && let Some(ty) = self.var_rust_types.get(&ident.name)
         {
-            return ty.starts_with("Vec<");
+            // Vec<u8>, [u8] (from hex literals), [u8; N] (fixed-size arrays)
+            return ty.starts_with("Vec<") || ty.starts_with("[u8]") || ty.starts_with("[u8;");
+        }
+        // Slice expressions (arr[start..end]) produce [T] which needs & to become &[T]
+        if matches!(&arg.kind, ExprKind::Slice { .. }) {
+            return true;
         }
         false
     }
@@ -2396,6 +2911,7 @@ impl CodeGenerator for RustGenerator {
         self.var_rust_types.clear();
         self.param_rust_types.clear();
         self.func_return_types.clear();
+        self.func_param_types.clear();
 
         // Pre-pass: collect struct definitions and method mappings
         for item in &ast.ast.items {

@@ -721,25 +721,64 @@ impl SwiftGenerator {
                 if is_inout {
                     self.write("&");
                 }
-                // Wrap with type cast if the parameter expects a specific UInt type
-                // and the argument might be a Swift Int (loop variable, etc.)
-                let needs_uint_cast = param_info
+                let is_uint_param = param_info
                     .map(|p| {
                         let ty = &p.swift_type;
                         !p.is_inout
                             && (ty == "UInt64" || ty == "UInt32" || ty == "UInt16" || ty == "UInt8")
-                            && self.expr_might_be_int(arg)
                     })
                     .unwrap_or(false);
-                if needs_uint_cast {
+
+                if is_uint_param {
                     let target_type = &param_info.unwrap().swift_type;
-                    self.write(&format!("{}(", target_type));
-                    self.generate_expr(arg);
-                    self.write(")");
+                    if self.expr_might_be_int(arg) {
+                        // Int -> UInt conversion
+                        self.write(&format!("{}(", target_type));
+                        self.generate_expr(arg);
+                        self.write(")");
+                    } else if self.expr_may_need_uint_conversion(arg, target_type) {
+                        // UInt type mismatch conversion (e.g. UInt32 -> UInt8)
+                        self.write(&format!("{}(truncatingIfNeeded: ", target_type));
+                        self.generate_expr(arg);
+                        self.write(")");
+                    } else {
+                        self.generate_expr(arg);
+                    }
                 } else {
                     self.generate_expr(arg);
                 }
             }
+        }
+    }
+
+    /// Check if an expression may produce a UInt type different from the target,
+    /// requiring a `truncatingIfNeeded` conversion. Returns true for function calls,
+    /// method calls, casts to a different type, and variables with a known different type.
+    fn expr_may_need_uint_conversion(&self, expr: &Expr, target_type: &str) -> bool {
+        match &expr.kind {
+            // Function calls may return a different UInt type
+            ExprKind::Call { .. }
+            | ExprKind::MethodCall { .. }
+            | ExprKind::TypeStaticCall { .. }
+            | ExprKind::GenericCall { .. } => true,
+            // Casts produce their target type - check if it differs
+            ExprKind::Cast { ty, .. } => {
+                let cast_type = self.swift_type(ty);
+                cast_type != target_type
+                    && (cast_type == "UInt8"
+                        || cast_type == "UInt16"
+                        || cast_type == "UInt32"
+                        || cast_type == "UInt64")
+            }
+            // Binary operations may produce a type that differs
+            ExprKind::Binary { .. } => true,
+            // Parenthesized - check inner
+            ExprKind::Paren(inner) => self.expr_may_need_uint_conversion(inner, target_type),
+            // Array index may return a different element type
+            ExprKind::Index { .. } => true,
+            // Struct field access may return a different type
+            ExprKind::Field { .. } => true,
+            _ => false,
         }
     }
 
@@ -767,6 +806,19 @@ impl SwiftGenerator {
             // Field access might produce Int but our .len() already wraps with UInt64
             ExprKind::Field { .. } => false,
             _ => false,
+        }
+    }
+
+    /// Extract the Swift element type string from an array/slice type.
+    /// Returns `Some("UInt32")` for `[UInt32]`, etc.
+    fn get_array_element_type(&self, ty: &ParserType) -> Option<String> {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Array { element, .. }
+            | TypeKind::Slice { element }
+            | TypeKind::ArrayRef { element, .. } => Some(self.swift_type(element)),
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.get_array_element_type(inner),
+            _ => None,
         }
     }
 
@@ -837,7 +889,25 @@ impl SwiftGenerator {
 
                 self.write(" = ");
                 if let Some(init) = init {
-                    self.generate_expr(init);
+                    // When the declared type is an array and init is ArrayRepeat,
+                    // use the declared element type for the array initializer
+                    // instead of inferring from the value expression.
+                    if let Some(declared_ty) = ty
+                        && let ExprKind::ArrayRepeat { value, count } = &init.kind
+                    {
+                        let declared_elem = self.get_array_element_type(declared_ty);
+                        if let Some(elem_type) = declared_elem {
+                            self.write(&format!("[{}](repeating: ", elem_type));
+                            self.generate_expr(value);
+                            self.write(", count: Int(");
+                            self.generate_expr(count);
+                            self.write("))");
+                        } else {
+                            self.generate_expr(init);
+                        }
+                    } else {
+                        self.generate_expr(init);
+                    }
                 } else if let Some(ty) = ty {
                     self.write(&self.default_value_for_type(ty));
                 } else {

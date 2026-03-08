@@ -444,7 +444,7 @@ impl ObjCGenerator {
         self.writeln("static int __test_failures = 0;");
         self.writeln("static const char *__test_name = \"\";");
         self.writeln("");
-        self.writeln("static void __assert(bool condition) {");
+        self.writeln("static void algoc_assert(bool condition) {");
         self.indent();
         self.writeln("if (!condition) {");
         self.indent();
@@ -1695,7 +1695,7 @@ impl ObjCGenerator {
     fn generate_builtin(&mut self, name: BuiltinFunc, args: &[Expr]) {
         match name {
             BuiltinFunc::Assert => {
-                self.write("__assert(");
+                self.write("algoc_assert(");
                 self.generate_expr(&args[0]);
                 self.write(")");
             }

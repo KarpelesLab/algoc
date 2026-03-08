@@ -1454,12 +1454,29 @@ impl CppGenerator {
             }
             ExprKind::StructLit { name, fields } => {
                 self.write(&format!("{}{{", name.name));
+                // Look up struct field types for correct array initialization
+                let struct_fields = self.struct_defs.get(&name.name).cloned();
                 for (i, (field_name, value)) in fields.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
                     self.write(&format!(".{} = ", field_name.name));
-                    self.generate_expr(value);
+                    // Check if this field is a fixed-size array in the struct definition.
+                    // If so, use brace-init instead of std::vector{...} for array literals.
+                    let field_elem_ty = struct_fields.as_ref().and_then(|sf| {
+                        sf.iter().find(|f| f.name == field_name.name).and_then(|f| {
+                            if let crate::parser::TypeKind::Array { element, .. } = &f.ty.kind {
+                                Some(element.as_ref().clone())
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                    if let Some(ref elem_ty) = field_elem_ty {
+                        self.generate_array_init(value, elem_ty);
+                    } else {
+                        self.generate_expr(value);
+                    }
                 }
                 self.write("}");
             }

@@ -43,6 +43,8 @@ pub struct KotlinGenerator {
     var_prim_types: HashMap<String, PrimitiveType>,
     /// Current function return type (for return statement conversion)
     current_return_type: Option<ParserType>,
+    /// Function parameter types: func_name -> Vec<ParserType>
+    func_param_types: HashMap<String, Vec<ParserType>>,
 }
 
 impl KotlinGenerator {
@@ -57,6 +59,7 @@ impl KotlinGenerator {
             var_elem_types: HashMap::new(),
             var_prim_types: HashMap::new(),
             current_return_type: None,
+            func_param_types: HashMap::new(),
         }
     }
 
@@ -357,8 +360,32 @@ impl KotlinGenerator {
     }
 
     fn generate_ast(&mut self, ast: &Ast) {
+        // Pre-pass: collect function parameter types for call-site conversions
+        self.collect_func_param_types(ast);
         for item in &ast.items {
             self.generate_item(item);
+        }
+    }
+
+    /// Pre-pass to collect function parameter types so that call sites can
+    /// insert the correct narrowing/widening conversions.
+    fn collect_func_param_types(&mut self, ast: &Ast) {
+        for item in &ast.items {
+            match &item.kind {
+                ItemKind::Function(func) => {
+                    let types: Vec<ParserType> = func.params.iter().map(|p| p.ty.clone()).collect();
+                    self.func_param_types.insert(func.name.name.clone(), types);
+                }
+                ItemKind::Impl(impl_def) => {
+                    for method in &impl_def.methods {
+                        let mangled = format!("{}__{}", impl_def.target.name, method.name.name);
+                        let types: Vec<ParserType> =
+                            method.params.iter().map(|p| p.ty.clone()).collect();
+                        self.func_param_types.insert(mangled, types);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -392,6 +419,7 @@ impl KotlinGenerator {
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
         let saved_elem_types = self.var_elem_types.clone();
         let saved_prim_types = self.var_prim_types.clone();
+        let saved_var_types = self.var_types.clone();
         let saved_return_type = self.current_return_type.take();
         self.current_return_type = func.return_type.clone();
         for param in &func.params {
@@ -402,6 +430,7 @@ impl KotlinGenerator {
             if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
                 self.var_prim_types.insert(param.name.name.clone(), *p);
             }
+            Self::track_param_type(&param.ty, &param.name.name, &mut self.var_types);
         }
 
         let mangled_name = format!("{}__{}", struct_name, func.name.name);
@@ -424,6 +453,7 @@ impl KotlinGenerator {
         self.writeln("");
         self.var_elem_types = saved_elem_types;
         self.var_prim_types = saved_prim_types;
+        self.var_types = saved_var_types;
         self.current_return_type = saved_return_type;
     }
 
@@ -688,6 +718,65 @@ impl KotlinGenerator {
                 Some(".toULong()")
             }
             _ => None,
+        }
+    }
+
+    /// Generate a call argument, adding a conversion suffix if the parameter
+    /// type requires a different unsigned integer type than the argument
+    /// naturally produces.
+    fn generate_call_arg(&mut self, arg: &Expr, param_ty: Option<&ParserType>) {
+        if let Some(ty) = param_ty
+            && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+            && let Some(suffix) = Self::prim_conversion_suffix(p)
+        {
+            // Check if the argument already produces the correct type
+            // (e.g. a variable of that type, or a literal that fits)
+            let already_correct = self.expr_matches_prim(arg, p);
+            if already_correct {
+                self.generate_expr(arg);
+            } else {
+                // Need parentheses around complex expressions before suffix
+                let needs_parens = matches!(
+                    &arg.kind,
+                    ExprKind::Binary { .. } | ExprKind::Conditional { .. } | ExprKind::Unary { .. }
+                );
+                if needs_parens {
+                    self.write("(");
+                }
+                self.generate_expr(arg);
+                if needs_parens {
+                    self.write(")");
+                }
+                self.write(suffix);
+            }
+        } else {
+            self.generate_expr(arg);
+        }
+    }
+
+    /// Check whether an expression already produces a value of the given
+    /// primitive type, so no conversion suffix is needed.
+    fn expr_matches_prim(&self, expr: &Expr, target: &PrimitiveType) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(ident) => {
+                if let Some(p) = self.var_prim_types.get(&ident.name) {
+                    p.to_native() == target.to_native()
+                } else {
+                    false
+                }
+            }
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    p.to_native() == target.to_native()
+                } else {
+                    false
+                }
+            }
+            ExprKind::Paren(inner) => self.expr_matches_prim(inner, target),
+            ExprKind::Ref(inner) | ExprKind::MutRef(inner) | ExprKind::Deref(inner) => {
+                self.expr_matches_prim(inner, target)
+            }
+            _ => false,
         }
     }
 
@@ -1532,11 +1621,10 @@ impl KotlinGenerator {
                 // Check for method calls like slice.len() or reader.read_u32()
                 if let ExprKind::Field { object, field } = &func.kind {
                     if field.name == "len" && args.is_empty() {
-                        // Convert .len() to .size.toUInt() since AlgoC len()
-                        // returns an unsigned integer, and UInt is the most
-                        // common unsigned type used in operations.
+                        // Convert .len() to .size.toULong() since AlgoC len()
+                        // returns u64 (unsigned 64-bit integer)
                         self.generate_expr(object);
-                        self.write(".size.toUInt()");
+                        self.write(".size.toULong()");
                         return;
                     }
 
@@ -1639,16 +1727,27 @@ impl KotlinGenerator {
                         && let Some(methods) = self.struct_methods.get(&struct_name).cloned()
                         && let Some(mangled_name) = methods.get(&field.name)
                     {
+                        let mangled_name = mangled_name.clone();
+                        let param_types = self.func_param_types.get(&mangled_name).cloned();
                         self.write(&format!("{}(", mangled_name));
                         self.generate_expr(object);
-                        for arg in args {
+                        for (i, arg) in args.iter().enumerate() {
                             self.write(", ");
-                            self.generate_expr(arg);
+                            // args[i] corresponds to params[i+1] (param 0 is self)
+                            let pty = param_types.as_ref().and_then(|pts| pts.get(i + 1));
+                            self.generate_call_arg(arg, pty);
                         }
                         self.write(")");
                         return;
                     }
                 }
+
+                // Look up parameter info for the target function
+                let param_types = if let ExprKind::Ident(ident) = &func.kind {
+                    self.func_param_types.get(&ident.name).cloned()
+                } else {
+                    None
+                };
 
                 self.generate_expr(func);
                 self.write("(");
@@ -1656,7 +1755,8 @@ impl KotlinGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    let pty = param_types.as_ref().and_then(|pts| pts.get(i));
+                    self.generate_call_arg(arg, pty);
                 }
                 self.write(")");
             }
@@ -1808,11 +1908,14 @@ impl KotlinGenerator {
                 ..
             } => {
                 // Generate: mangled_name(receiver, args...)
+                let param_types = self.func_param_types.get(mangled_name).cloned();
                 self.write(&format!("{}(", mangled_name));
                 self.generate_expr(receiver);
-                for arg in args {
+                for (i, arg) in args.iter().enumerate() {
                     self.write(", ");
-                    self.generate_expr(arg);
+                    // args[i] corresponds to params[i+1] (param 0 is self)
+                    let pty = param_types.as_ref().and_then(|pts| pts.get(i + 1));
+                    self.generate_call_arg(arg, pty);
                 }
                 self.write(")");
             }
@@ -1821,25 +1924,35 @@ impl KotlinGenerator {
                 method_name,
                 args,
             } => {
-                self.write(&format!("{}__{}", type_name.name, method_name.name));
+                let mangled = format!("{}__{}", type_name.name, method_name.name);
+                let param_types = self.func_param_types.get(&mangled).cloned();
+                self.write(&mangled);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    let pty = param_types.as_ref().and_then(|pts| pts.get(i));
+                    self.generate_call_arg(arg, pty);
                 }
                 self.write(")");
             }
             ExprKind::GenericCall { func, args, .. } => {
                 // Should be resolved by monomorphization - generate as regular call
+                let param_types = if let ExprKind::Ident(ident) = &func.kind {
+                    self.func_param_types.get(&ident.name).cloned()
+                } else {
+                    None
+                };
+
                 self.generate_expr(func);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    let pty = param_types.as_ref().and_then(|pts| pts.get(i));
+                    self.generate_call_arg(arg, pty);
                 }
                 self.write(")");
             }

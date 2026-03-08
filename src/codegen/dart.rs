@@ -751,10 +751,12 @@ impl DartGenerator {
                 self.write_indent();
                 self.write(&format!("var {} = ", name.name));
                 if let Some(init) = init {
-                    // When we have a type annotation and the init is an array literal,
+                    // When we have a type annotation and the init is an array literal or repeat,
                     // pass the type context so the correct typed list constructor is used
                     if let ExprKind::Array(elements) = &init.kind {
                         self.generate_array_expr(elements, ty.as_ref());
+                    } else if let ExprKind::ArrayRepeat { value, count } = &init.kind {
+                        self.generate_array_repeat(value, count, ty.as_ref());
                     } else {
                         self.generate_expr(init);
                     }
@@ -1194,27 +1196,7 @@ impl DartGenerator {
                 self.generate_array_expr(elements, None);
             }
             ExprKind::ArrayRepeat { value, count } => {
-                // Determine the appropriate typed list from the value's type
-                let typed_list = typed_list_for_value(value);
-
-                // All typed lists are zero-initialized, so we can just use the constructor
-                self.write(&format!("{}(", typed_list));
-                self.generate_expr(count);
-                self.write(")");
-
-                // Check if we need to fill with a non-zero value
-                let is_zero = matches!(&value.kind, ExprKind::Integer(0));
-                let is_cast_zero = matches!(
-                    &value.kind,
-                    ExprKind::Cast { expr, .. } if matches!(&expr.kind, ExprKind::Integer(0))
-                );
-                if !is_zero && !is_cast_zero {
-                    self.write("..fillRange(0, ");
-                    self.generate_expr(count);
-                    self.write(", ");
-                    self.generate_expr(value);
-                    self.write(")");
-                }
+                self.generate_array_repeat(value, count, None);
             }
             ExprKind::Cast { expr: inner, ty } => {
                 self.generate_cast(inner, ty);
@@ -1546,6 +1528,47 @@ impl DartGenerator {
             self.generate_expr(elem);
         }
         self.write("])");
+    }
+
+    /// Generate an array repeat expression `[value; count]`, optionally with a declared type hint.
+    /// When target_type is provided (e.g. from a `let` statement with a type annotation),
+    /// uses the declared type to pick the correct typed list constructor.
+    /// Otherwise, infers from the repeat value.
+    fn generate_array_repeat(
+        &mut self,
+        value: &Expr,
+        count: &Expr,
+        target_type: Option<&crate::parser::Type>,
+    ) {
+        // Determine the appropriate typed list: prefer declared type, fall back to value inference
+        let typed_list = if let Some(ty) = target_type {
+            if let Some(name) = Self::typed_list_name_for_type(ty) {
+                name
+            } else {
+                typed_list_for_value(value)
+            }
+        } else {
+            typed_list_for_value(value)
+        };
+
+        // All typed lists are zero-initialized, so we can just use the constructor
+        self.write(&format!("{}(", typed_list));
+        self.generate_expr(count);
+        self.write(")");
+
+        // Check if we need to fill with a non-zero value
+        let is_zero = matches!(&value.kind, ExprKind::Integer(0));
+        let is_cast_zero = matches!(
+            &value.kind,
+            ExprKind::Cast { expr, .. } if matches!(&expr.kind, ExprKind::Integer(0))
+        );
+        if !is_zero && !is_cast_zero {
+            self.write("..fillRange(0, ");
+            self.generate_expr(count);
+            self.write(", ");
+            self.generate_expr(value);
+            self.write(")");
+        }
     }
 
     fn generate_builtin(&mut self, name: BuiltinFunc, args: &[Expr]) {

@@ -428,32 +428,14 @@ impl PerlGenerator {
     }
 
     fn generate_const(&mut self, c: &crate::parser::ConstDef) {
-        // For array constants, use my @NAME = (...);
-        // For other constants, use my $NAME = ...;
-        match &c.value.kind {
-            ExprKind::Array(_) => {
-                self.write_indent();
-                self.write(&format!("my @{} = ", c.name.name));
-                // Generate array elements without the [] wrapper
-                if let ExprKind::Array(elements) = &c.value.kind {
-                    self.write("(");
-                    for (i, elem) in elements.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
-                        }
-                        self.generate_expr(elem);
-                    }
-                    self.write(")");
-                }
-                self.write(";\n\n");
-            }
-            _ => {
-                self.write_indent();
-                self.write(&format!("my ${} = ", c.name.name));
-                self.generate_expr(&c.value);
-                self.write(";\n\n");
-            }
-        }
+        // All constants use scalar syntax: my $NAME = ...;
+        // Array constants use array refs: my $NAME = [...];
+        // This matches how identifiers are referenced ($NAME) and
+        // how indexing works ($NAME->[$i]).
+        self.write_indent();
+        self.write(&format!("my ${} = ", c.name.name));
+        self.generate_expr(&c.value);
+        self.write(";\n\n");
     }
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {

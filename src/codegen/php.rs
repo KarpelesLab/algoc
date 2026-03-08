@@ -10,7 +10,7 @@ use crate::parser::{
     Ast, BinaryOp, Block, BuiltinFunc, Expr, ExprKind, Function, Item, ItemKind, PrimitiveType,
     Stmt, StmtKind, Type as ParserType, UnaryOp,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Struct field info for code generation
 #[derive(Clone)]
@@ -38,6 +38,8 @@ pub struct PhpGenerator {
     var_types: HashMap<String, String>,
     /// Parameters that need pass-by-reference (&mut)
     mutref_params: HashMap<String, Vec<bool>>,
+    /// Names of constants (accessed without $ prefix in PHP)
+    const_names: HashSet<String>,
 }
 
 /// Prefix for all user-defined function names to avoid collisions with PHP built-ins
@@ -53,6 +55,7 @@ impl PhpGenerator {
             struct_methods: HashMap::new(),
             var_types: HashMap::new(),
             mutref_params: HashMap::new(),
+            const_names: HashSet::new(),
         }
     }
 
@@ -976,7 +979,12 @@ impl PhpGenerator {
                 }
             }
             ExprKind::Ident(ident) => {
-                self.write(&format!("${}", ident.name));
+                if self.const_names.contains(&ident.name) {
+                    // PHP constants are accessed without $ prefix
+                    self.write(&ident.name);
+                } else {
+                    self.write(&format!("${}", ident.name));
+                }
             }
             ExprKind::Binary { left, op, right } => {
                 // For array comparisons, use constant_time_eq
@@ -1739,6 +1747,7 @@ impl CodeGenerator for PhpGenerator {
         self.struct_methods.clear();
         self.var_types.clear();
         self.mutref_params.clear();
+        self.const_names.clear();
 
         // Pre-pass: collect struct field info and methods for read/write generation
         for item in &ast.ast.items {
@@ -1776,6 +1785,9 @@ impl CodeGenerator for PhpGenerator {
                     }
                     self.struct_methods
                         .insert(impl_def.target.name.clone(), methods);
+                }
+                ItemKind::Const(c) => {
+                    self.const_names.insert(c.name.name.clone());
                 }
                 _ => {}
             }

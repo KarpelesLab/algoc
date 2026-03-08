@@ -173,24 +173,24 @@ impl GoGenerator {
                 }
                 None
             }
-            // Index into a slice/array: if the base is []uint8, result is uint8
+            // Index into a slice/array: extract the element type
             ExprKind::Index { array, .. } => {
                 let array_type = self.infer_expr_go_type(array);
                 if let Some(ref at) = array_type {
-                    if at == "[]uint8" || at.starts_with("[]uint8") {
-                        return Some("uint8".to_string());
+                    // Extract element type from slice types like "[]uint8"
+                    if let Some(elem) = at.strip_prefix("[]") {
+                        return Some(elem.to_string());
                     }
-                    if at == "[]uint32" || at.starts_with("[]uint32") {
-                        return Some("uint32".to_string());
-                    }
-                    if at == "[]uint64" || at.starts_with("[]uint64") {
-                        return Some("uint64".to_string());
-                    }
-                    if at == "[]uint16" || at.starts_with("[]uint16") {
-                        return Some("uint16".to_string());
+                    // Extract element type from fixed-size array types like "[16]uint32"
+                    if let Some(rest) = at.strip_prefix('[')
+                        && let Some(bracket_end) = rest.find(']')
+                    {
+                        let elem = &rest[bracket_end + 1..];
+                        if !elem.is_empty() {
+                            return Some(elem.to_string());
+                        }
                     }
                 }
-                // If the param type is a slice of bytes (e.g. &[u8] -> []uint8)
                 None
             }
             // Binary expressions: infer from operands
@@ -261,7 +261,15 @@ impl GoGenerator {
             TypeKind::ArrayRef { element, .. } => {
                 format!("[]{}", self.go_type(element))
             }
-            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => self.go_type(inner),
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                // References to fixed-size arrays become slices in Go,
+                // since Go doesn't use references to arrays — slices serve that role.
+                if let TypeKind::Array { element, .. } = &inner.kind {
+                    format!("[]{}", self.go_type(element))
+                } else {
+                    self.go_type(inner)
+                }
+            }
             TypeKind::Named(ident) => ident.name.clone(),
             TypeKind::SelfType => "interface{}".to_string(),
         }
@@ -1242,7 +1250,12 @@ impl GoGenerator {
                         let go_ty = self.go_type(ty);
                         self.var_go_types.insert(name.name.clone(), go_ty.clone());
                         self.write(&format!("var {} {} = ", name.name, go_ty));
-                        self.generate_expr(init);
+                        // Use type-aware generation for fixed-size array targets
+                        if matches!(ty.kind, crate::parser::TypeKind::Array { .. }) {
+                            self.generate_expr_with_type(init, ty);
+                        } else {
+                            self.generate_expr(init);
+                        }
                         self.write("\n");
                     } else {
                         // Use := for variable declaration with initialization (type inferred)
@@ -1488,6 +1501,47 @@ impl GoGenerator {
                 self.generate_block(block);
                 self.dedent();
                 self.writeln("}");
+            }
+        }
+    }
+
+    /// Generate an expression with knowledge of the target type.
+    /// When the target is a fixed-size array, generates `[N]T{...}` instead of `[]T{...}`.
+    fn generate_expr_with_type(&mut self, expr: &Expr, target_ty: &ParserType) {
+        use crate::parser::TypeKind;
+        match (&expr.kind, &target_ty.kind) {
+            // Array literal targeting a fixed-size array type
+            (ExprKind::Array(elements), TypeKind::Array { element, size }) => {
+                let go_elem = self.go_type(element);
+                self.write(&format!("[{}]{}", size, go_elem));
+                self.write("{");
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_expr(elem);
+                }
+                self.write("}");
+            }
+            // ArrayRepeat targeting a fixed-size array type: [value; count] -> [N]T{}
+            (ExprKind::ArrayRepeat { value, .. }, TypeKind::Array { element, size }) => {
+                let go_elem = self.go_type(element);
+                if matches!(&value.kind, ExprKind::Integer(0)) {
+                    // Zero init: Go zero-initializes by default
+                    self.write(&format!("[{}]{}{{}}", size, go_elem));
+                } else {
+                    // Non-zero: use a lambda to fill
+                    self.write(&format!(
+                        "func() [{}]{} {{ var a [{}]{}; for i := range a {{ a[i] = ",
+                        size, go_elem, size, go_elem
+                    ));
+                    self.generate_expr(value);
+                    self.write(" }; return a }()");
+                }
+            }
+            _ => {
+                // Fall back to regular expression generation
+                self.generate_expr(expr);
             }
         }
     }
@@ -1877,8 +1931,17 @@ impl GoGenerator {
             }
             ExprKind::Ref(inner) | ExprKind::MutRef(inner) => {
                 // References in Go - for slices they're already references,
-                // for other types we just pass the value
+                // for other types we just pass the value.
+                // If the inner expression is a fixed-size array, we need to
+                // convert it to a slice with [:] so it can be passed as []T.
+                let inner_type = self.infer_expr_go_type(inner);
+                let needs_slice = inner_type
+                    .as_ref()
+                    .is_some_and(|t| is_fixed_array_go_type(t));
                 self.generate_expr(inner);
+                if needs_slice {
+                    self.write("[:]");
+                }
             }
             ExprKind::Deref(inner) => {
                 // Dereferences are typically no-ops for our usage
@@ -1895,12 +1958,26 @@ impl GoGenerator {
             }
             ExprKind::StructLit { name, fields } => {
                 self.write(&format!("{}{{", name.name));
+                // Look up struct field types for correct array initialization
+                let struct_fields = self.struct_defs.get(&name.name).cloned();
                 for (i, (field_name, value)) in fields.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
                     self.write(&format!("{}: ", go_exported_field(&field_name.name)));
-                    self.generate_expr(value);
+                    // Check if this field is a fixed-size array; if so, use typed init
+                    let field_ty = struct_fields.as_ref().and_then(|sf| {
+                        sf.iter()
+                            .find(|f| f.name == field_name.name)
+                            .map(|f| f.ty.clone())
+                    });
+                    if let Some(ref ty) = field_ty
+                        && matches!(ty.kind, crate::parser::TypeKind::Array { .. })
+                    {
+                        self.generate_expr_with_type(value, ty);
+                    } else {
+                        self.generate_expr(value);
+                    }
                 }
                 self.write("}");
             }
@@ -2625,8 +2702,7 @@ fn go_int_type_rank(ty: &str) -> u8 {
     match ty {
         "uint8" => 1,
         "uint16" => 2,
-        "uint32" => 3,
-        "int" => 3, // int is same width as uint32 on most platforms, treat as same rank
+        "uint32" | "int" => 3,
         "uint64" => 4,
         _ => 0,
     }
@@ -2635,16 +2711,25 @@ fn go_int_type_rank(ty: &str) -> u8 {
 /// Determine the wider of two Go integer types for binary expression coercion.
 /// When both are integer types, returns the wider one.
 /// When they are the same, returns that type.
+/// When `int` conflicts with a uint type of the same rank, prefer the uint type
+/// since AlgoC uses unsigned integers exclusively.
 fn go_wider_type(a: &str, b: &str) -> String {
     let ra = go_int_type_rank(a);
     let rb = go_int_type_rank(b);
     if ra == 0 || rb == 0 {
         // One is not a recognized integer type; return whichever is known
         if ra > 0 { a.to_string() } else { b.to_string() }
-    } else if ra >= rb {
+    } else if ra > rb {
         a.to_string()
-    } else {
+    } else if rb > ra {
         b.to_string()
+    } else {
+        // Same rank: prefer unsigned type over `int`
+        if a == "int" {
+            b.to_string()
+        } else {
+            a.to_string()
+        }
     }
 }
 
@@ -2652,4 +2737,31 @@ fn go_wider_type(a: &str, b: &str) -> String {
 /// that can participate in binary arithmetic/comparison requiring casts.
 fn is_go_int_type(ty: &str) -> bool {
     go_int_type_rank(ty) > 0
+}
+
+/// Check if a Go type string represents a fixed-size array (e.g. "[16]uint32", "[288]uint8").
+/// Returns false for slice types like "[]uint8".
+fn is_fixed_array_go_type(ty: &str) -> bool {
+    if let Some(rest) = ty.strip_prefix('[') {
+        // Fixed array: [N]T where N is a digit
+        rest.starts_with(|c: char| c.is_ascii_digit())
+    } else {
+        false
+    }
+}
+
+/// Extract the element type from a fixed-size array Go type string.
+/// E.g., "[16]uint32" -> Some("uint32"), "[]uint8" -> None
+#[allow(dead_code)]
+fn fixed_array_element_type(ty: &str) -> Option<&str> {
+    if let Some(rest) = ty.strip_prefix('[')
+        && rest.starts_with(|c: char| c.is_ascii_digit())
+        && let Some(bracket_end) = rest.find(']')
+    {
+        let elem = &rest[bracket_end + 1..];
+        if !elem.is_empty() {
+            return Some(elem);
+        }
+    }
+    None
 }

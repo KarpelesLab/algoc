@@ -2119,6 +2119,9 @@ impl JavaGenerator {
             ExprKind::Call { .. } => true,
             // Method calls - also produce int typically
             ExprKind::MethodCall { .. } => true,
+            // Type-qualified static calls and generic calls also produce int
+            ExprKind::TypeStaticCall { .. } => true,
+            ExprKind::GenericCall { .. } => true,
             // Parenthesized - check inner
             ExprKind::Paren(inner) => Self::expr_may_widen_to_int(inner),
             // Conditionals - check branches

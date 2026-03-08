@@ -49,6 +49,8 @@ pub struct CGenerator {
     func_signatures: HashMap<String, Vec<FuncParamInfo>>,
     /// Variables that are slices/arrays (need _len companion when passed to functions)
     slice_vars: HashSet<String>,
+    /// Variables that are fixed-size arrays (decay to pointers, no & needed)
+    fixed_array_vars: HashSet<String>,
 }
 
 impl CGenerator {
@@ -63,6 +65,7 @@ impl CGenerator {
             pointer_vars: HashSet::new(),
             func_signatures: HashMap::new(),
             slice_vars: HashSet::new(),
+            fixed_array_vars: HashSet::new(),
         }
     }
 
@@ -176,18 +179,16 @@ impl CGenerator {
         }
     }
 
-    /// Check if a parameter type requires a companion _len argument in C
+    /// Check if a parameter type requires a companion _len argument in C.
+    /// Only dynamically-sized types (slices, array refs) need _len.
+    /// Fixed-size arrays (TypeKind::Array) do NOT need _len since the size is known at compile time.
     fn param_needs_len(ty: &ParserType) -> bool {
         use crate::parser::TypeKind;
         match &ty.kind {
-            TypeKind::Array { .. } => true,
             TypeKind::Slice { .. } => true,
             TypeKind::ArrayRef { .. } => true,
-            TypeKind::MutRef(inner) => {
-                matches!(inner.kind, TypeKind::Slice { .. } | TypeKind::Array { .. })
-            }
-            TypeKind::Ref(inner) => {
-                matches!(inner.kind, TypeKind::Slice { .. } | TypeKind::Array { .. })
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                matches!(inner.kind, TypeKind::Slice { .. })
             }
             _ => false,
         }
@@ -830,16 +831,33 @@ impl CGenerator {
         }
     }
 
-    /// Populate pointer_vars and slice_vars from function parameters
+    /// Check if a parameter type is a fixed-size array (or ref to one).
+    /// These decay to pointers in C and should not have `&` taken.
+    fn is_fixed_array_param(ty: &ParserType) -> bool {
+        use crate::parser::TypeKind;
+        match &ty.kind {
+            TypeKind::Array { .. } => true,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                matches!(inner.kind, TypeKind::Array { .. })
+            }
+            _ => false,
+        }
+    }
+
+    /// Populate pointer_vars, slice_vars, and fixed_array_vars from function parameters
     fn collect_pointer_params(&mut self, func: &Function) {
         self.pointer_vars.clear();
         self.slice_vars.clear();
+        self.fixed_array_vars.clear();
         for param in &func.params {
             if Self::is_pointer_param(&param.ty) {
                 self.pointer_vars.insert(param.name.name.clone());
             }
             if Self::param_needs_len(&param.ty) {
                 self.slice_vars.insert(param.name.name.clone());
+            }
+            if Self::is_fixed_array_param(&param.ty) {
+                self.fixed_array_vars.insert(param.name.name.clone());
             }
         }
     }
@@ -915,15 +933,12 @@ impl CGenerator {
         use crate::parser::TypeKind;
 
         match &param.ty.kind {
-            TypeKind::Array {
-                element: _,
-                size: _,
-            } => {
-                // Arrays decay to pointers in function params
+            TypeKind::Array { element: _, size } => {
+                // Fixed-size arrays decay to pointers in function params
+                // No companion _len needed since the size is known at compile time
                 let base = self.type_to_c_base(&param.ty);
                 self.write(&format!("const {}* {}", base, param.name.name));
-                // Also emit a length parameter
-                self.write(&format!(", size_t {}_len", param.name.name));
+                let _ = size;
             }
             TypeKind::Slice { element } => {
                 // Slice: pointer + length
@@ -945,9 +960,9 @@ impl CGenerator {
                     self.write(&format!(", size_t {}_len", param.name.name));
                 }
                 TypeKind::Array { element, size } => {
+                    // Fixed-size array ref: no companion _len needed
                     let elem_ty = self.type_to_c(element);
                     self.write(&format!("{}* {}", elem_ty, param.name.name));
-                    self.write(&format!(", size_t {}_len", param.name.name));
                     let _ = size;
                 }
                 TypeKind::Named(ident) => {
@@ -965,9 +980,9 @@ impl CGenerator {
                     self.write(&format!(", size_t {}_len", param.name.name));
                 }
                 TypeKind::Array { element, size } => {
+                    // Fixed-size array ref: no companion _len needed
                     let elem_ty = self.type_to_c(element);
                     self.write(&format!("const {}* {}", elem_ty, param.name.name));
-                    self.write(&format!(", size_t {}_len", param.name.name));
                     let _ = size;
                 }
                 TypeKind::Named(ident) => {
@@ -1298,9 +1313,9 @@ impl CGenerator {
                     }
                     self.write(";\n");
 
-                    // Emit a companion length variable
-                    self.writeln(&format!("size_t {}_len = {};", name.name, size));
-                    self.slice_vars.insert(name.name.clone());
+                    // Fixed-size arrays don't need a companion _len variable
+                    // since the size is known at compile time
+                    self.fixed_array_vars.insert(name.name.clone());
                     let _ = element;
                 }
                 TypeKind::Slice { element } => {
@@ -1331,7 +1346,7 @@ impl CGenerator {
                 TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
                     // Reference types become pointers
                     match &inner.kind {
-                        TypeKind::Slice { element } | TypeKind::Array { element, .. } => {
+                        TypeKind::Slice { element } => {
                             let elem_ty = self.type_to_c(element);
                             self.write_indent();
                             if matches!(ty.kind, crate::parser::TypeKind::Ref(_)) {
@@ -1345,9 +1360,25 @@ impl CGenerator {
                                 self.write(" = NULL");
                             }
                             self.write(";\n");
-                            // Length companion
+                            // Length companion for slices
                             self.writeln(&format!("size_t {}_len = 0;", name.name));
                             self.slice_vars.insert(name.name.clone());
+                        }
+                        TypeKind::Array { element, .. } => {
+                            // Reference to fixed-size array: pointer, no _len needed
+                            let elem_ty = self.type_to_c(element);
+                            self.write_indent();
+                            if matches!(ty.kind, crate::parser::TypeKind::Ref(_)) {
+                                self.write("const ");
+                            }
+                            self.write(&format!("{}* {}", elem_ty, name.name));
+                            if let Some(init) = init {
+                                self.write(" = ");
+                                self.generate_expr(init);
+                            } else {
+                                self.write(" = NULL");
+                            }
+                            self.write(";\n");
                         }
                         TypeKind::Named(ident) => {
                             self.write_indent();
@@ -1970,8 +2001,14 @@ impl CGenerator {
             }
             ExprKind::Ref(inner) => {
                 // & in C: take address
-                // But for arrays, the name is already a pointer
+                // But for fixed-size arrays, the name already decays to a pointer
                 match &inner.kind {
+                    ExprKind::Ident(ident)
+                        if self.fixed_array_vars.contains(&ident.name)
+                            || self.slice_vars.contains(&ident.name) =>
+                    {
+                        self.generate_expr(inner);
+                    }
                     ExprKind::Ident(_) | ExprKind::Field { .. } => {
                         self.write("&");
                         self.generate_expr(inner);
@@ -1983,7 +2020,14 @@ impl CGenerator {
             }
             ExprKind::MutRef(inner) => {
                 // &mut in C: take address (same as &)
+                // But for fixed-size arrays, the name already decays to a pointer
                 match &inner.kind {
+                    ExprKind::Ident(ident)
+                        if self.fixed_array_vars.contains(&ident.name)
+                            || self.slice_vars.contains(&ident.name) =>
+                    {
+                        self.generate_expr(inner);
+                    }
                     ExprKind::Ident(_) | ExprKind::Field { .. } => {
                         self.write("&");
                         self.generate_expr(inner);
@@ -2154,7 +2198,15 @@ impl CGenerator {
     fn generate_array_len_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Ident(ident) => {
-                self.write(&format!("{}_len", ident.name));
+                if self.fixed_array_vars.contains(&ident.name) {
+                    // Fixed-size array: use sizeof to compute length
+                    self.write(&format!(
+                        "sizeof({}) / sizeof({}[0])",
+                        ident.name, ident.name
+                    ));
+                } else {
+                    self.write(&format!("{}_len", ident.name));
+                }
             }
             ExprKind::Bytes(s) => {
                 self.write(&format!("{}", s.len()));
