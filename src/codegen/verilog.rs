@@ -681,8 +681,15 @@ impl VerilogGenerator {
             self.indent();
 
             // Declare parameters
+            let has_params = !func.params.is_empty();
             for param in &func.params {
                 self.generate_param_decl(param, false);
+            }
+
+            // Verilog functions must have at least one input port
+            if !has_params {
+                self.writeln("input __dummy;");
+                self.declare_var("__dummy");
             }
 
             // Pre-scan for local variable declarations
@@ -824,6 +831,7 @@ impl VerilogGenerator {
             }
             self.indent();
             // Emit minimal params
+            let has_params = !func.params.is_empty();
             for param in &func.params {
                 let bits = self.type_bit_width(&param.ty);
                 if bits > 1 {
@@ -831,6 +839,10 @@ impl VerilogGenerator {
                 } else {
                     self.writeln(&format!("input {};", param.name.name));
                 }
+            }
+            // Verilog functions must have at least one input port
+            if !has_params {
+                self.writeln("input __dummy;");
             }
             self.writeln("begin");
             self.writeln(&format!("  {} = 0; // Stubbed", func.name.name));
@@ -875,82 +887,141 @@ impl VerilogGenerator {
             }
             TypeKind::MutRef(inner) => {
                 // Mutable ref: use inout
-                match &inner.kind {
-                    TypeKind::Primitive(p) => {
-                        let bits = p.to_native().bit_width();
-                        if bits == 1 {
-                            self.writeln(&format!("inout {};", param.name.name));
-                        } else {
-                            self.writeln(&format!("inout [{}:0] {};", bits - 1, param.name.name));
-                        }
-                    }
-                    TypeKind::Array { element, size } => {
-                        let elem_bits = self.type_bit_width(element);
-                        let total_bits = (elem_bits as u64) * size;
-                        self.writeln(&format!(
-                            "inout [{}:0] {};",
-                            total_bits - 1,
-                            param.name.name
-                        ));
-                        self.array_sizes.insert(param.name.name.clone(), *size);
-                    }
-                    TypeKind::Named(ident) => {
-                        // Struct ref: flatten fields
-                        if let Some(fields) = self.struct_defs.get(&ident.name).cloned() {
-                            for field in &fields {
-                                let field_bits = self.type_bit_width(&field.ty);
-                                let field_name = format!("{}_{}", param.name.name, field.name);
-                                if Self::is_array_type(&field.ty) {
-                                    if let Some(sz) = Self::get_array_size(&field.ty) {
-                                        self.writeln(&format!(
-                                            "inout [{}:0] {};",
-                                            field_bits - 1,
-                                            field_name
-                                        ));
-                                        self.array_sizes.insert(field_name.clone(), sz);
-                                        self.struct_field_array_sizes
-                                            .insert(field_name.clone(), sz);
-                                    }
-                                } else if field_bits == 1 {
-                                    self.writeln(&format!("inout {};", field_name));
-                                } else {
+                // Resolve SelfType to current struct name
+                let resolved_inner = if matches!(&inner.kind, TypeKind::SelfType) {
+                    self.current_struct_name.clone()
+                } else if let TypeKind::Named(ident) = &inner.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
+
+                if let Some(struct_name) = resolved_inner {
+                    // Struct ref: flatten fields
+                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
+                        for field in &fields {
+                            let field_bits = self.type_bit_width(&field.ty);
+                            let field_name = format!("{}_{}", param.name.name, field.name);
+                            if Self::is_array_type(&field.ty) {
+                                if let Some(sz) = Self::get_array_size(&field.ty) {
                                     self.writeln(&format!(
                                         "inout [{}:0] {};",
                                         field_bits - 1,
                                         field_name
                                     ));
+                                    self.array_sizes.insert(field_name.clone(), sz);
+                                    self.struct_field_array_sizes.insert(field_name.clone(), sz);
                                 }
+                            } else if field_bits == 1 {
+                                self.writeln(&format!("inout {};", field_name));
+                            } else {
+                                self.writeln(&format!(
+                                    "inout [{}:0] {};",
+                                    field_bits - 1,
+                                    field_name
+                                ));
                             }
-                            self.var_types
-                                .insert(param.name.name.clone(), ident.name.clone());
-                        } else {
+                        }
+                        self.var_types
+                            .insert(param.name.name.clone(), struct_name.clone());
+                    } else {
+                        self.writeln(&format!("inout [31:0] {};", param.name.name));
+                    }
+                } else {
+                    match &inner.kind {
+                        TypeKind::Primitive(p) => {
+                            let bits = p.to_native().bit_width();
+                            if bits == 1 {
+                                self.writeln(&format!("inout {};", param.name.name));
+                            } else {
+                                self.writeln(&format!(
+                                    "inout [{}:0] {};",
+                                    bits - 1,
+                                    param.name.name
+                                ));
+                            }
+                        }
+                        TypeKind::Array { element, size } => {
+                            let elem_bits = self.type_bit_width(element);
+                            let total_bits = (elem_bits as u64) * size;
+                            self.writeln(&format!(
+                                "inout [{}:0] {};",
+                                total_bits - 1,
+                                param.name.name
+                            ));
+                            self.array_sizes.insert(param.name.name.clone(), *size);
+                        }
+                        _ => {
                             self.writeln(&format!("inout [31:0] {};", param.name.name));
                         }
-                    }
-                    _ => {
-                        self.writeln(&format!("inout [31:0] {};", param.name.name));
                     }
                 }
             }
             TypeKind::Ref(inner) => {
                 // Immutable ref
-                match &inner.kind {
-                    TypeKind::Array { element, size } => {
-                        let elem_bits = self.type_bit_width(element);
-                        let total_bits = (elem_bits as u64) * size;
-                        self.writeln(&format!(
-                            "input [{}:0] {};",
-                            total_bits - 1,
-                            param.name.name
-                        ));
-                        self.array_sizes.insert(param.name.name.clone(), *size);
+                // Resolve SelfType to current struct name
+                let resolved_struct = if matches!(&inner.kind, TypeKind::SelfType) {
+                    self.current_struct_name.clone()
+                } else if let TypeKind::Named(ident) = &inner.kind {
+                    Some(ident.name.clone())
+                } else {
+                    None
+                };
+
+                if let Some(struct_name) = resolved_struct {
+                    // Struct ref: flatten fields as input
+                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
+                        for field in &fields {
+                            let field_bits = self.type_bit_width(&field.ty);
+                            let field_name = format!("{}_{}", param.name.name, field.name);
+                            if Self::is_array_type(&field.ty) {
+                                if let Some(sz) = Self::get_array_size(&field.ty) {
+                                    self.writeln(&format!(
+                                        "input [{}:0] {};",
+                                        field_bits - 1,
+                                        field_name
+                                    ));
+                                    self.array_sizes.insert(field_name.clone(), sz);
+                                    self.struct_field_array_sizes.insert(field_name.clone(), sz);
+                                }
+                            } else if field_bits == 1 {
+                                self.writeln(&format!("input {};", field_name));
+                            } else {
+                                self.writeln(&format!(
+                                    "input [{}:0] {};",
+                                    field_bits - 1,
+                                    field_name
+                                ));
+                            }
+                        }
+                        self.var_types
+                            .insert(param.name.name.clone(), struct_name.clone());
+                    } else {
+                        self.writeln(&format!("input [31:0] {};", param.name.name));
                     }
-                    _ => {
-                        let bits = self.type_bit_width(inner);
-                        if bits == 1 {
-                            self.writeln(&format!("input {};", param.name.name));
-                        } else {
-                            self.writeln(&format!("input [{}:0] {};", bits - 1, param.name.name));
+                } else {
+                    match &inner.kind {
+                        TypeKind::Array { element, size } => {
+                            let elem_bits = self.type_bit_width(element);
+                            let total_bits = (elem_bits as u64) * size;
+                            self.writeln(&format!(
+                                "input [{}:0] {};",
+                                total_bits - 1,
+                                param.name.name
+                            ));
+                            self.array_sizes.insert(param.name.name.clone(), *size);
+                        }
+                        _ => {
+                            let bits = self.type_bit_width(inner);
+                            if bits == 1 {
+                                self.writeln(&format!("input {};", param.name.name));
+                            } else {
+                                self.writeln(&format!(
+                                    "input [{}:0] {};",
+                                    bits - 1,
+                                    param.name.name
+                                ));
+                            }
                         }
                     }
                 }
@@ -983,6 +1054,42 @@ impl VerilogGenerator {
                     self.writeln(&format!("input [31:0] {};", param.name.name));
                 }
             }
+            TypeKind::SelfType => {
+                // Bare SelfType: resolve to current struct and flatten as input
+                if let Some(struct_name) = self.current_struct_name.clone() {
+                    if let Some(fields) = self.struct_defs.get(&struct_name).cloned() {
+                        for field in &fields {
+                            let field_bits = self.type_bit_width(&field.ty);
+                            let field_name = format!("{}_{}", param.name.name, field.name);
+                            if Self::is_array_type(&field.ty) {
+                                if let Some(sz) = Self::get_array_size(&field.ty) {
+                                    self.writeln(&format!(
+                                        "input [{}:0] {};",
+                                        field_bits - 1,
+                                        field_name
+                                    ));
+                                    self.array_sizes.insert(field_name.clone(), sz);
+                                    self.struct_field_array_sizes.insert(field_name.clone(), sz);
+                                }
+                            } else if field_bits == 1 {
+                                self.writeln(&format!("input {};", field_name));
+                            } else {
+                                self.writeln(&format!(
+                                    "input [{}:0] {};",
+                                    field_bits - 1,
+                                    field_name
+                                ));
+                            }
+                        }
+                        self.var_types
+                            .insert(param.name.name.clone(), struct_name.clone());
+                    } else {
+                        self.writeln(&format!("input [31:0] {};", param.name.name));
+                    }
+                } else {
+                    self.writeln(&format!("input [31:0] {};", param.name.name));
+                }
+            }
             _ => {
                 self.writeln(&format!("input [31:0] {};", param.name.name));
             }
@@ -1003,6 +1110,47 @@ impl VerilogGenerator {
                 }
             }
             _ => "[31:0]".to_string(),
+        }
+    }
+
+    /// Find the name of the local struct variable in a constructor body.
+    /// Constructors typically have `let mut varname: StructType;` and then `return varname;`.
+    fn find_constructor_local_var(&self, block: &Block, struct_name: &str) -> Option<String> {
+        for stmt in &block.stmts {
+            if let StmtKind::Let { name, ty, .. } = &stmt.kind
+                && let Some(ty) = ty
+                && let TypeKind::Named(ident) = &ty.kind
+                && ident.name == struct_name
+            {
+                return Some(name.name.clone());
+            }
+        }
+        None
+    }
+
+    /// Generate struct field declarations as inout parameters for a task.
+    /// Used for constructors that return Self, where struct fields become inout params.
+    fn generate_struct_inout_params(&mut self, param_prefix: &str, struct_name: &str) {
+        if let Some(fields) = self.struct_defs.get(struct_name).cloned() {
+            for field in &fields {
+                let field_bits = self.type_bit_width(&field.ty);
+                let field_name = format!("{}_{}", param_prefix, field.name);
+                if Self::is_array_type(&field.ty) {
+                    if let Some(sz) = Self::get_array_size(&field.ty) {
+                        self.writeln(&format!("inout [{}:0] {};", field_bits - 1, field_name));
+                        self.array_sizes.insert(field_name.clone(), sz);
+                        self.struct_field_array_sizes.insert(field_name.clone(), sz);
+                    }
+                } else if field_bits == 1 {
+                    self.writeln(&format!("inout {};", field_name));
+                } else {
+                    self.writeln(&format!("inout [{}:0] {};", field_bits - 1, field_name));
+                }
+                self.declare_var(&field_name);
+            }
+            self.var_types
+                .insert(param_prefix.to_string(), struct_name.to_string());
+            self.declare_var(param_prefix);
         }
     }
 
@@ -1027,18 +1175,52 @@ impl VerilogGenerator {
         self.generated_functions.insert(mangled_name.clone());
         self.current_struct_name = Some(struct_name.to_string());
 
-        if let Some(ret_ty) = func.return_type.as_ref() {
+        // Check if this is a static constructor returning Self
+        let is_self_return = func.return_type.as_ref().is_some_and(|rt| {
+            matches!(&rt.kind, TypeKind::SelfType)
+                || matches!(&rt.kind, TypeKind::Named(ident) if ident.name == "Self")
+        });
+        let is_static_constructor = func.is_static && is_self_return;
+
+        if is_static_constructor {
+            // Static constructor returning Self -> generate as task with inout struct fields.
+            // Find the local struct variable name used in the body (e.g., "state").
+            let local_var_name = self
+                .find_constructor_local_var(&func.body, struct_name)
+                .unwrap_or_else(|| "self".to_string());
+
+            self.current_function_name = None;
+            self.known_tasks.insert(mangled_name.clone());
+            self.write_indent();
+            self.write(&format!("task {};\n", mangled_name));
+            self.indent();
+
+            // Generate the struct fields as inout parameters using the local var name as prefix
+            self.generate_struct_inout_params(&local_var_name, struct_name);
+
+            // Generate remaining params (beyond self, if any)
+            for param in &func.params {
+                self.generate_param_decl(param, false);
+            }
+
+            // Pre-scan for local variable declarations
+            // The local struct variable is already declared as params, so scan_stmt_vars
+            // will skip it because the fields are already declared.
+            self.generate_block_var_declarations(&func.body);
+
+            self.writeln("begin");
+            self.indent();
+            self.generate_block(&func.body);
+            self.dedent();
+            self.writeln("end");
+
+            self.dedent();
+            self.writeln("endtask");
+        } else if let Some(ret_ty) = func.return_type.as_ref() {
             // Generate as function
             self.current_function_name = Some(mangled_name.clone());
 
-            // Check if return type is Self - resolve to struct_name
-            let ret_width = if matches!(&ret_ty.kind, TypeKind::SelfType) {
-                // For Self return type, check if struct has fields that would make it too wide
-                // For now, use a dummy
-                "[31:0]".to_string()
-            } else {
-                self.return_type_width(ret_ty)
-            };
+            let ret_width = self.return_type_width(ret_ty);
 
             self.write_indent();
             if ret_width.is_empty() {
@@ -1048,8 +1230,16 @@ impl VerilogGenerator {
             }
             self.indent();
 
+            // Check if function has zero parameters - Verilog requires at least one input
+            let has_params = !func.params.is_empty();
+
             for param in &func.params {
                 self.generate_param_decl(param, false);
+            }
+
+            if !has_params {
+                self.writeln("input __dummy;");
+                self.declare_var("__dummy");
             }
 
             self.generate_block_var_declarations(&func.body);
@@ -1390,18 +1580,68 @@ impl VerilogGenerator {
                         return;
                     }
 
-                    // Named struct type with factory call
+                    // Named struct type with factory call (Call variant)
                     if let Some(ty) = ty
-                        && let TypeKind::Named(_) = &ty.kind
+                        && let TypeKind::Named(type_ident) = &ty.kind
                         && let ExprKind::Call { func, .. } = &init.kind
                         && let ExprKind::Ident(func_ident) = &func.kind
                         && func_ident.name.contains("__new")
                     {
-                        // Static factory: handled by the task/function call
-                        self.write_indent();
-                        self.write("// struct init: ");
-                        self.write(&name.name);
-                        self.write("\n");
+                        if self.known_tasks.contains(&func_ident.name) {
+                            // Constructor is a task: call it with flattened struct fields
+                            self.write_indent();
+                            self.write(&format!("{}(", func_ident.name));
+                            self.generate_struct_call_args_flat(&name.name, &type_ident.name, &[]);
+                            self.write(");\n");
+                        } else {
+                            self.write_indent();
+                            self.write("// struct init: ");
+                            self.write(&name.name);
+                            self.write("\n");
+                        }
+                        return;
+                    }
+
+                    // Named struct type with factory call (TypeStaticCall variant)
+                    if let ExprKind::TypeStaticCall {
+                        type_name,
+                        method_name,
+                        args: call_args,
+                    } = &init.kind
+                    {
+                        let mangled = format!("{}__{}", type_name.name, method_name.name);
+                        if self.known_tasks.contains(&mangled) {
+                            // Constructor is a task: call it with flattened struct fields
+                            self.write_indent();
+                            self.write(&format!("{}(", mangled));
+                            self.generate_struct_call_args_flat(
+                                &name.name,
+                                &type_name.name,
+                                call_args,
+                            );
+                            self.write(");\n");
+                        } else if self.stubbed_functions.contains(&mangled) {
+                            // Stubbed constructor: just initialize to defaults
+                            self.write_indent();
+                            self.write("// struct init (stubbed): ");
+                            self.write(&name.name);
+                            self.write("\n");
+                        } else {
+                            // Function constructor: call it
+                            self.write_indent();
+                            self.write(&format!("{} = {}(", name.name, mangled));
+                            for (i, arg) in call_args.iter().enumerate() {
+                                if i > 0 {
+                                    self.write(", ");
+                                }
+                                self.generate_expr(arg);
+                            }
+                            // Add dummy arg for zero-arg functions
+                            if call_args.is_empty() {
+                                self.write("0");
+                            }
+                            self.write(");\n");
+                        }
                         return;
                     }
 
@@ -1578,13 +1818,20 @@ impl VerilogGenerator {
             StmtKind::Return(expr) => {
                 self.write_indent();
                 if let Some(expr) = expr {
-                    let func_name = self
-                        .current_function_name
-                        .clone()
-                        .unwrap_or_else(|| "__func_result".to_string());
-                    self.write(&format!("{} = ", func_name));
-                    self.generate_expr(expr);
-                    self.write(";\n");
+                    if let Some(func_name) = self.current_function_name.clone() {
+                        // In a function: assign to function name (Verilog return convention)
+                        self.write(&format!("{} = ", func_name));
+                        self.generate_expr(expr);
+                        self.write(";\n");
+                    } else if let ExprKind::Ident(ident) = &expr.kind
+                        && self.var_types.contains_key(&ident.name)
+                    {
+                        // In a task returning a struct variable (constructor-as-task):
+                        // the struct fields are already written via inout params, so no-op
+                        self.write("// return via inout params\n");
+                    } else {
+                        self.write("// return (task)\n");
+                    }
                 } else {
                     self.write("// return void\n");
                 }
@@ -1860,15 +2107,25 @@ impl VerilogGenerator {
                 method_name,
                 args,
             } => {
-                self.write(&format!("{}__{}", type_name.name, method_name.name));
-                self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
+                let mangled = format!("{}__{}", type_name.name, method_name.name);
+                if self.stubbed_functions.contains(&mangled) {
+                    // Stubbed: just emit 0
+                    self.write("0 /* stubbed */");
+                } else {
+                    self.write(&format!("{}(", mangled));
+                    if args.is_empty() && !self.known_tasks.contains(&mangled) {
+                        // Zero-arg function: pass dummy argument
+                        self.write("0");
+                    } else {
+                        for (i, arg) in args.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_expr(arg);
+                        }
                     }
-                    self.generate_expr(arg);
+                    self.write(")");
                 }
-                self.write(")");
             }
             ExprKind::GenericCall { func, args, .. } => {
                 self.generate_expr(func);
@@ -2004,6 +2261,17 @@ impl VerilogGenerator {
                 self.generate_expr(arg);
             }
         }
+    }
+
+    /// Generate arguments for calling a task/function that takes struct fields,
+    /// with additional expression args.
+    fn generate_struct_call_args_flat(
+        &mut self,
+        var_name: &str,
+        struct_name: &str,
+        extra_args: &[Expr],
+    ) {
+        self.generate_struct_call_args(var_name, struct_name, extra_args);
     }
 
     /// Generate .len() expression
@@ -2397,6 +2665,16 @@ impl CodeGenerator for VerilogGenerator {
                         // Check if it's a void function (task)
                         if method.return_type.is_none() {
                             self.known_tasks.insert(mangled);
+                        }
+                        // Static constructors returning Self become tasks
+                        if method.is_static
+                            && method.return_type.as_ref().is_some_and(|rt| {
+                                matches!(&rt.kind, TypeKind::SelfType)
+                                    || matches!(&rt.kind, TypeKind::Named(ident) if ident.name == "Self")
+                            })
+                        {
+                            self.known_tasks
+                                .insert(format!("{}__{}", impl_def.target.name, method.name.name));
                         }
                     }
                     self.struct_methods

@@ -354,13 +354,16 @@ impl VhdlGenerator {
     }
 
     fn integer_literal(n: u128, bits: u32) -> String {
-        if bits <= 32 {
+        // GHDL's integer range is limited to 32-bit signed (-2^31 to 2^31-1).
+        // Values >= 2^31 overflow to_unsigned(), so use hex literals instead.
+        const GHDL_INT_MAX: u128 = 0x7FFF_FFFF; // 2^31 - 1
+        if n <= GHDL_INT_MAX && bits <= 32 {
             format!("to_unsigned({}, {})", n, bits)
-        } else if bits <= 64 {
-            // VHDL integer range is limited, use hex string
-            format!("unsigned'(x\"{:016X}\")", n)
         } else {
-            format!("unsigned'(x\"{:032X}\")", n)
+            // Use unsigned'(x"...") hex literal syntax.
+            // The hex string length must match bits/4 (round up to multiple of 4).
+            let hex_digits = bits.div_ceil(4) as usize;
+            format!("unsigned'(x\"{:0>width$X}\")", n, width = hex_digits)
         }
     }
 }
