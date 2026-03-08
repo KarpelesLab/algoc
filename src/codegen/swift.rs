@@ -53,6 +53,8 @@ pub struct SwiftGenerator {
     func_param_info: HashMap<String, Vec<FuncParamInfo>>,
     /// Current struct name for resolving SelfType (set during method/function generation)
     current_struct_name: Option<String>,
+    /// Array element types for variables (e.g. "input" -> "UInt8" when input: [UInt8])
+    var_array_elem_types: HashMap<String, String>,
 }
 
 impl SwiftGenerator {
@@ -68,6 +70,7 @@ impl SwiftGenerator {
             inout_params: std::collections::HashSet::new(),
             func_param_info: HashMap::new(),
             current_struct_name: None,
+            var_array_elem_types: HashMap::new(),
         }
     }
 
@@ -469,12 +472,17 @@ impl SwiftGenerator {
         self.inout_params.clear();
         let saved_var_types = self.var_types.clone();
         let saved_prim_types = self.var_prim_types.clone();
+        let saved_array_elem_types = self.var_array_elem_types.clone();
 
         // Track parameter types for secure_zero detection and type casting
         for param in &func.params {
             Self::track_param_type(&param.ty, &param.name.name, &mut self.var_types);
             if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
                 self.var_prim_types.insert(param.name.name.clone(), *p);
+            }
+            if let Some(elem_prim) = Self::extract_array_element_prim_type(&param.ty) {
+                self.var_array_elem_types
+                    .insert(param.name.name.clone(), elem_prim);
             }
         }
 
@@ -524,6 +532,7 @@ impl SwiftGenerator {
         self.writeln("");
         self.var_types = saved_var_types;
         self.var_prim_types = saved_prim_types;
+        self.var_array_elem_types = saved_array_elem_types;
         self.current_struct_name = None;
     }
 
@@ -547,8 +556,53 @@ impl SwiftGenerator {
             Self::swift_safe_ident(&c.name.name),
             type_str
         ));
-        self.generate_expr(&c.value);
+        // For large array constants, check if all elements are
+        // identical (use `repeating:count:`) or fall back to chunked
+        // generation with the declared element type.
+        let elem_type_hint = self.get_array_element_type(&c.ty);
+        if let Some(ref hint) = elem_type_hint
+            && let ExprKind::Array(elements) = &c.value.kind
+            && elements.len() > 16
+        {
+            if let Some((_, val_str)) = array_all_same_value(elements) {
+                self.write(&format!(
+                    "[{}](repeating: {}, count: {})",
+                    hint,
+                    val_str,
+                    elements.len()
+                ));
+            } else if elements.len() > 32 {
+                self.generate_chunked_array(elements, hint);
+            } else {
+                self.generate_expr(&c.value);
+            }
+        } else {
+            self.generate_expr(&c.value);
+        }
         self.write("\n\n");
+    }
+
+    /// Generate a large array literal split into chunks for faster
+    /// Swift type checking, using the provided element type.
+    fn generate_chunked_array(&mut self, elements: &[Expr], elem_type: &str) {
+        let chunk_size = 16;
+        self.write(&format!(
+            "{{ () -> [{}] in var __a: [{}] = [{}](); ",
+            elem_type, elem_type, elem_type
+        ));
+        for chunk in elements.chunks(chunk_size) {
+            self.write("__a += [");
+            for (i, elem) in chunk.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.generate_expr(elem);
+            }
+            self.write("] as [");
+            self.write(elem_type);
+            self.write("]; ");
+        }
+        self.write("return __a }()");
     }
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
@@ -687,12 +741,17 @@ impl SwiftGenerator {
         self.inout_params.clear();
         let saved_var_types = self.var_types.clone();
         let saved_prim_types = self.var_prim_types.clone();
+        let saved_array_elem_types = self.var_array_elem_types.clone();
 
         // Track parameter types for secure_zero detection and type casting
         for param in &func.params {
             Self::track_param_type(&param.ty, &param.name.name, &mut self.var_types);
             if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
                 self.var_prim_types.insert(param.name.name.clone(), *p);
+            }
+            if let Some(elem_prim) = Self::extract_array_element_prim_type(&param.ty) {
+                self.var_array_elem_types
+                    .insert(param.name.name.clone(), elem_prim);
             }
         }
 
@@ -741,6 +800,7 @@ impl SwiftGenerator {
         self.writeln("");
         self.var_types = saved_var_types;
         self.var_prim_types = saved_prim_types;
+        self.var_array_elem_types = saved_array_elem_types;
         self.current_struct_name = None;
     }
 
@@ -806,7 +866,13 @@ impl SwiftGenerator {
                         self.write(")");
                     } else if self.expr_may_need_uint_conversion(arg, target_type) {
                         // UInt type mismatch conversion (e.g. UInt32 -> UInt8)
-                        self.write(&format!("{}(truncatingIfNeeded: ", target_type));
+                        let inferred = self.infer_swift_int_type(arg);
+                        let label = if self.is_widening_cast(&inferred, target_type) {
+                            ""
+                        } else {
+                            "truncatingIfNeeded: "
+                        };
+                        self.write(&format!("{}({}", target_type, label));
                         self.generate_expr(arg);
                         self.write(")");
                     } else {
@@ -824,11 +890,17 @@ impl SwiftGenerator {
     /// method calls, casts to a different type, and variables with a known different type.
     fn expr_may_need_uint_conversion(&self, expr: &Expr, target_type: &str) -> bool {
         match &expr.kind {
-            // Function calls may return a different UInt type
+            // Function calls: check if the inferred return type matches
             ExprKind::Call { .. }
             | ExprKind::MethodCall { .. }
             | ExprKind::TypeStaticCall { .. }
-            | ExprKind::GenericCall { .. } => true,
+            | ExprKind::GenericCall { .. } => {
+                if let Some(inferred) = self.infer_swift_int_type(expr) {
+                    inferred != target_type
+                } else {
+                    true
+                }
+            }
             // Casts produce their target type - check if it differs
             ExprKind::Cast { ty, .. } => {
                 let cast_type = self.swift_type(ty);
@@ -838,14 +910,32 @@ impl SwiftGenerator {
                         || cast_type == "UInt32"
                         || cast_type == "UInt64")
             }
-            // Binary operations may produce a type that differs
-            ExprKind::Binary { .. } => true,
+            // Binary operations: check if the inferred result type matches
+            ExprKind::Binary { .. } => {
+                if let Some(inferred) = self.infer_swift_int_type(expr) {
+                    inferred != target_type
+                } else {
+                    true
+                }
+            }
             // Parenthesized - check inner
             ExprKind::Paren(inner) => self.expr_may_need_uint_conversion(inner, target_type),
-            // Array index may return a different element type
-            ExprKind::Index { .. } => true,
-            // Struct field access may return a different type
-            ExprKind::Field { .. } => true,
+            // Array index: check if the element type matches the target
+            ExprKind::Index { .. } => {
+                if let Some(inferred) = self.infer_swift_int_type(expr) {
+                    inferred != target_type
+                } else {
+                    true
+                }
+            }
+            // Struct field access: check if the field type matches the target
+            ExprKind::Field { .. } => {
+                if let Some(inferred) = self.infer_swift_int_type(expr) {
+                    inferred != target_type
+                } else {
+                    true
+                }
+            }
             _ => false,
         }
     }
@@ -892,6 +982,35 @@ impl SwiftGenerator {
         }
     }
 
+    /// Extract the Swift element type name for an array/slice parameter type.
+    /// Returns the Swift type string (e.g. "UInt8", "UInt32") if the type
+    /// is an array/slice of a primitive, or None otherwise.
+    fn extract_array_element_prim_type(ty: &ParserType) -> Option<String> {
+        use crate::parser::TypeKind;
+        let elem = match &ty.kind {
+            TypeKind::Array { element, .. }
+            | TypeKind::Slice { element }
+            | TypeKind::ArrayRef { element, .. } => element,
+            TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                return Self::extract_array_element_prim_type(inner);
+            }
+            _ => return None,
+        };
+        if let TypeKind::Primitive(p) = &elem.kind {
+            use crate::parser::PrimitiveType;
+            let swift = match p.to_native() {
+                PrimitiveType::U8 | PrimitiveType::I8 => "UInt8",
+                PrimitiveType::U16 | PrimitiveType::I16 => "UInt16",
+                PrimitiveType::U32 | PrimitiveType::I32 => "UInt32",
+                PrimitiveType::U64 | PrimitiveType::I64 => "UInt64",
+                _ => return None,
+            };
+            Some(swift.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Get the inner type of a reference/mutable reference type
     fn swift_inner_type(&self, ty: &ParserType) -> String {
         use crate::parser::TypeKind;
@@ -929,6 +1048,36 @@ impl SwiftGenerator {
                     && let crate::parser::TypeKind::Primitive(p) = &ty.kind
                 {
                     self.var_prim_types.insert(name.name.clone(), *p);
+                }
+
+                // Track array element types for index expression type inference
+                if let Some(ty) = ty
+                    && let Some(elem) = Self::extract_array_element_prim_type(ty)
+                {
+                    self.var_array_elem_types.insert(name.name.clone(), elem);
+                }
+
+                // Infer primitive type from the init expression when
+                // no explicit type annotation is present. This avoids
+                // unnecessary truncatingIfNeeded casts in binary
+                // expressions where one side is a variable initialized
+                // from a known-type expression.
+                if (ty.is_none()
+                    || !matches!(
+                        &ty.as_ref().unwrap().kind,
+                        crate::parser::TypeKind::Primitive(_)
+                    ))
+                    && let Some(init_expr) = init
+                    && let Some(inferred) = self.infer_swift_int_type(init_expr)
+                {
+                    let prim = match inferred.as_str() {
+                        "UInt8" => crate::parser::PrimitiveType::U8,
+                        "UInt16" => crate::parser::PrimitiveType::U16,
+                        "UInt32" => crate::parser::PrimitiveType::U32,
+                        "UInt64" => crate::parser::PrimitiveType::U64,
+                        _ => crate::parser::PrimitiveType::U32,
+                    };
+                    self.var_prim_types.insert(name.name.clone(), prim);
                 }
 
                 // Also infer type from static method calls like TypeName__new()
@@ -982,6 +1131,35 @@ impl SwiftGenerator {
                         } else {
                             self.generate_expr(init);
                         }
+                    } else if let Some(declared_ty) = ty
+                        && let ExprKind::Array(elements) = &init.kind
+                        && elements.len() > 16
+                    {
+                        // For large array literal initializers, first
+                        // check if all elements are the same value and
+                        // use `repeating:count:` which is the fastest
+                        // for the Swift type checker. Otherwise fall
+                        // back to chunked generation with the declared
+                        // element type.
+                        if let Some((_, val_str)) = array_all_same_value(elements) {
+                            let declared_elem = self.get_array_element_type(declared_ty);
+                            let elem_type = declared_elem.unwrap_or_else(|| "UInt8".to_string());
+                            self.write(&format!(
+                                "[{}](repeating: {}, count: {})",
+                                elem_type,
+                                val_str,
+                                elements.len()
+                            ));
+                        } else if elements.len() > 32 {
+                            let declared_elem = self.get_array_element_type(declared_ty);
+                            if let Some(elem_type) = declared_elem {
+                                self.generate_chunked_array(elements, &elem_type);
+                            } else {
+                                self.generate_expr(init);
+                            }
+                        } else {
+                            self.generate_expr(init);
+                        }
                     } else {
                         self.generate_expr(init);
                     }
@@ -1006,17 +1184,22 @@ impl SwiftGenerator {
                     if endian != crate::parser::Endianness::Native
                         && let ExprKind::Slice { array, start, .. } = &inner.kind
                     {
-                        // Generate endian write into byte slice
+                        // Generate endian write into byte slice.
+                        // Each assignment is on its own line to reduce
+                        // type-checker pressure in Swift.
                         let little_endian = endian == crate::parser::Endianness::Little;
                         let native = p.to_native();
-                        self.write_indent();
-                        self.write("do { var __val = ");
+                        self.writeln("do {");
+                        self.indent();
                         // Cast value to appropriate type
                         let cast_type = self.swift_cast_type(native);
-                        self.write(&format!("{}(truncatingIfNeeded: ", cast_type));
+                        self.write_indent();
+                        self.write(&format!(
+                            "let __val: {} = {}(truncatingIfNeeded: ",
+                            cast_type, cast_type
+                        ));
                         self.generate_expr(value);
-                        self.write(")");
-                        self.write("; ");
+                        self.write(")\n");
 
                         let byte_count = p.bit_width() / 8;
                         for i in 0..byte_count {
@@ -1025,7 +1208,7 @@ impl SwiftGenerator {
                             } else {
                                 ((byte_count - 1) - i) * 8
                             };
-                            self.write("");
+                            self.write_indent();
                             self.generate_expr(array);
                             self.write("[Int(");
                             self.generate_expr(start);
@@ -1033,11 +1216,10 @@ impl SwiftGenerator {
                             if shift > 0 {
                                 self.write(&format!(" >> {}", shift));
                             }
-                            self.write("); ");
+                            self.write(")\n");
                         }
-                        // suppress unused variable warning
-                        self.write("_ = __val }");
-                        self.write("\n");
+                        self.dedent();
+                        self.writeln("}");
                         return;
                     }
                 }
@@ -1261,7 +1443,14 @@ impl SwiftGenerator {
                     };
                     self.write("(");
                     if let Some(ref ct) = cl {
-                        self.write(&format!("{}(truncatingIfNeeded: ", ct));
+                        // Use plain initializer for widening casts,
+                        // truncatingIfNeeded for narrowing/unknown.
+                        let label = if self.is_widening_cast(&lt, ct) {
+                            ""
+                        } else {
+                            "truncatingIfNeeded: "
+                        };
+                        self.write(&format!("{}({}", ct, label));
                         self.generate_expr(left);
                         self.write(")");
                     } else {
@@ -1269,7 +1458,12 @@ impl SwiftGenerator {
                     }
                     self.write(op_str);
                     if let Some(ref ct) = cr {
-                        self.write(&format!("{}(truncatingIfNeeded: ", ct));
+                        let label = if self.is_widening_cast(&rt, ct) {
+                            ""
+                        } else {
+                            "truncatingIfNeeded: "
+                        };
+                        self.write(&format!("{}({}", ct, label));
                         self.generate_expr(right);
                         self.write(")");
                     } else {
@@ -1522,6 +1716,43 @@ impl SwiftGenerator {
             ExprKind::Array(elements) => {
                 if elements.is_empty() {
                     self.write("[UInt8]()");
+                } else if elements.len() > 16 && array_all_same_value(elements).is_some() {
+                    // For large arrays where all elements are the same
+                    // value, use `[T](repeating:count:)` to avoid a
+                    // huge array literal that slows down the Swift
+                    // type checker.
+                    let (elem_type, val_str) = array_all_same_value(elements).unwrap();
+                    self.write(&format!(
+                        "[{}](repeating: {}, count: {})",
+                        elem_type,
+                        val_str,
+                        elements.len()
+                    ));
+                } else if elements.len() > 32 {
+                    // For large array literals with distinct values,
+                    // generate a closure that builds the array from
+                    // smaller chunks. This prevents the Swift type
+                    // checker from having to resolve all elements in
+                    // a single expression.
+                    let elem_type = infer_array_element_swift_type(elements);
+                    let chunk_size = 16;
+                    self.write(&format!(
+                        "{{ () -> [{}] in var __a: [{}] = [{}](); ",
+                        elem_type, elem_type, elem_type
+                    ));
+                    for chunk in elements.chunks(chunk_size) {
+                        self.write("__a += [");
+                        for (i, elem) in chunk.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_expr(elem);
+                        }
+                        self.write("] as [");
+                        self.write(elem_type);
+                        self.write("]; ");
+                    }
+                    self.write("return __a }()");
                 } else {
                     // Determine element type from first element
                     self.write("[");
@@ -1573,15 +1804,47 @@ impl SwiftGenerator {
                 self.write(")");
             }
             ExprKind::StructLit { name, fields } => {
-                self.write(&format!("{}(", name.name));
-                for (i, (field_name, value)) in fields.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
+                // Check if the struct literal has any large array fields
+                // or nested struct literals. These cause exponential
+                // type-checker slowdown in Swift when passed as a single
+                // expression. Generate a closure that builds the struct
+                // step by step instead.
+                let has_complex_field = fields.iter().any(|(_, v)| expr_is_complex_for_swift(v));
+                if has_complex_field {
+                    let safe_name = Self::swift_safe_ident(&name.name);
+                    // Check if all fields are default values - if so,
+                    // just use the factory function directly.
+                    let all_default = fields.iter().all(|(_, v)| expr_is_default_value(v));
+                    if all_default {
+                        self.write(&format!("create_{}()", safe_name));
+                    } else {
+                        // Collect non-default fields
+                        let non_default_fields: Vec<_> = fields
+                            .iter()
+                            .filter(|(_, v)| !expr_is_default_value(v))
+                            .collect();
+                        self.write(&format!(
+                            "{{ () -> {} in var __s: {} = create_{}()",
+                            safe_name, safe_name, safe_name
+                        ));
+                        for (field_name, value) in &non_default_fields {
+                            let safe_field = Self::swift_safe_ident(&field_name.name);
+                            self.write(&format!("; __s.{} = ", safe_field));
+                            self.generate_expr(value);
+                        }
+                        self.write("; return __s }()");
                     }
-                    self.write(&format!("{}: ", field_name.name));
-                    self.generate_expr(value);
+                } else {
+                    self.write(&format!("{}(", name.name));
+                    for (i, (field_name, value)) in fields.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.write(&format!("{}: ", field_name.name));
+                        self.generate_expr(value);
+                    }
+                    self.write(")");
                 }
-                self.write(")");
             }
             ExprKind::Conditional {
                 condition,
@@ -1878,10 +2141,15 @@ impl SwiftGenerator {
                     let cast_type = self.swift_cast_type(native);
                     let byte_count = p.bit_width() / 8;
 
-                    // Generate manual byte-to-integer conversion
-                    self.write("({ (__b: [UInt8]) -> ");
+                    // Generate byte-to-integer conversion using a
+                    // parameterless closure with explicit let binding.
+                    // This avoids closure parameter type inference and
+                    // breaks up operator chains to speed up swiftc.
+                    self.write("{ () -> ");
                     self.write(&cast_type);
-                    self.write(" in var __v: ");
+                    self.write(" in let __b: [UInt8] = ");
+                    self.generate_expr(expr);
+                    self.write("; var __v: ");
                     self.write(&cast_type);
                     self.write(" = 0; ");
 
@@ -1891,16 +2159,18 @@ impl SwiftGenerator {
                         } else {
                             ((byte_count - 1) - i) * 8
                         };
-                        self.write(&format!("__v = __v | {}(", cast_type));
-                        self.write(&format!("__b[{}])", i));
+                        // Use a temporary to avoid chaining |, <<,
+                        // and UInt32() in a single expression.
+                        self.write(&format!(
+                            "let __t{}: {} = {}(__b[{}])",
+                            i, cast_type, cast_type, i
+                        ));
                         if shift > 0 {
                             self.write(&format!(" << {}", shift));
                         }
-                        self.write("; ");
+                        self.write(&format!("; __v = __v | __t{}; ", i));
                     }
-                    self.write("return __v })(");
-                    self.generate_expr(expr);
-                    self.write(")");
+                    self.write("return __v }()");
                     return;
                 }
 
@@ -1932,9 +2202,16 @@ impl SwiftGenerator {
                 _ => "UInt32",
             };
 
+            // Use a parameterless closure with an explicit let binding
+            // to avoid closure parameter type inference overhead.
             self.write(&format!(
-                "{{ (__val: {}) -> [UInt8] in var __a = [UInt8](repeating: 0, count: {}); ",
-                source_type, byte_count
+                "{{ () -> [UInt8] in let __val: {} = {}(truncatingIfNeeded: ",
+                source_type, source_type
+            ));
+            self.generate_expr(inner_expr);
+            self.write(&format!(
+                "); var __a: [UInt8] = [UInt8](repeating: 0, count: {}); ",
+                byte_count
             ));
             for i in 0..byte_count {
                 let shift = if little_endian {
@@ -1948,11 +2225,7 @@ impl SwiftGenerator {
                 }
                 self.write("); ");
             }
-            self.write("return __a }(");
-            // Cast the source expression to the correct type
-            self.write(&format!("{}(truncatingIfNeeded: ", source_type));
-            self.generate_expr(inner_expr);
-            self.write("))");
+            self.write("return __a }()");
             return;
         }
 
@@ -1968,10 +2241,31 @@ impl SwiftGenerator {
                         self.write(" != 0)");
                     }
                     _ => {
-                        // Use truncatingIfNeeded: for safe wrapping conversion
-                        self.write(&format!("{}(truncatingIfNeeded: ", cast_type));
-                        self.generate_expr(expr);
-                        self.write(")");
+                        // For integer literals, use a direct cast (no
+                        // truncatingIfNeeded) to reduce type-checker work.
+                        if matches!(expr.kind, ExprKind::Integer(_)) {
+                            self.write(&format!("{}(", cast_type));
+                            self.generate_expr(expr);
+                            self.write(")");
+                        } else {
+                            // Check if the source type matches the target
+                            // (identity cast) - skip entirely.
+                            let inferred = self.infer_swift_int_type(expr);
+                            if inferred.as_deref() == Some(&cast_type) {
+                                // Same type - no cast needed
+                                self.generate_expr(expr);
+                            } else if self.is_widening_cast(&inferred, &cast_type) {
+                                // Widening cast (e.g. UInt8 -> UInt32) -
+                                // use plain initializer.
+                                self.write(&format!("{}(", cast_type));
+                                self.generate_expr(expr);
+                                self.write(")");
+                            } else {
+                                self.write(&format!("{}(truncatingIfNeeded: ", cast_type));
+                                self.generate_expr(expr);
+                                self.write(")");
+                            }
+                        }
                     }
                 }
             }
@@ -2112,6 +2406,30 @@ impl SwiftGenerator {
                 self.infer_swift_int_type(inner)
             }
             ExprKind::Unary { operand, .. } => self.infer_swift_int_type(operand),
+            ExprKind::Index { array, .. } => {
+                // Infer element type from the array being indexed.
+                // e.g. if `input` is `[UInt8]`, then `input[i]` is `UInt8`.
+                if let ExprKind::Ident(ident) = &array.kind {
+                    self.var_array_elem_types.get(&ident.name).cloned()
+                } else if let ExprKind::Field { object, field } = &array.kind {
+                    // Handle struct field arrays like state.data[i]
+                    if let ExprKind::Ident(obj_ident) = &object.kind
+                        && let Some(struct_name) = self.var_types.get(&obj_ident.name)
+                        && let Some(fields) = self.struct_defs.get(struct_name)
+                    {
+                        for f in fields {
+                            if f.name == field.name
+                                && let Some(elem) = Self::extract_array_element_prim_type(&f.ty)
+                            {
+                                return Some(elem);
+                            }
+                        }
+                    }
+                    None
+                } else {
+                    None
+                }
+            }
             ExprKind::Field { object, field } => {
                 if let ExprKind::Ident(obj_ident) = &object.kind
                     && let Some(struct_name) = self.var_types.get(&obj_ident.name)
@@ -2142,6 +2460,28 @@ impl SwiftGenerator {
         }
     }
 
+    /// Check if casting from the source type to the target type is widening
+    /// (no data loss), so we can use a plain initializer instead of
+    /// `truncatingIfNeeded:`.
+    fn is_widening_cast(&self, source_type: &Option<String>, target_type: &str) -> bool {
+        let rank = |t: &str| -> u8 {
+            match t {
+                "UInt8" => 1,
+                "UInt16" => 2,
+                "UInt32" => 3,
+                "UInt64" => 4,
+                _ => 0,
+            }
+        };
+        if let Some(src) = source_type {
+            let src_rank = rank(src);
+            let tgt_rank = rank(target_type);
+            src_rank > 0 && tgt_rank > 0 && src_rank < tgt_rank
+        } else {
+            false
+        }
+    }
+
     /// Return the wider of two unsigned integer type strings.
     fn wider_uint_type<'a>(&self, a: &'a str, b: &'a str) -> &'a str {
         let rank = |t: &str| -> u8 {
@@ -2154,6 +2494,133 @@ impl SwiftGenerator {
             }
         };
         if rank(a) >= rank(b) { a } else { b }
+    }
+}
+
+/// Infer the Swift element type for an array literal based on its elements.
+/// Returns "UInt8" for byte-sized values, "UInt32" for larger integers,
+/// "UInt64" for very large values.
+fn infer_array_element_swift_type(elements: &[Expr]) -> &'static str {
+    let mut max_val: u128 = 0;
+    let mut has_cast_type: Option<&'static str> = None;
+    for elem in elements {
+        match &elem.kind {
+            ExprKind::Integer(n) => {
+                if *n > max_val {
+                    max_val = *n;
+                }
+            }
+            ExprKind::Cast { ty, .. } => {
+                if let crate::parser::TypeKind::Primitive(p) = &ty.kind {
+                    use crate::parser::PrimitiveType;
+                    let t = match p.to_native() {
+                        PrimitiveType::U8 | PrimitiveType::I8 => "UInt8",
+                        PrimitiveType::U16 | PrimitiveType::I16 => "UInt16",
+                        PrimitiveType::U32 | PrimitiveType::I32 => "UInt32",
+                        PrimitiveType::U64 | PrimitiveType::I64 => "UInt64",
+                        _ => "UInt32",
+                    };
+                    has_cast_type = Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = has_cast_type {
+        return t;
+    }
+    if max_val <= 255 {
+        "UInt8"
+    } else if max_val <= 65535 {
+        "UInt16"
+    } else if max_val <= 4294967295 {
+        "UInt32"
+    } else {
+        "UInt64"
+    }
+}
+
+/// Check if all elements in an array literal are the same value.
+/// Returns `Some((swift_type, value_string))` if so, e.g. `("UInt32", "0")`.
+fn array_all_same_value(elements: &[Expr]) -> Option<(&'static str, String)> {
+    if elements.is_empty() {
+        return None;
+    }
+    // Extract the canonical integer value from the first element
+    let (first_val, first_type) = extract_array_elem_int(&elements[0])?;
+    // Check all remaining elements
+    for elem in &elements[1..] {
+        let (val, _) = extract_array_elem_int(elem)?;
+        if val != first_val {
+            return None;
+        }
+    }
+    Some((first_type, first_val.to_string()))
+}
+
+/// Extract the integer value and Swift type from an array element expression.
+/// Handles plain integers and casted integers like `0 as u32`.
+fn extract_array_elem_int(expr: &Expr) -> Option<(u128, &'static str)> {
+    match &expr.kind {
+        ExprKind::Integer(n) => {
+            // Plain integer - assume UInt8 if small, UInt32 otherwise
+            if *n <= 255 {
+                Some((*n, "UInt8"))
+            } else {
+                Some((*n, "UInt32"))
+            }
+        }
+        ExprKind::Cast { expr: inner, ty } => {
+            if let ExprKind::Integer(n) = &inner.kind
+                && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+            {
+                use crate::parser::PrimitiveType;
+                let swift_type = match p.to_native() {
+                    PrimitiveType::U8 | PrimitiveType::I8 => "UInt8",
+                    PrimitiveType::U16 | PrimitiveType::I16 => "UInt16",
+                    PrimitiveType::U32 | PrimitiveType::I32 => "UInt32",
+                    PrimitiveType::U64 | PrimitiveType::I64 => "UInt64",
+                    _ => "UInt32",
+                };
+                return Some((*n, swift_type));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Check if an expression represents a "default" value that would already
+/// be set by `create_StructName()`. This covers:
+/// - Integer literal 0
+/// - An array literal where all elements are 0 (possibly cast)
+/// - A struct literal where all fields are default
+fn expr_is_default_value(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Integer(0) => true,
+        ExprKind::Bool(false) => true,
+        ExprKind::Array(elements) => elements.iter().all(|e| {
+            matches!(&e.kind, ExprKind::Integer(0))
+                || matches!(&e.kind, ExprKind::Cast { expr: inner, .. }
+                        if matches!(&inner.kind, ExprKind::Integer(0)))
+        }),
+        ExprKind::Cast { expr: inner, .. } => matches!(&inner.kind, ExprKind::Integer(0)),
+        ExprKind::StructLit { fields, .. } => fields.iter().all(|(_, v)| expr_is_default_value(v)),
+        _ => false,
+    }
+}
+
+/// Check if an expression is complex enough to cause Swift type-checker
+/// slowdowns when embedded in a struct literal. This targets large inline
+/// array literals (> 16 elements) and nested struct literals that themselves
+/// contain complex fields.
+fn expr_is_complex_for_swift(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Array(elements) => elements.len() > 16,
+        ExprKind::StructLit { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_is_complex_for_swift(v))
+        }
+        _ => false,
     }
 }
 
@@ -2308,6 +2775,20 @@ impl CodeGenerator for SwiftGenerator {
                     }
                     self.struct_methods
                         .insert(impl_def.target.name.clone(), methods);
+                }
+                ItemKind::Const(c) => {
+                    // Track primitive types of constants so that
+                    // binary expression type matching can avoid
+                    // unnecessary truncatingIfNeeded casts.
+                    if let crate::parser::TypeKind::Primitive(p) = &c.ty.kind {
+                        self.var_prim_types.insert(c.name.name.clone(), *p);
+                    }
+                    // Track array element types of constants so that
+                    // indexing into a constant array avoids redundant
+                    // truncatingIfNeeded casts.
+                    if let Some(elem) = Self::extract_array_element_prim_type(&c.ty) {
+                        self.var_array_elem_types.insert(c.name.name.clone(), elem);
+                    }
                 }
                 _ => {}
             }
