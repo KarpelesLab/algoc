@@ -668,33 +668,9 @@ impl VerilogGenerator {
             return;
         }
 
-        if func.return_type.is_none() {
-            // Generate as task
-            self.current_function_name = None;
-            self.write_indent();
-            self.write(&format!("task {};\n", func.name.name));
-            self.indent();
-
-            // Declare parameters
-            for param in &func.params {
-                self.generate_param_decl(param, false);
-            }
-
-            // Pre-scan for local variable declarations
-            self.generate_block_var_declarations(&func.body);
-
-            self.writeln("begin");
-            self.indent();
-            self.generate_block(&func.body);
-            self.dedent();
-            self.writeln("end");
-
-            self.dedent();
-            self.writeln("endtask");
-        } else {
+        if let Some(ret_ty) = func.return_type.as_ref() {
             // Generate as function
             self.current_function_name = Some(func.name.name.clone());
-            let ret_ty = func.return_type.as_ref().unwrap();
             let ret_width = self.return_type_width(ret_ty);
             self.write_indent();
             if ret_width.is_empty() {
@@ -720,6 +696,27 @@ impl VerilogGenerator {
 
             self.dedent();
             self.writeln("endfunction");
+        } else {
+            // Generate as task (no return type)
+            self.current_function_name = None;
+            self.write_indent();
+            self.write(&format!("task {};\n", func.name.name));
+            self.indent();
+
+            for param in &func.params {
+                self.generate_param_decl(param, false);
+            }
+
+            self.generate_block_var_declarations(&func.body);
+
+            self.writeln("begin");
+            self.indent();
+            self.generate_block(&func.body);
+            self.dedent();
+            self.writeln("end");
+
+            self.dedent();
+            self.writeln("endtask");
         }
         self.current_function_name = None;
         self.writeln("");
@@ -818,17 +815,7 @@ impl VerilogGenerator {
 
     /// Generate a stub for a function that uses unsupported features
     fn generate_stub_function(&mut self, func: &Function) {
-        if func.return_type.is_none() {
-            self.writeln(&format!("task {};", func.name.name));
-            self.indent();
-            // Emit minimal params so task signature matches any calls
-            self.writeln("begin");
-            self.writeln("  // Stubbed: uses unsupported features");
-            self.writeln("end");
-            self.dedent();
-            self.writeln("endtask");
-        } else {
-            let ret_ty = func.return_type.as_ref().unwrap();
+        if let Some(ret_ty) = func.return_type.as_ref() {
             let ret_width = self.return_type_width(ret_ty);
             if ret_width.is_empty() {
                 self.writeln(&format!("function {};", func.name.name));
@@ -850,6 +837,14 @@ impl VerilogGenerator {
             self.writeln("end");
             self.dedent();
             self.writeln("endfunction");
+        } else {
+            self.writeln(&format!("task {};", func.name.name));
+            self.indent();
+            self.writeln("begin");
+            self.writeln("  // Stubbed: uses unsupported features");
+            self.writeln("end");
+            self.dedent();
+            self.writeln("endtask");
         }
         self.writeln("");
     }
@@ -1032,33 +1027,9 @@ impl VerilogGenerator {
         self.generated_functions.insert(mangled_name.clone());
         self.current_struct_name = Some(struct_name.to_string());
 
-        if func.return_type.is_none() {
-            // Generate as task
-            self.current_function_name = None;
-            self.known_tasks.insert(mangled_name.clone());
-            self.write_indent();
-            self.write(&format!("task {};\n", mangled_name));
-            self.indent();
-
-            for param in &func.params {
-                // First param might be &mut self (struct ref)
-                self.generate_param_decl(param, Self::is_mut_ref(&param.ty));
-            }
-
-            self.generate_block_var_declarations(&func.body);
-
-            self.writeln("begin");
-            self.indent();
-            self.generate_block(&func.body);
-            self.dedent();
-            self.writeln("end");
-
-            self.dedent();
-            self.writeln("endtask");
-        } else {
+        if let Some(ret_ty) = func.return_type.as_ref() {
             // Generate as function
             self.current_function_name = Some(mangled_name.clone());
-            let ret_ty = func.return_type.as_ref().unwrap();
 
             // Check if return type is Self - resolve to struct_name
             let ret_width = if matches!(&ret_ty.kind, TypeKind::SelfType) {
@@ -1091,6 +1062,28 @@ impl VerilogGenerator {
 
             self.dedent();
             self.writeln("endfunction");
+        } else {
+            // Generate as task (no return type)
+            self.current_function_name = None;
+            self.known_tasks.insert(mangled_name.clone());
+            self.write_indent();
+            self.write(&format!("task {};\n", mangled_name));
+            self.indent();
+
+            for param in &func.params {
+                self.generate_param_decl(param, Self::is_mut_ref(&param.ty));
+            }
+
+            self.generate_block_var_declarations(&func.body);
+
+            self.writeln("begin");
+            self.indent();
+            self.generate_block(&func.body);
+            self.dedent();
+            self.writeln("end");
+
+            self.dedent();
+            self.writeln("endtask");
         }
         self.current_function_name = None;
         self.current_struct_name = None;
