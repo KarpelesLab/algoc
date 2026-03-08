@@ -590,6 +590,28 @@ impl PythonGenerator {
                         .insert(name.name.clone(), type_ident.name.clone());
                 }
 
+                // Infer type from static method calls like TypeName__new() or TypeName::new()
+                if let Some(init_expr) = init {
+                    if let ExprKind::Call { func, .. } = &init_expr.kind
+                        && let ExprKind::Ident(func_ident) = &func.kind
+                        && let Some(idx) = func_ident.name.find("__new")
+                    {
+                        let struct_name = &func_ident.name[..idx];
+                        self.var_types
+                            .insert(name.name.clone(), struct_name.to_string());
+                    }
+                    if let ExprKind::TypeStaticCall {
+                        type_name,
+                        method_name,
+                        ..
+                    } = &init_expr.kind
+                        && method_name.name == "new"
+                    {
+                        self.var_types
+                            .insert(name.name.clone(), type_name.name.clone());
+                    }
+                }
+
                 self.write_indent();
                 self.write(&format!("{} = ", name.name));
                 if let Some(init) = init {

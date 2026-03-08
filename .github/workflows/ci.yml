@@ -11,6 +11,7 @@ env:
 
 jobs:
   build:
+    name: Build & Lint
     runs-on: ubuntu-latest
 
     steps:
@@ -33,29 +34,74 @@ jobs:
       - name: Run cargo tests
         run: cargo test
 
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: algoc
+          path: target/release/algoc
+
+  test-javascript:
+    name: Test (JavaScript)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      - name: Run stdlib tests
+        run: |
+          shopt -s globstar
+          failed=0
+          for file in stdlib/**/*.algoc; do
+            echo "Testing: $file"
+            if ! ./algoc test "$file" --target js; then
+              failed=1
+            fi
+          done
+          exit $failed
+
+  test-python:
+    name: Test (Python)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: algoc
+
+      - name: Make binary executable
+        run: chmod +x algoc
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Run stdlib tests (JavaScript)
+      - name: Run stdlib tests
         run: |
-          echo "Running stdlib tests with JavaScript target..."
+          shopt -s globstar
+          failed=0
           for file in stdlib/**/*.algoc; do
             echo "Testing: $file"
-            cargo run --release -- test "$file" --target js
+            if ! ./algoc test "$file" --target python; then
+              failed=1
+            fi
           done
-
-      - name: Run stdlib tests (Python)
-        continue-on-error: true  # Python codegen has known issues, track separately
-        run: |
-          echo "Running stdlib tests with Python target..."
-          for file in stdlib/**/*.algoc; do
-            echo "Testing: $file"
-            cargo run --release -- test "$file" --target python
-          done
+          exit $failed

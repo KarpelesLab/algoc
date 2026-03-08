@@ -82,7 +82,7 @@ impl Md5State {
     // Reset to initial state
     fn reset(&mut self) {
         for i in 0..4 {
-            self.h[i] = H_INIT[i];
+            self.h[i] = MD5_H_INIT[i];
         }
         self.block_len = 0;
         self.total_len = 0;
