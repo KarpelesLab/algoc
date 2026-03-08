@@ -312,6 +312,12 @@ impl VerilogGenerator {
             {
                 return true;
             }
+            if let TypeKind::Ref(inner) = &param.ty.kind
+                && let TypeKind::Named(ident) = &inner.kind
+                && self.unsupported_structs.contains(&ident.name)
+            {
+                return true;
+            }
         }
         // Check return type
         if let Some(ret) = &func.return_type
@@ -2210,10 +2216,41 @@ impl VerilogGenerator {
 
         self.generate_expr(func);
         self.write("(");
-        for (i, arg) in args.iter().enumerate() {
-            if i > 0 {
+        let mut first = true;
+        for arg in args.iter() {
+            // Check if this argument is a struct variable that needs flattening
+            if let ExprKind::Ident(ident) = &arg.kind
+                && let Some(struct_name) = self.var_types.get(&ident.name).cloned()
+                && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
+            {
+                for field in &fields {
+                    if !first {
+                        self.write(", ");
+                    }
+                    first = false;
+                    self.write(&format!("{}_{}", ident.name, field.name));
+                }
+                continue;
+            }
+            // Also handle &var and &mut var wrapping a struct variable
+            if let ExprKind::Ref(inner) | ExprKind::MutRef(inner) = &arg.kind
+                && let ExprKind::Ident(ident) = &inner.kind
+                && let Some(struct_name) = self.var_types.get(&ident.name).cloned()
+                && let Some(fields) = self.struct_defs.get(&struct_name).cloned()
+            {
+                for field in &fields {
+                    if !first {
+                        self.write(", ");
+                    }
+                    first = false;
+                    self.write(&format!("{}_{}", ident.name, field.name));
+                }
+                continue;
+            }
+            if !first {
                 self.write(", ");
             }
+            first = false;
             self.generate_expr(arg);
         }
         self.write(")");
