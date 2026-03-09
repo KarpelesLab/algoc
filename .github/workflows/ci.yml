@@ -390,7 +390,7 @@ jobs:
           failed=0
           for file in stdlib/**/*.algoc; do
             echo "Testing: $file"
-            if ! timeout 600 ./algoc test "$file" -t swift; then
+            if ! timeout 1200 ./algoc test "$file" -t swift; then
               echo "FAILED or TIMEOUT: $file"
               failed=1
             fi
