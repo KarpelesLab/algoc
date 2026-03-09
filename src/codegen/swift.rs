@@ -55,6 +55,11 @@ pub struct SwiftGenerator {
     current_struct_name: Option<String>,
     /// Array element types for variables (e.g. "input" -> "UInt8" when input: [UInt8])
     var_array_elem_types: HashMap<String, String>,
+    /// Tracks array aliases: when a struct field stores a copy of a local
+    /// array variable (Swift value semantics), we need to sync the original
+    /// variable after any inout modification of the struct.
+    /// Maps struct_var_name -> Vec<(field_name, original_var_name)>
+    array_field_aliases: HashMap<String, Vec<(String, String)>>,
 }
 
 impl SwiftGenerator {
@@ -71,6 +76,7 @@ impl SwiftGenerator {
             func_param_info: HashMap::new(),
             current_struct_name: None,
             var_array_elem_types: HashMap::new(),
+            array_field_aliases: HashMap::new(),
         }
     }
 
@@ -470,6 +476,7 @@ impl SwiftGenerator {
     fn generate_method(&mut self, struct_name: &str, func: &Function) {
         self.current_struct_name = Some(struct_name.to_string());
         self.inout_params.clear();
+        self.array_field_aliases.clear();
         let saved_var_types = self.var_types.clone();
         let saved_prim_types = self.var_prim_types.clone();
         let saved_array_elem_types = self.var_array_elem_types.clone();
@@ -538,6 +545,7 @@ impl SwiftGenerator {
 
     fn generate_test(&mut self, test: &crate::parser::TestDef) {
         self.inout_params.clear();
+        self.array_field_aliases.clear();
 
         self.writeln(&format!("func test_{}() {{", test.name.name));
         self.indent();
@@ -580,6 +588,101 @@ impl SwiftGenerator {
             self.generate_expr(&c.value);
         }
         self.write("\n\n");
+    }
+
+    /// After generating an expression that may contain function calls passing
+    /// struct variables as inout (&), sync any tracked array field aliases.
+    /// This handles Swift value semantics: the struct's copy of the array may
+    /// have been modified by the callee, but the original local variable wasn't.
+    fn emit_array_alias_sync(&mut self, expr: &Expr) {
+        let mut structs_to_sync = Vec::new();
+        Self::collect_inout_struct_refs(expr, &mut structs_to_sync);
+        structs_to_sync.dedup();
+
+        for struct_var in &structs_to_sync {
+            if let Some(aliases) = self.array_field_aliases.get(struct_var.as_str()) {
+                let aliases = aliases.clone();
+                for (field_name, original_var) in &aliases {
+                    let safe_original = Self::swift_safe_ident(original_var);
+                    let safe_struct = Self::swift_safe_ident(struct_var);
+                    let safe_field = Self::swift_safe_ident(field_name);
+                    self.writeln(&format!(
+                        "{} = {}.{}",
+                        safe_original, safe_struct, safe_field
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Recursively collect identifiers passed as &name or &mut name in
+    /// function call arguments, which may be struct variables with array
+    /// field aliases that need syncing after the call.
+    fn collect_inout_struct_refs(expr: &Expr, result: &mut Vec<String>) {
+        match &expr.kind {
+            ExprKind::Call { func, args } | ExprKind::GenericCall { func, args, .. } => {
+                for arg in args {
+                    if let ExprKind::Ref(inner) | ExprKind::MutRef(inner) = &arg.kind
+                        && let ExprKind::Ident(ident) = &inner.kind
+                    {
+                        result.push(ident.name.clone());
+                    }
+                    Self::collect_inout_struct_refs(arg, result);
+                }
+                Self::collect_inout_struct_refs(func, result);
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                Self::collect_inout_struct_refs(receiver, result);
+                for arg in args {
+                    if let ExprKind::Ref(inner) | ExprKind::MutRef(inner) = &arg.kind
+                        && let ExprKind::Ident(ident) = &inner.kind
+                    {
+                        result.push(ident.name.clone());
+                    }
+                    Self::collect_inout_struct_refs(arg, result);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_inout_struct_refs(left, result);
+                Self::collect_inout_struct_refs(right, result);
+            }
+            ExprKind::Unary { operand, .. } => {
+                Self::collect_inout_struct_refs(operand, result);
+            }
+            ExprKind::Paren(inner)
+            | ExprKind::Deref(inner)
+            | ExprKind::Ref(inner)
+            | ExprKind::MutRef(inner) => {
+                Self::collect_inout_struct_refs(inner, result);
+            }
+            ExprKind::Cast { expr: inner, .. } => {
+                Self::collect_inout_struct_refs(inner, result);
+            }
+            ExprKind::Index { array, index } => {
+                Self::collect_inout_struct_refs(array, result);
+                Self::collect_inout_struct_refs(index, result);
+            }
+            ExprKind::Slice {
+                array, start, end, ..
+            } => {
+                Self::collect_inout_struct_refs(array, result);
+                Self::collect_inout_struct_refs(start, result);
+                Self::collect_inout_struct_refs(end, result);
+            }
+            ExprKind::Field { object, .. } => {
+                Self::collect_inout_struct_refs(object, result);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_inout_struct_refs(condition, result);
+                Self::collect_inout_struct_refs(then_expr, result);
+                Self::collect_inout_struct_refs(else_expr, result);
+            }
+            _ => {}
+        }
     }
 
     /// Generate a large array literal split into chunks for faster
@@ -750,6 +853,7 @@ impl SwiftGenerator {
         self.current_struct_name = Self::infer_self_type_name(&func.name.name);
 
         self.inout_params.clear();
+        self.array_field_aliases.clear();
         let saved_var_types = self.var_types.clone();
         let saved_prim_types = self.var_prim_types.clone();
         let saved_array_elem_types = self.var_array_elem_types.clone();
@@ -1180,11 +1284,58 @@ impl SwiftGenerator {
                     self.write("0");
                 }
                 self.write("\n");
+
+                // Swift value semantics fix: when a struct stores a copy of
+                // an array variable, modifications to the struct's field
+                // won't be reflected in the original. For inout params,
+                // emit a `defer` to copy back at scope exit. For local
+                // array vars, track the alias so we can sync after inout
+                // calls on the struct.
+                if let Some(init_expr) = init
+                    && let ExprKind::StructLit { fields, .. } = &init_expr.kind
+                {
+                    let safe_var = Self::swift_safe_ident(&name.name);
+                    let var_name = name.name.clone();
+                    for (field_name, field_val) in fields {
+                        // Unwrap Ref/MutRef wrappers to get the inner ident
+                        let inner_expr = match &field_val.kind {
+                            ExprKind::Ref(inner) | ExprKind::MutRef(inner) => &inner.kind,
+                            other => other,
+                        };
+                        if let ExprKind::Ident(ident) = inner_expr {
+                            // Check if this is an array variable
+                            let is_array = self.var_array_elem_types.contains_key(&ident.name);
+                            if self.inout_params.contains(&ident.name) {
+                                // inout param: use defer for automatic sync
+                                let safe_field = Self::swift_safe_ident(&field_name.name);
+                                let safe_param = Self::swift_safe_ident(&ident.name);
+                                self.writeln(&format!(
+                                    "defer {{ {} = {}.{} }}",
+                                    safe_param, safe_var, safe_field
+                                ));
+                            } else if is_array {
+                                // Local array var: track alias for sync
+                                // after inout calls on the struct
+                                self.array_field_aliases
+                                    .entry(var_name.clone())
+                                    .or_default()
+                                    .push((field_name.name.clone(), ident.name.clone()));
+                            }
+                        }
+                    }
+                }
+
+                // Sync array aliases after inout calls in the init expr
+                if let Some(init_expr) = init {
+                    self.emit_array_alias_sync(init_expr);
+                }
             }
             StmtKind::Expr(expr) => {
                 self.write_indent();
                 self.generate_expr(expr);
                 self.write("\n");
+                // Sync array aliases after inout calls on structs
+                self.emit_array_alias_sync(expr);
             }
             StmtKind::Assign { target, value } => {
                 // Check for endian cast assignment: buf[0..4] as u32be = value
@@ -1444,6 +1595,9 @@ impl SwiftGenerator {
                         // One known, other unknown (loop var / untracked):
                         // cast the unknown side to the known type so Swift
                         // is guaranteed matching operands.
+                        // Integer literals are excluded: Swift infers their
+                        // type from context and wrapping them can change
+                        // semantics (e.g. UInt32(n) wraps negative values).
                         (Some(l), None) if !matches!(right.kind, ExprKind::Integer(_)) => {
                             (None, Some(l.clone()))
                         }
@@ -2403,7 +2557,12 @@ impl SwiftGenerator {
                 None
             }
             ExprKind::Integer(_) => None,
-            ExprKind::Binary { left, right, .. } => {
+            ExprKind::Binary { left, right, op } => {
+                // For shifts, the result type is the left operand's type,
+                // not the shift amount (right operand).
+                if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                    return self.infer_swift_int_type(left);
+                }
                 let lt = self.infer_swift_int_type(left);
                 let rt = self.infer_swift_int_type(right);
                 match (lt, rt) {
