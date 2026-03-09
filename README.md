@@ -29,25 +29,25 @@ cargo build --release
 
 ```bash
 # Type-check a file
-algoc check stdlib/crypto/sha256.algoc
+algoc check stdlib/hash/sha256.algoc
 
 # Compile to JavaScript
-algoc compile stdlib/crypto/sha256.algoc -t js
+algoc compile stdlib/hash/sha256.algoc -t js
 
 # Compile to Python
-algoc compile stdlib/crypto/sha256.algoc -t py
+algoc compile stdlib/hash/sha256.algoc -t py
 
 # Compile with custom output path
-algoc compile stdlib/crypto/sha256.algoc -t js -o output.js
+algoc compile stdlib/hash/sha256.algoc -t js -o output.js
 
 # Include test functions in output
-algoc compile stdlib/crypto/sha256.algoc -t js --test
+algoc compile stdlib/hash/sha256.algoc -t js --test
 
 # Run tests directly (compiles and streams to interpreter)
-algoc test stdlib/crypto/sha256.algoc -t js
+algoc test stdlib/hash/sha256.algoc -t js
 
 # Parse and dump AST (no type checking)
-algoc parse stdlib/crypto/sha256.algoc
+algoc parse stdlib/hash/sha256.algoc
 ```
 
 ## Example
@@ -248,20 +248,20 @@ if condition {
 
 The `stdlib/` directory contains reference implementations:
 
+### Hash
+- **SHA-256** (`stdlib/hash/sha256.algoc`) - FIPS 180-4 compliant
+- **SHA-1** (`stdlib/hash/sha1.algoc`) - FIPS 180-4 compliant
+- **MD5** (`stdlib/hash/md5.algoc`) - RFC 1321 implementation
+- **HMAC** (`stdlib/hash/hmac.algoc`) - RFC 2104/4231, generic over any Hash implementation
+- **Hash Interface** (`stdlib/hash/hash.algoc`) - Common interface for hash functions
+- **CRC32** (`stdlib/hash/crc32.algoc`) - Checksum computation
+
 ### Cryptographic
-- **SHA-256** (`stdlib/crypto/sha256.algoc`) - FIPS 180-4 compliant
-- **SHA-1** (`stdlib/crypto/sha1.algoc`) - FIPS 180-4 compliant
-- **MD5** (`stdlib/crypto/md5.algoc`) - RFC 1321 implementation
 - **AES** (`stdlib/crypto/aes.algoc`) - FIPS 197 (AES-128, AES-192, AES-256)
-- **HMAC** (`stdlib/crypto/hmac.algoc`) - RFC 2104/4231, generic over any Hash implementation
-- **Hash Interface** (`stdlib/crypto/hash.algoc`) - Common interface for hash functions
 
 ### Compression
 - **DEFLATE** (`stdlib/compression/deflate.algoc`) - RFC 1951 decompression with Huffman decoding
 - **Gzip** (`stdlib/compression/gzip.algoc`) - RFC 1952 container format
-
-### Hash
-- **CRC32** (`stdlib/hash/crc32.algoc`) - Checksum computation
 
 ### Image
 - **PNG** (`stdlib/image/png.algoc`) - PNG encoder/decoder (RGB, RGBA, Grayscale; all 5 filter types)
