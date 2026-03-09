@@ -293,16 +293,36 @@ fn run_compiled_test(code: &str, ext: &str, target: &str) -> ExitCode {
             };
         }
         "swift" => {
-            let status = Command::new("swift").arg(&source_path).status();
+            let binary_path = source_path.with_extension("");
+            let compile = Command::new("swiftc")
+                .arg("-Onone")
+                .arg("-o")
+                .arg(&binary_path)
+                .arg(&source_path)
+                .status();
             let _ = fs::remove_file(&source_path);
-            return match status {
-                Ok(s) if s.success() => ExitCode::SUCCESS,
-                Ok(_) => ExitCode::FAILURE,
-                Err(e) => {
-                    eprintln!("Error running swift: {}", e);
-                    ExitCode::FAILURE
+            match compile {
+                Ok(s) if s.success() => {
+                    let status = Command::new(&binary_path).status();
+                    let _ = fs::remove_file(&binary_path);
+                    return match status {
+                        Ok(s) if s.success() => ExitCode::SUCCESS,
+                        Ok(_) => ExitCode::FAILURE,
+                        Err(e) => {
+                            eprintln!("Error running swift binary: {}", e);
+                            ExitCode::FAILURE
+                        }
+                    };
                 }
-            };
+                Ok(_) => {
+                    let _ = fs::remove_file(&binary_path);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error compiling swift: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         "dart" => {
             let status = Command::new("dart").arg("run").arg(&source_path).status();

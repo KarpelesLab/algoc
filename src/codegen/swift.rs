@@ -585,24 +585,35 @@ impl SwiftGenerator {
     /// Generate a large array literal split into chunks for faster
     /// Swift type checking, using the provided element type.
     fn generate_chunked_array(&mut self, elements: &[Expr], elem_type: &str) {
+        // Use simple array concatenation with explicit type annotations per chunk
+        // to minimize type-checker pressure (closures are much slower to type-check)
         let chunk_size = 16;
-        self.write(&format!(
-            "{{ () -> [{}] in var __a: [{}] = [{}](); ",
-            elem_type, elem_type, elem_type
-        ));
-        for chunk in elements.chunks(chunk_size) {
-            self.write("__a += [");
+        let chunks: Vec<_> = elements.chunks(chunk_size).collect();
+        if chunks.len() <= 1 {
+            self.write("[");
+            for (i, elem) in elements.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.generate_expr(elem);
+            }
+            self.write(&format!("] as [{}]", elem_type));
+            return;
+        }
+        // Multi-chunk: concatenate typed array literals
+        for (ci, chunk) in chunks.iter().enumerate() {
+            if ci > 0 {
+                self.write("\n    + ");
+            }
+            self.write("([");
             for (i, elem) in chunk.iter().enumerate() {
                 if i > 0 {
                     self.write(", ");
                 }
                 self.generate_expr(elem);
             }
-            self.write("] as [");
-            self.write(elem_type);
-            self.write("]; ");
+            self.write(&format!("] as [{}])", elem_type));
         }
-        self.write("return __a }()");
     }
 
     fn generate_struct(&mut self, s: &crate::parser::StructDef) {
