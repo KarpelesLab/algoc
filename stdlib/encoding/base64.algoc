@@ -1,0 +1,208 @@
+// Base64 encoding/decoding implementation
+//
+// Implements Base64 encoding and decoding as specified in RFC 4648.
+
+use "../runtime.algoc";
+
+// Base64 encoding alphabet (A-Z, a-z, 0-9, +, /)
+const BASE64_CHARS: u8[64] = [
+    65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77,
+    78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+    97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+    110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 43, 47
+];
+
+// Base64 decoding table (maps ASCII value to 6-bit value, 0xFF = invalid)
+const BASE64_DECODE: u8[128] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 62,   0xFF, 0xFF, 0xFF, 63,
+    52,   53,   54,   55,   56,   57,   58,   59,   60,   61,   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0,    1,    2,    3,    4,    5,    6,    7,    8,    9,    10,   11,   12,   13,   14,
+    15,   16,   17,   18,   19,   20,   21,   22,   23,   24,   25,   0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 26,   27,   28,   29,   30,   31,   32,   33,   34,   35,   36,   37,   38,   39,   40,
+    41,   42,   43,   44,   45,   46,   47,   48,   49,   50,   51,   0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+];
+
+const BASE64_PAD: u8 = 61; // '='
+
+// Calculate encoded length (including padding)
+fn base64_encode_len(input_len: u64) -> u64 {
+    return ((input_len + 2) / 3) * 4;
+}
+
+// Calculate maximum decoded length
+fn base64_decode_len(input_len: u64) -> u64 {
+    return (input_len / 4) * 3;
+}
+
+// Encode bytes to Base64
+// Returns number of bytes written to output
+fn base64_encode(input: &[u8], output: &mut [u8]) -> u64 {
+    let in_len = input.len();
+    let mut out_pos: u64 = 0;
+    let mut i: u64 = 0;
+
+    // Process 3-byte groups
+    while i + 3 <= in_len {
+        let b0 = input[i] as u32;
+        let b1 = input[i + 1] as u32;
+        let b2 = input[i + 2] as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        output[out_pos]     = BASE64_CHARS[(triple >> 18) & 0x3F];
+        output[out_pos + 1] = BASE64_CHARS[(triple >> 12) & 0x3F];
+        output[out_pos + 2] = BASE64_CHARS[(triple >> 6) & 0x3F];
+        output[out_pos + 3] = BASE64_CHARS[triple & 0x3F];
+
+        i = i + 3;
+        out_pos = out_pos + 4;
+    }
+
+    // Handle remaining bytes
+    let remaining = in_len - i;
+    if remaining == 1 {
+        let b0 = input[i] as u32;
+        output[out_pos]     = BASE64_CHARS[(b0 >> 2) & 0x3F];
+        output[out_pos + 1] = BASE64_CHARS[(b0 << 4) & 0x3F];
+        output[out_pos + 2] = BASE64_PAD;
+        output[out_pos + 3] = BASE64_PAD;
+        out_pos = out_pos + 4;
+    } else if remaining == 2 {
+        let b0 = input[i] as u32;
+        let b1 = input[i + 1] as u32;
+        output[out_pos]     = BASE64_CHARS[(b0 >> 2) & 0x3F];
+        output[out_pos + 1] = BASE64_CHARS[((b0 << 4) | (b1 >> 4)) & 0x3F];
+        output[out_pos + 2] = BASE64_CHARS[(b1 << 2) & 0x3F];
+        output[out_pos + 3] = BASE64_PAD;
+        out_pos = out_pos + 4;
+    }
+
+    return out_pos;
+}
+
+// Decode Base64 to bytes
+// Returns number of bytes written to output
+fn base64_decode(input: &[u8], output: &mut [u8]) -> u64 {
+    let in_len = input.len();
+    let mut out_pos: u64 = 0;
+    let mut buf: u32 = 0;
+    let mut buf_len: u8 = 0;
+
+    for i in 0..in_len {
+        let ch = input[i];
+        if ch == BASE64_PAD {
+            // Padding — stop processing
+            break;
+        }
+        if ch >= 128 {
+            continue; // Skip non-ASCII
+        }
+        let val = BASE64_DECODE[ch];
+        if val == 0xFF {
+            continue; // Skip invalid characters (whitespace etc.)
+        }
+
+        buf = (buf << 6) | (val as u32);
+        buf_len = buf_len + 1;
+
+        if buf_len == 4 {
+            output[out_pos]     = ((buf >> 16) & 0xFF) as u8;
+            output[out_pos + 1] = ((buf >> 8) & 0xFF) as u8;
+            output[out_pos + 2] = (buf & 0xFF) as u8;
+            out_pos = out_pos + 3;
+            buf = 0;
+            buf_len = 0;
+        }
+    }
+
+    // Handle remaining buffered data
+    if buf_len == 3 {
+        // 3 base64 chars = 2 bytes
+        output[out_pos]     = ((buf >> 10) & 0xFF) as u8;
+        output[out_pos + 1] = ((buf >> 2) & 0xFF) as u8;
+        out_pos = out_pos + 2;
+    } else if buf_len == 2 {
+        // 2 base64 chars = 1 byte
+        output[out_pos] = ((buf >> 4) & 0xFF) as u8;
+        out_pos = out_pos + 1;
+    }
+
+    return out_pos;
+}
+
+// Test vectors from RFC 4648 Section 10
+test base64_encode_empty() {
+    let input: &[u8] = bytes("");
+    let mut output: u8[4];
+    let len = base64_encode(input, &mut output);
+    assert(len == 0);
+}
+
+test base64_encode_f() {
+    let input: &[u8] = bytes("f");
+    let mut output: u8[4];
+    let len = base64_encode(input, &mut output);
+    assert(len == 4);
+    let expected: &[u8] = bytes("Zg==");
+    assert(output[0] == expected[0]);
+    assert(output[1] == expected[1]);
+    assert(output[2] == expected[2]);
+    assert(output[3] == expected[3]);
+}
+
+test base64_encode_foo() {
+    let input: &[u8] = bytes("foo");
+    let mut output: u8[4];
+    let len = base64_encode(input, &mut output);
+    assert(len == 4);
+    let expected: &[u8] = bytes("Zm9v");
+    assert(output[0] == expected[0]);
+    assert(output[1] == expected[1]);
+    assert(output[2] == expected[2]);
+    assert(output[3] == expected[3]);
+}
+
+test base64_encode_foobar() {
+    let input: &[u8] = bytes("foobar");
+    let mut output: u8[8];
+    let len = base64_encode(input, &mut output);
+    assert(len == 8);
+    let expected: &[u8] = bytes("Zm9vYmFy");
+    for i in 0..8 {
+        assert(output[i] == expected[i]);
+    }
+}
+
+test base64_decode_foobar() {
+    let input: &[u8] = bytes("Zm9vYmFy");
+    let mut output: u8[6];
+    let len = base64_decode(input, &mut output);
+    assert(len == 6);
+    let expected: &[u8] = bytes("foobar");
+    for i in 0..6 {
+        assert(output[i] == expected[i]);
+    }
+}
+
+test base64_decode_padded() {
+    // "Zg==" decodes to "f"
+    let input: &[u8] = bytes("Zg==");
+    let mut output: u8[3];
+    let len = base64_decode(input, &mut output);
+    assert(len == 1);
+    assert(output[0] == 102); // 'f'
+}
+
+test base64_roundtrip() {
+    let original: &[u8] = bytes("Hello, World!");
+    let mut encoded: u8[20];
+    let enc_len = base64_encode(original, &mut encoded);
+    let mut decoded: u8[20];
+    let dec_len = base64_decode(encoded[0..enc_len], &mut decoded);
+    assert(dec_len == 13);
+    for i in 0..13 {
+        assert(decoded[i] == original[i]);
+    }
+}

@@ -94,6 +94,66 @@ impl PythonGenerator {
         }
     }
 
+    /// Check if an expression involves u64 types, used to decide between _u32() and _u64() wrapping.
+    fn expr_uses_u64(&self, expr: &Expr) -> bool {
+        use crate::parser::{PrimitiveType, TypeKind};
+
+        match &expr.kind {
+            ExprKind::Cast { ty, .. } => {
+                if let TypeKind::Primitive(p) = &ty.kind {
+                    let native = p.to_native();
+                    matches!(
+                        native,
+                        PrimitiveType::U64
+                            | PrimitiveType::I64
+                            | PrimitiveType::U128
+                            | PrimitiveType::I128
+                    )
+                } else {
+                    false
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_uses_u64(left) || self.expr_uses_u64(right)
+            }
+            ExprKind::Unary { operand, .. } => self.expr_uses_u64(operand),
+            ExprKind::Paren(inner) => self.expr_uses_u64(inner),
+            ExprKind::Integer(n) => *n > 0xFFFFFFFF,
+            // Look up variable types
+            ExprKind::Ident(ident) => self
+                .var_elem_types
+                .get(&ident.name)
+                .map_or(false, |p| {
+                    matches!(
+                        p,
+                        PrimitiveType::U64
+                            | PrimitiveType::I64
+                            | PrimitiveType::U128
+                            | PrimitiveType::I128
+                    )
+                }),
+            // Array indexing: check element type of the array variable
+            ExprKind::Index { array, .. } => {
+                if let ExprKind::Ident(ident) = &array.kind {
+                    self.var_elem_types.get(&ident.name).map_or(false, |p| {
+                        matches!(
+                            p,
+                            PrimitiveType::U64
+                                | PrimitiveType::I64
+                                | PrimitiveType::U128
+                                | PrimitiveType::I128
+                        )
+                    })
+                } else {
+                    false
+                }
+            }
+            // Function calls: check if any argument is u64 (common pattern for functions like rotr64)
+            ExprKind::Call { args, .. } => args.iter().any(|arg| self.expr_uses_u64(arg)),
+            _ => false,
+        }
+    }
+
     /// Get the variable name from an index target expression (e.g., `data[idx]` -> "data")
     fn index_target_var(expr: &Expr) -> Option<&str> {
         match &expr.kind {
@@ -614,6 +674,11 @@ impl PythonGenerator {
                 self.var_elem_types
                     .insert(param.name.name.clone(), elem_prim);
             }
+            // Also track plain primitive parameter types (e.g., u64)
+            if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
+                self.var_elem_types
+                    .insert(param.name.name.clone(), *p);
+            }
         }
 
         self.write_indent();
@@ -663,6 +728,13 @@ impl PythonGenerator {
                     && let Some(elem_prim) = Self::element_primitive(ty)
                 {
                     self.var_elem_types.insert(name.name.clone(), elem_prim);
+                }
+
+                // Track plain primitive types (e.g., u64 variables) for correct wrapping
+                if let Some(ty) = ty
+                    && let crate::parser::TypeKind::Primitive(p) = &ty.kind
+                {
+                    self.var_elem_types.insert(name.name.clone(), *p);
                 }
 
                 // Also infer element type from ArrayRepeat with cast: [val as u8; N]
@@ -994,7 +1066,7 @@ impl PythonGenerator {
                 );
 
                 // Check if either operand uses 64-bit types
-                let uses_u64 = expr_uses_u64(left) || expr_uses_u64(right);
+                let uses_u64 = self.expr_uses_u64(left) || self.expr_uses_u64(right);
 
                 if needs_mask {
                     if uses_u64 {
@@ -1047,7 +1119,11 @@ impl PythonGenerator {
                     }
                     UnaryOp::BitNot => {
                         // Python's ~ on unbounded integers needs masking
-                        self.write("_u32(~(");
+                        if self.expr_uses_u64(operand) {
+                            self.write("_u64(~(");
+                        } else {
+                            self.write("_u32(~(");
+                        }
                         self.generate_expr(operand);
                         self.write("))");
                     }
@@ -1665,36 +1741,7 @@ fn is_byte_sequence_expr(expr: &Expr) -> bool {
 }
 
 /// Check if an expression involves 64-bit or larger types
-fn expr_uses_u64(expr: &Expr) -> bool {
-    use crate::parser::{PrimitiveType, TypeKind};
-
-    match &expr.kind {
-        // Cast determines the output type
-        ExprKind::Cast { ty, .. } => {
-            if let TypeKind::Primitive(p) = &ty.kind {
-                let native = p.to_native();
-                matches!(
-                    native,
-                    PrimitiveType::U64
-                        | PrimitiveType::I64
-                        | PrimitiveType::U128
-                        | PrimitiveType::I128
-                )
-            } else {
-                false
-            }
-        }
-        // Binary operations propagate u64
-        ExprKind::Binary { left, right, .. } => expr_uses_u64(left) || expr_uses_u64(right),
-        // Unary operations propagate u64
-        ExprKind::Unary { operand, .. } => expr_uses_u64(operand),
-        // Parentheses propagate u64
-        ExprKind::Paren(inner) => expr_uses_u64(inner),
-        // Large integer literals need u64
-        ExprKind::Integer(n) => *n > 0xFFFFFFFF,
-        _ => false,
-    }
-}
+// Removed standalone expr_uses_u64 — now a method on PythonGenerator
 
 impl Default for PythonGenerator {
     fn default() -> Self {

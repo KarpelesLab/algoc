@@ -497,6 +497,12 @@ impl JavaScriptGenerator {
                     crate::parser::PrimitiveType::U8 => format!("new Uint8Array({})", size),
                     crate::parser::PrimitiveType::U16 => format!("new Uint16Array({})", size),
                     crate::parser::PrimitiveType::U32 => format!("new Uint32Array({})", size),
+                    crate::parser::PrimitiveType::U64
+                    | crate::parser::PrimitiveType::I64
+                    | crate::parser::PrimitiveType::U128
+                    | crate::parser::PrimitiveType::I128 => {
+                        format!("new Array({}).fill(0n)", size)
+                    }
                     _ => format!("new Array({}).fill(0)", size),
                 },
                 _ => format!("new Array({}).fill(0)", size),
@@ -611,8 +617,12 @@ impl JavaScriptGenerator {
                 self.write_indent();
                 self.write(&format!("let {} = ", name.name));
                 if let Some(init) = init {
-                    // If type is BigInt but init isn't, wrap in BigInt()
-                    if type_is_bigint && !init_is_bigint {
+                    // If type is a plain BigInt (not array/slice) but init isn't, wrap in BigInt()
+                    let is_plain_bigint = ty
+                        .as_ref()
+                        .map(|t| matches!(t.kind, crate::parser::TypeKind::Primitive(_)))
+                        .unwrap_or(false);
+                    if type_is_bigint && !init_is_bigint && is_plain_bigint {
                         self.write("BigInt(");
                         self.generate_expr(init);
                         self.write(")");
@@ -620,12 +630,7 @@ impl JavaScriptGenerator {
                         self.generate_expr(init);
                     }
                 } else if let Some(ty) = ty {
-                    // Default value for BigInt types
-                    if type_is_bigint {
-                        self.write("0n");
-                    } else {
-                        self.write(&self.default_value_for_type(ty));
-                    }
+                    self.write(&self.default_value_for_type(ty));
                 } else {
                     self.write("undefined");
                 }
@@ -918,7 +923,17 @@ impl JavaScriptGenerator {
                             | BinaryOp::Shr
                     );
 
-                if needs_unsigned {
+                // For BigInt operations that can overflow 64 bits, mask to 64 bits
+                let needs_bigint_mask = uses_bigint
+                    && matches!(
+                        op,
+                        BinaryOp::Add
+                            | BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::Shl
+                    );
+
+                if needs_unsigned || needs_bigint_mask {
                     self.write("(");
                 }
                 self.write("(");
@@ -985,6 +1000,8 @@ impl JavaScriptGenerator {
                 self.write(")");
                 if needs_unsigned {
                     self.write(" >>> 0)");
+                } else if needs_bigint_mask {
+                    self.write(" & 0xFFFFFFFFFFFFFFFFn)");
                 }
             }
             ExprKind::Unary { op, operand } => {
@@ -999,7 +1016,11 @@ impl JavaScriptGenerator {
                 self.write(")");
                 // For bitwise not, ensure unsigned
                 if matches!(op, UnaryOp::BitNot) {
-                    self.write(" >>> 0");
+                    if self.expr_uses_bigint(operand) {
+                        self.write(" & 0xFFFFFFFFFFFFFFFFn");
+                    } else {
+                        self.write(" >>> 0");
+                    }
                 }
             }
             ExprKind::Index { array, index } => {
@@ -1209,9 +1230,19 @@ impl JavaScriptGenerator {
                         .iter()
                         .all(|e| matches!(e.kind, ExprKind::Integer(_)));
 
+                    let any_u64 = elements.iter().any(|e| {
+                        if let ExprKind::Integer(n) = &e.kind {
+                            *n > 0xFFFFFFFF
+                        } else {
+                            false
+                        }
+                    });
+
                     if all_bytes {
                         // Use Uint8Array for byte arrays
                         self.write("new Uint8Array([");
+                    } else if all_ints && any_u64 {
+                        self.write("new BigUint64Array([");
                     } else if all_ints {
                         self.write("new Uint32Array([");
                     } else {
@@ -1751,14 +1782,29 @@ impl JavaScriptGenerator {
     fn is_bigint_type(&self, ty: Option<&crate::parser::Type>) -> bool {
         use crate::parser::{PrimitiveType, TypeKind};
 
-        if let Some(ty) = ty
-            && let TypeKind::Primitive(p) = &ty.kind
-        {
-            let native = p.to_native();
-            return matches!(
-                native,
-                PrimitiveType::U64 | PrimitiveType::I64 | PrimitiveType::U128 | PrimitiveType::I128
-            );
+        if let Some(ty) = ty {
+            match &ty.kind {
+                TypeKind::Primitive(p) => {
+                    let native = p.to_native();
+                    return matches!(
+                        native,
+                        PrimitiveType::U64
+                            | PrimitiveType::I64
+                            | PrimitiveType::U128
+                            | PrimitiveType::I128
+                    );
+                }
+                // Arrays/slices with u64 elements: indexing produces BigInt
+                TypeKind::Array { element, .. }
+                | TypeKind::Slice { element }
+                | TypeKind::ArrayRef { element, .. } => {
+                    return self.is_bigint_type(Some(element));
+                }
+                TypeKind::MutRef(inner) | TypeKind::Ref(inner) => {
+                    return self.is_bigint_type(Some(inner));
+                }
+                _ => {}
+            }
         }
         false
     }
@@ -1826,6 +1872,14 @@ impl JavaScriptGenerator {
             ExprKind::MethodCall { mangled_name, .. } => self.bigint_funcs.contains(mangled_name),
             // Check field access - if field is BigInt type
             ExprKind::Field { field, .. } => self.bigint_fields.contains(&field.name),
+            // Array indexing: check if the array variable holds BigInt elements
+            ExprKind::Index { array, .. } => {
+                if let ExprKind::Ident(ident) = &array.kind {
+                    self.bigint_vars.contains(&ident.name)
+                } else {
+                    false
+                }
+            }
             // Everything else is not BigInt
             _ => false,
         }

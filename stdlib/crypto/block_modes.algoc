@@ -1,0 +1,255 @@
+// AES block cipher modes: CTR and CBC
+//
+// Implements AES-CTR (Counter) and AES-CBC (Cipher Block Chaining) modes
+// as specified in NIST SP 800-38A.
+
+use "../runtime.algoc";
+use "aes.algoc";
+
+// ============================================================================
+// AES-CTR (Counter Mode)
+// ============================================================================
+// CTR mode turns a block cipher into a stream cipher.
+// Counter = 12-byte nonce || 4-byte big-endian counter (starting at 1)
+// Encrypt and decrypt are the same operation: XOR with keystream.
+
+fn aes_ctr_crypt(key: &AesKey, nonce: &[u8; 12], input: &[u8], output: &mut [u8]) {
+    let in_len = input.len();
+    let mut counter_block: [u8; 16];
+    let mut keystream: [u8; 16];
+    let mut block_count: u32 = 1;
+    let mut offset: u64 = 0;
+
+    // Set nonce in counter block
+    for i in 0..12 {
+        counter_block[i] = nonce[i];
+    }
+
+    // Process full blocks
+    while offset + 16 <= in_len {
+        // Set counter (big-endian)
+        counter_block[12..16] as u32be = block_count;
+
+        aes_encrypt_block(key, &counter_block, &mut keystream);
+        for i in 0..16 {
+            output[offset + i] = input[offset + i] ^ keystream[i];
+        }
+        offset = offset + 16;
+        block_count = block_count + 1;
+    }
+
+    // Handle partial last block
+    if offset < in_len {
+        counter_block[12..16] as u32be = block_count;
+        aes_encrypt_block(key, &counter_block, &mut keystream);
+        let remaining = in_len - offset;
+        for i in 0..remaining {
+            output[offset + i] = input[offset + i] ^ keystream[i];
+        }
+    }
+
+    secure_zero(&mut keystream);
+    secure_zero(&mut counter_block);
+}
+
+// ============================================================================
+// AES-CBC (Cipher Block Chaining)
+// ============================================================================
+// CBC encrypt: C_i = E_K(P_i XOR C_{i-1}), C_0 = IV
+// CBC decrypt: P_i = D_K(C_i) XOR C_{i-1}
+// Input length must be a multiple of 16 bytes.
+
+fn aes_cbc_encrypt(key: &AesKey, iv: &[u8; 16], input: &[u8], input_len: u64, output: &mut [u8]) {
+    let mut prev: [u8; 16];
+    let mut block: [u8; 16];
+
+    // Initialize previous ciphertext block to IV
+    for i in 0..16 {
+        prev[i] = iv[i];
+    }
+
+    let mut offset: u64 = 0;
+    while offset + 16 <= input_len {
+        // XOR plaintext with previous ciphertext
+        for i in 0..16 {
+            block[i] = input[offset + i] ^ prev[i];
+        }
+
+        // Encrypt
+        aes_encrypt_block(key, &block, &mut prev);
+
+        // Write ciphertext
+        for i in 0..16 {
+            output[offset + i] = prev[i];
+        }
+
+        offset = offset + 16;
+    }
+
+    secure_zero(&mut block);
+}
+
+fn aes_cbc_decrypt(key: &AesKey, iv: &[u8; 16], input: &[u8], input_len: u64, output: &mut [u8]) {
+    let mut prev: [u8; 16];
+    let mut decrypted: [u8; 16];
+
+    // Initialize previous ciphertext block to IV
+    for i in 0..16 {
+        prev[i] = iv[i];
+    }
+
+    let mut offset: u64 = 0;
+    while offset + 16 <= input_len {
+        // Decrypt ciphertext block
+        let ct_block = input[offset..offset + 16];
+        aes_decrypt_block(key, ct_block, &mut decrypted);
+
+        // XOR with previous ciphertext to get plaintext
+        for i in 0..16 {
+            output[offset + i] = decrypted[i] ^ prev[i];
+        }
+
+        // Save current ciphertext as previous
+        for i in 0..16 {
+            prev[i] = input[offset + i];
+        }
+
+        offset = offset + 16;
+    }
+
+    secure_zero(&mut decrypted);
+}
+
+// ============================================================================
+// Convenience Functions (AES-256)
+// ============================================================================
+
+fn aes256_ctr_crypt(key: &[u8; 32], nonce: &[u8; 12], input: &[u8], output: &mut [u8]) {
+    let mut expanded: AesKey;
+    aes256_key_expand(key, &mut expanded);
+    aes_ctr_crypt(&expanded, nonce, input, output);
+    secure_zero(&mut expanded.round_keys);
+}
+
+fn aes256_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], input: &[u8], input_len: u64, output: &mut [u8]) {
+    let mut expanded: AesKey;
+    aes256_key_expand(key, &mut expanded);
+    aes_cbc_encrypt(&expanded, iv, input, input_len, output);
+    secure_zero(&mut expanded.round_keys);
+}
+
+fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], input: &[u8], input_len: u64, output: &mut [u8]) {
+    let mut expanded: AesKey;
+    aes256_key_expand(key, &mut expanded);
+    aes_cbc_decrypt(&expanded, iv, input, input_len, output);
+    secure_zero(&mut expanded.round_keys);
+}
+
+// AES-128 convenience
+fn aes128_ctr_crypt(key: &[u8; 16], nonce: &[u8; 12], input: &[u8], output: &mut [u8]) {
+    let mut expanded: AesKey;
+    aes128_key_expand(key, &mut expanded);
+    aes_ctr_crypt(&expanded, nonce, input, output);
+    secure_zero(&mut expanded.round_keys);
+}
+
+fn aes128_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], input: &[u8], input_len: u64, output: &mut [u8]) {
+    let mut expanded: AesKey;
+    aes128_key_expand(key, &mut expanded);
+    aes_cbc_encrypt(&expanded, iv, input, input_len, output);
+    secure_zero(&mut expanded.round_keys);
+}
+
+fn aes128_cbc_decrypt(key: &[u8; 16], iv: &[u8; 16], input: &[u8], input_len: u64, output: &mut [u8]) {
+    let mut expanded: AesKey;
+    aes128_key_expand(key, &mut expanded);
+    aes_cbc_decrypt(&expanded, iv, input, input_len, output);
+    secure_zero(&mut expanded.round_keys);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+// AES-CTR roundtrip test
+test aes_ctr_roundtrip() {
+    let key = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let nonce = hex("000000000000000000000000");
+    let plaintext: &[u8] = bytes("Hello, AES-CTR!!");
+    let mut ciphertext: u8[16];
+    let mut decrypted: u8[16];
+
+    aes256_ctr_crypt(&key, &nonce, plaintext, &mut ciphertext);
+    aes256_ctr_crypt(&key, &nonce, &ciphertext, &mut decrypted);
+
+    for i in 0..16 {
+        assert(decrypted[i] == plaintext[i]);
+    }
+}
+
+// AES-CTR: partial block roundtrip
+test aes_ctr_partial_block() {
+    let key = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let nonce = hex("000102030405060708090a0b");
+    let plaintext: &[u8] = bytes("Short");
+    let mut ciphertext: u8[5];
+    let mut decrypted: u8[5];
+
+    aes256_ctr_crypt(&key, &nonce, plaintext, &mut ciphertext);
+    aes256_ctr_crypt(&key, &nonce, &ciphertext, &mut decrypted);
+
+    for i in 0..5 {
+        assert(decrypted[i] == plaintext[i]);
+    }
+}
+
+// NIST SP 800-38A F.2.5 AES-256-CBC Encrypt (first block)
+test aes_cbc_nist_encrypt() {
+    let key = hex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+    let iv = hex("000102030405060708090a0b0c0d0e0f");
+    let plaintext = hex("6bc1bee22e409f96e93d7e117393172a");
+    let expected = hex("f58c4c04d6e5f1ba779eabfb5f7bfbd6");
+    let mut ciphertext: u8[16];
+
+    aes256_cbc_encrypt(&key, &iv, plaintext, 16, &mut ciphertext);
+    assert(constant_time_eq(&ciphertext, expected));
+}
+
+// AES-CBC encrypt then decrypt roundtrip
+test aes_cbc_roundtrip() {
+    let key = hex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+    let iv = hex("000102030405060708090a0b0c0d0e0f");
+    let plaintext = hex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+    let mut ciphertext: u8[32];
+    let mut decrypted: u8[32];
+
+    aes256_cbc_encrypt(&key, &iv, plaintext, 32, &mut ciphertext);
+    aes256_cbc_decrypt(&key, &iv, &ciphertext, 32, &mut decrypted);
+    assert(constant_time_eq(&decrypted, plaintext));
+}
+
+// AES-128-CBC roundtrip
+test aes128_cbc_roundtrip() {
+    let key = hex("2b7e151628aed2a6abf7158809cf4f3c");
+    let iv = hex("000102030405060708090a0b0c0d0e0f");
+    let plaintext = hex("6bc1bee22e409f96e93d7e117393172a");
+    let mut ciphertext: u8[16];
+    let mut decrypted: u8[16];
+
+    aes128_cbc_encrypt(&key, &iv, plaintext, 16, &mut ciphertext);
+    aes128_cbc_decrypt(&key, &iv, &ciphertext, 16, &mut decrypted);
+    assert(constant_time_eq(&decrypted, plaintext));
+}
+
+// AES-128-CTR roundtrip
+test aes128_ctr_roundtrip() {
+    let key = hex("2b7e151628aed2a6abf7158809cf4f3c");
+    let nonce = hex("f0f1f2f3f4f5f6f7f8f9fafb");
+    let plaintext = hex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+    let mut ciphertext: u8[32];
+    let mut decrypted: u8[32];
+
+    aes128_ctr_crypt(&key, &nonce, plaintext, &mut ciphertext);
+    aes128_ctr_crypt(&key, &nonce, &ciphertext, &mut decrypted);
+    assert(constant_time_eq(&decrypted, plaintext));
+}

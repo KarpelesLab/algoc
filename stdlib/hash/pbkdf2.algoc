@@ -1,0 +1,82 @@
+// PBKDF2 (Password-Based Key Derivation Function 2) implementation
+//
+// Implements PBKDF2-HMAC-SHA256 as specified in RFC 2898 Section 5.2.
+
+use "../runtime.algoc";
+use "hmac.algoc";
+
+// PBKDF2-HMAC-SHA256 key derivation function
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, output: &mut [u8], dk_len: u64) {
+    let h_len: u64 = 32; // SHA-256 output size
+    let salt_len = salt.len();
+    let mut block_num: u32 = 1;
+    let mut offset: u64 = 0;
+
+    while offset < dk_len {
+        // Build salt || INT_32_BE(block_num)
+        let mut salt_block: u8[256];
+        for i in 0..salt_len {
+            salt_block[i] = salt[i];
+        }
+        salt_block[salt_len..salt_len + 4] as u32be = block_num;
+
+        let mut u_prev: u8[32];
+        let mut t: u8[32];
+
+        // U_1 = HMAC-SHA256(password, salt || INT(i))
+        hmac_sha256(password, salt_block[0..salt_len + 4], &mut u_prev);
+        for j in 0..32 {
+            t[j] = u_prev[j];
+        }
+
+        // U_2 .. U_c
+        let mut iter: u32 = 1;
+        while iter < iterations {
+            let mut u_next: u8[32];
+            hmac_sha256(password, &u_prev, &mut u_next);
+            for j in 0..32 {
+                t[j] = t[j] ^ u_next[j];
+                u_prev[j] = u_next[j];
+            }
+            iter = iter + 1;
+        }
+
+        // Copy T_i to output (may be partial for last block)
+        let mut copy_len = h_len;
+        if offset + copy_len > dk_len {
+            copy_len = dk_len - offset;
+        }
+        for j in 0..copy_len {
+            output[offset + j] = t[j];
+        }
+
+        offset = offset + h_len;
+        block_num = block_num + 1;
+
+        secure_zero(&mut u_prev);
+        secure_zero(&mut t);
+        secure_zero(&mut salt_block);
+    }
+}
+
+test pbkdf2_sha256_iter1() {
+    let mut dk: u8[32];
+    pbkdf2_sha256(bytes("password"), bytes("salt"), 1, &mut dk, 32);
+    assert(dk == hex("120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"));
+}
+
+test pbkdf2_sha256_iter2() {
+    let mut dk: u8[32];
+    pbkdf2_sha256(bytes("password"), bytes("salt"), 2, &mut dk, 32);
+    assert(dk == hex("ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"));
+}
+
+test pbkdf2_sha256_short_key() {
+    let mut dk: u8[16];
+    pbkdf2_sha256(bytes("passwd"), bytes("salt"), 1, &mut dk, 16);
+    let mut dk_full: u8[32];
+    pbkdf2_sha256(bytes("passwd"), bytes("salt"), 1, &mut dk_full, 32);
+    for i in 0..16 {
+        assert(dk[i] == dk_full[i]);
+    }
+}

@@ -1,0 +1,50 @@
+// Adler-32 checksum implementation
+//
+// Implements the Adler-32 checksum as specified in RFC 1950.
+// Adler-32 is used in zlib as a data integrity check.
+
+use "../runtime.algoc";
+
+const ADLER_MOD: u32 = 65521;
+
+// Compute Adler-32 checksum of data
+fn adler32(data: &[u8]) -> u32 {
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for i in 0..data.len() {
+        a = (a + (data[i] as u32)) % ADLER_MOD;
+        b = (b + a) % ADLER_MOD;
+    }
+    return (b << 16) | a;
+}
+
+// Update Adler-32 with additional data (streaming)
+fn adler32_update(adler: u32, data: &[u8]) -> u32 {
+    let mut a: u32 = adler & 0xFFFF;
+    let mut b: u32 = (adler >> 16) & 0xFFFF;
+    for i in 0..data.len() {
+        a = (a + (data[i] as u32)) % ADLER_MOD;
+        b = (b + a) % ADLER_MOD;
+    }
+    return (b << 16) | a;
+}
+
+test adler32_empty() {
+    assert(adler32(bytes("")) == 0x00000001);
+}
+
+test adler32_a() {
+    assert(adler32(bytes("a")) == 0x00620062);
+}
+
+test adler32_abc() {
+    assert(adler32(bytes("abc")) == 0x024d0127);
+}
+
+test adler32_wikipedia() {
+    assert(adler32(bytes("Wikipedia")) == 0x11e60398);
+}
+
+test adler32_123456789() {
+    assert(adler32(bytes("123456789")) == 0x091e01de);
+}

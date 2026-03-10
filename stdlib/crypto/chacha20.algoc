@@ -1,0 +1,167 @@
+// ChaCha20 stream cipher implementation
+//
+// Implements ChaCha20 as specified in RFC 8439.
+
+use "../runtime.algoc";
+
+// ChaCha20 constants: "expand 32-byte k"
+const CHACHA_C0: u32 = 0x61707865;
+const CHACHA_C1: u32 = 0x3320646e;
+const CHACHA_C2: u32 = 0x79622d32;
+const CHACHA_C3: u32 = 0x6b206574;
+
+// ChaCha20 quarter round
+fn chacha20_qr(s: &mut [u32; 16], a: u8, b: u8, c: u8, d: u8) {
+    s[a] = s[a] + s[b]; s[d] = rotl(s[d] ^ s[a], 16);
+    s[c] = s[c] + s[d]; s[b] = rotl(s[b] ^ s[c], 12);
+    s[a] = s[a] + s[b]; s[d] = rotl(s[d] ^ s[a], 8);
+    s[c] = s[c] + s[d]; s[b] = rotl(s[b] ^ s[c], 7);
+}
+
+// Generate a single ChaCha20 keystream block (64 bytes)
+fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12], output: &mut [u8; 64]) {
+    let mut state: [u32; 16];
+    let mut initial: [u32; 16];
+
+    // Initialize state
+    state[0] = CHACHA_C0;
+    state[1] = CHACHA_C1;
+    state[2] = CHACHA_C2;
+    state[3] = CHACHA_C3;
+    state[4] = read_u32_le(key, 0);
+    state[5] = read_u32_le(key, 4);
+    state[6] = read_u32_le(key, 8);
+    state[7] = read_u32_le(key, 12);
+    state[8] = read_u32_le(key, 16);
+    state[9] = read_u32_le(key, 20);
+    state[10] = read_u32_le(key, 24);
+    state[11] = read_u32_le(key, 28);
+    state[12] = counter;
+    state[13] = read_u32_le(nonce, 0);
+    state[14] = read_u32_le(nonce, 4);
+    state[15] = read_u32_le(nonce, 8);
+
+    // Save initial state
+    for i in 0..16 {
+        initial[i] = state[i];
+    }
+
+    // 20 rounds (10 double-rounds)
+    for i in 0..10 {
+        // Column rounds
+        chacha20_qr(&mut state, 0, 4, 8, 12);
+        chacha20_qr(&mut state, 1, 5, 9, 13);
+        chacha20_qr(&mut state, 2, 6, 10, 14);
+        chacha20_qr(&mut state, 3, 7, 11, 15);
+        // Diagonal rounds
+        chacha20_qr(&mut state, 0, 5, 10, 15);
+        chacha20_qr(&mut state, 1, 6, 11, 12);
+        chacha20_qr(&mut state, 2, 7, 8, 13);
+        chacha20_qr(&mut state, 3, 4, 9, 14);
+    }
+
+    // Add initial state and serialize to little-endian bytes
+    for i in 0..16 {
+        state[i] = state[i] + initial[i];
+        write_u32_le(output, (i as u64) * 4, state[i]);
+    }
+}
+
+// Encrypt or decrypt with ChaCha20 (same operation: XOR with keystream)
+fn chacha20_crypt(key: &[u8; 32], counter: u32, nonce: &[u8; 12], input: &[u8], output: &mut [u8]) {
+    let in_len = input.len();
+    let mut block_counter = counter;
+    let mut offset: u64 = 0;
+    let mut keystream: [u8; 64];
+
+    // Process full 64-byte blocks
+    while offset + 64 <= in_len {
+        chacha20_block(key, block_counter, nonce, &mut keystream);
+        for i in 0..64 {
+            output[offset + i] = input[offset + i] ^ keystream[i];
+        }
+        offset = offset + 64;
+        block_counter = block_counter + 1;
+    }
+
+    // Handle partial last block
+    if offset < in_len {
+        chacha20_block(key, block_counter, nonce, &mut keystream);
+        let remaining = in_len - offset;
+        for i in 0..remaining {
+            output[offset + i] = input[offset + i] ^ keystream[i];
+        }
+    }
+
+    secure_zero(&mut keystream);
+}
+
+// Test vectors from RFC 8439
+
+// Section 2.1.1 - Quarter round test
+test chacha20_quarter_round() {
+    let mut state: [u32; 16];
+    for i in 0..16 {
+        state[i] = 0;
+    }
+    state[0] = 0x11111111;
+    state[1] = 0x01020304;
+    state[2] = 0x9b8d6f43;
+    state[3] = 0x01234567;
+    chacha20_qr(&mut state, 0, 1, 2, 3);
+    assert(state[0] == 0xea2a92f4);
+    assert(state[1] == 0xcb1cf8ce);
+    assert(state[2] == 0x4581472e);
+    assert(state[3] == 0x5881c4bb);
+}
+
+// Section 2.3.2 - ChaCha20 block function test
+test chacha20_block_rfc() {
+    let key = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let nonce = hex("000000090000004a00000000");
+    let mut output: [u8; 64];
+    chacha20_block(&key, 1, &nonce, &mut output);
+
+    // Expected first 16 bytes: 10 f1 e7 e4 d1 3b 59 15 50 0f dd 1f a3 20 71 c4
+    assert(output[0] == 0x10);
+    assert(output[1] == 0xf1);
+    assert(output[2] == 0xe7);
+    assert(output[3] == 0xe4);
+    assert(output[4] == 0xd1);
+    assert(output[5] == 0x3b);
+    assert(output[6] == 0x59);
+    assert(output[7] == 0x15);
+}
+
+// Encrypt/decrypt roundtrip
+test chacha20_roundtrip() {
+    let key = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let nonce = hex("000000000000004a00000000");
+    let plaintext: &[u8] = bytes("Hello, ChaCha20!");
+    let mut ciphertext: u8[16];
+    let mut decrypted: u8[16];
+    chacha20_crypt(&key, 1, &nonce, plaintext, &mut ciphertext);
+    chacha20_crypt(&key, 1, &nonce, &ciphertext, &mut decrypted);
+    for i in 0..16 {
+        assert(decrypted[i] == plaintext[i]);
+    }
+}
+
+// Section 2.4.2 - Encryption test (partial verification)
+test chacha20_encrypt_rfc() {
+    let key = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let nonce = hex("000000000000004a00000000");
+    let plaintext: &[u8] = bytes("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
+    let expected_ct = hex("6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d");
+    let mut ciphertext: u8[128];
+    chacha20_crypt(&key, 1, &nonce, plaintext, &mut ciphertext);
+    // Verify first 16 bytes of ciphertext
+    for i in 0..16 {
+        assert(ciphertext[i] == expected_ct[i]);
+    }
+    // Verify last few bytes
+    let pt_len = plaintext.len();
+    for i in 0..4 {
+        assert(ciphertext[pt_len - 4 + i] == expected_ct[pt_len - 4 + i]);
+    }
+}
