@@ -120,18 +120,15 @@ impl PythonGenerator {
             ExprKind::Paren(inner) => self.expr_uses_u64(inner),
             ExprKind::Integer(n) => *n > 0xFFFFFFFF,
             // Look up variable types
-            ExprKind::Ident(ident) => self
-                .var_elem_types
-                .get(&ident.name)
-                .map_or(false, |p| {
-                    matches!(
-                        p,
-                        PrimitiveType::U64
-                            | PrimitiveType::I64
-                            | PrimitiveType::U128
-                            | PrimitiveType::I128
-                    )
-                }),
+            ExprKind::Ident(ident) => self.var_elem_types.get(&ident.name).map_or(false, |p| {
+                matches!(
+                    p,
+                    PrimitiveType::U64
+                        | PrimitiveType::I64
+                        | PrimitiveType::U128
+                        | PrimitiveType::I128
+                )
+            }),
             // Array indexing: check element type of the array variable
             ExprKind::Index { array, .. } => {
                 if let ExprKind::Ident(ident) = &array.kind {
@@ -676,8 +673,7 @@ impl PythonGenerator {
             }
             // Also track plain primitive parameter types (e.g., u64)
             if let crate::parser::TypeKind::Primitive(p) = &param.ty.kind {
-                self.var_elem_types
-                    .insert(param.name.name.clone(), *p);
+                self.var_elem_types.insert(param.name.name.clone(), *p);
             }
         }
 

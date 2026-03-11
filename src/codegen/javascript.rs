@@ -927,10 +927,7 @@ impl JavaScriptGenerator {
                 let needs_bigint_mask = uses_bigint
                     && matches!(
                         op,
-                        BinaryOp::Add
-                            | BinaryOp::Sub
-                            | BinaryOp::Mul
-                            | BinaryOp::Shl
+                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Shl
                     );
 
                 if needs_unsigned || needs_bigint_mask {
