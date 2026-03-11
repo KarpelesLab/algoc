@@ -120,7 +120,7 @@ impl PythonGenerator {
             ExprKind::Paren(inner) => self.expr_uses_u64(inner),
             ExprKind::Integer(n) => *n > 0xFFFFFFFF,
             // Look up variable types
-            ExprKind::Ident(ident) => self.var_elem_types.get(&ident.name).map_or(false, |p| {
+            ExprKind::Ident(ident) => self.var_elem_types.get(&ident.name).is_some_and(|p| {
                 matches!(
                     p,
                     PrimitiveType::U64
@@ -132,7 +132,7 @@ impl PythonGenerator {
             // Array indexing: check element type of the array variable
             ExprKind::Index { array, .. } => {
                 if let ExprKind::Ident(ident) = &array.kind {
-                    self.var_elem_types.get(&ident.name).map_or(false, |p| {
+                    self.var_elem_types.get(&ident.name).is_some_and(|p| {
                         matches!(
                             p,
                             PrimitiveType::U64
@@ -1735,9 +1735,6 @@ fn is_byte_sequence_expr(expr: &Expr) -> bool {
         _ => false,
     }
 }
-
-/// Check if an expression involves 64-bit or larger types
-// Removed standalone expr_uses_u64 — now a method on PythonGenerator
 
 impl Default for PythonGenerator {
     fn default() -> Self {
